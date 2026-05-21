@@ -1047,13 +1047,15 @@ var (
 		[]string{"instance"},
 	)
 
-	// supplierFairShareGauge tracks the calculated fair share for each instance.
+	// supplierFairShareGauge is kept for metric compatibility. In single-primary
+	// mode it reports the configured supplier count this instance should own when
+	// it is primary.
 	supplierFairShareGauge = observability.MinerFactory.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Namespace: metricsNamespace,
 			Subsystem: metricsSubsystem,
 			Name:      "supplier_fair_share",
-			Help:      "Calculated fair share of suppliers for this instance",
+			Help:      "Configured supplier target for this instance when primary",
 		},
 		[]string{"instance"},
 	)

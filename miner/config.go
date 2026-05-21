@@ -167,8 +167,8 @@ type SupplierClaimingConfigYAML struct {
 	// Default: 10s
 	RenewRateSeconds int `yaml:"renew_rate_seconds,omitempty"`
 
-	// RebalanceIntervalSeconds is how often to check for fair supplier distribution
-	// across miner instances and scan for orphaned suppliers (in seconds).
+	// RebalanceIntervalSeconds is how often to scan for orphaned supplier claims
+	// that can be picked up by a standby miner (in seconds).
 	// Default: 30s
 	RebalanceIntervalSeconds int `yaml:"rebalance_interval_seconds,omitempty"`
 }

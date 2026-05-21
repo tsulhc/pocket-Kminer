@@ -56,102 +56,62 @@ func (s *SupplierClaimerTestSuite) createTestClaimer(instanceID string) *Supplie
 	return NewSupplierClaimer(logger, s.redisClient, instanceID, SupplierClaimerConfig{})
 }
 
-// TestReleaseExcess_NewestFirst verifies that releaseExcess releases newest-claimed
-// suppliers first (most recently claimed = least established).
-// DRAIN-07: When 4 suppliers are claimed at different times (A at t=0, B at t=1,
-// C at t=2, D at t=3) and releaseExcess(2) is called, suppliers D and C are
-// released (newest first), while A and B remain claimed.
-func (s *SupplierClaimerTestSuite) TestReleaseExcess_NewestFirst() {
-	claimer := s.createTestClaimer("test-instance-1")
+// TestInitialClaimClaimsEveryAvailableSupplier verifies the single-primary
+// behavior: active miner count does not cap this instance at a fair share.
+func (s *SupplierClaimerTestSuite) TestInitialClaimClaimsEveryAvailableSupplier() {
+	claimer := s.createTestClaimer("primary-instance")
 	claimer.ctx, claimer.cancelFn = context.WithCancel(s.ctx)
 	defer claimer.cancelFn()
 
-	// Register instance so TryClaim works
 	err := claimer.registerInstance(s.ctx)
 	s.Require().NoError(err)
 
-	suppliers := []string{"supplierA", "supplierB", "supplierC", "supplierD"}
-	claimer.allSuppliers = suppliers
+	standby := s.createTestClaimer("standby-instance")
+	err = standby.registerInstance(s.ctx)
+	s.Require().NoError(err)
 
-	// Claim all 4 suppliers via TryClaim (sets Redis keys + in-memory map)
-	for _, supplier := range suppliers {
-		ok := claimer.TryClaim(s.ctx, supplier)
-		s.Require().True(ok, "TryClaim should succeed for %s", supplier)
-	}
+	claimer.allSuppliers = []string{"supplierA", "supplierB", "supplierC", "supplierD"}
+	err = claimer.initialClaim(s.ctx)
+	s.Require().NoError(err)
 	s.Require().Equal(4, claimer.ClaimedCount())
 
-	// Set deterministic timestamps (A oldest, D newest) -- no time.Sleep needed
-	now := time.Now()
-	claimer.claimedMu.Lock()
-	claimer.claimed["supplierA"] = now.Add(-3 * time.Second) // oldest
-	claimer.claimed["supplierB"] = now.Add(-2 * time.Second)
-	claimer.claimed["supplierC"] = now.Add(-1 * time.Second)
-	claimer.claimed["supplierD"] = now // newest
-	claimer.claimedMu.Unlock()
-
-	// Track release order
-	var releasedOrder []string
-	claimer.onReleaseFn = func(_ context.Context, supplier string) error {
-		releasedOrder = append(releasedOrder, supplier)
-		return nil
+	for _, supplier := range claimer.allSuppliers {
+		owner, err := s.redisClient.Get(s.ctx, s.redisClient.KB().MinerClaimKey(supplier)).Result()
+		s.Require().NoError(err)
+		s.Require().Equal("primary-instance", owner)
 	}
-
-	// Release 2 excess -- should release D (newest) and C (next newest)
-	claimer.releaseExcess(2)
-
-	// Verify: D and C released, A and B remain
-	s.Require().False(claimer.IsClaimed("supplierD"), "supplierD (newest) should be released")
-	s.Require().False(claimer.IsClaimed("supplierC"), "supplierC (second newest) should be released")
-	s.Require().True(claimer.IsClaimed("supplierA"), "supplierA (oldest) should remain")
-	s.Require().True(claimer.IsClaimed("supplierB"), "supplierB (second oldest) should remain")
-	s.Require().Equal(2, claimer.ClaimedCount())
-
-	// Verify release order: newest first
-	s.Require().Len(releasedOrder, 2)
-	s.Require().Equal("supplierD", releasedOrder[0], "supplierD should be released first (newest)")
-	s.Require().Equal("supplierC", releasedOrder[1], "supplierC should be released second")
 }
 
-// TestReleaseExcess_NewestFirst_AllReleased verifies that when releaseExcess(N)
-// where N >= claimed count, all suppliers are released starting from newest.
-func (s *SupplierClaimerTestSuite) TestReleaseExcess_NewestFirst_AllReleased() {
-	claimer := s.createTestClaimer("test-instance-2")
-	claimer.ctx, claimer.cancelFn = context.WithCancel(s.ctx)
-	defer claimer.cancelFn()
+// TestStandbyClaimsOnlyExpiredSupplier verifies classic failover: a standby does
+// not steal healthy claims, but can claim a supplier after the primary lease is gone.
+func (s *SupplierClaimerTestSuite) TestStandbyClaimsOnlyExpiredSupplier() {
+	primary := s.createTestClaimer("primary-instance")
+	primary.ctx, primary.cancelFn = context.WithCancel(s.ctx)
+	defer primary.cancelFn()
+	s.Require().NoError(primary.registerInstance(s.ctx))
 
-	err := claimer.registerInstance(s.ctx)
+	suppliers := []string{"supplierA", "supplierB"}
+	primary.allSuppliers = suppliers
+	s.Require().NoError(primary.initialClaim(s.ctx))
+	s.Require().Equal(2, primary.ClaimedCount())
+
+	standby := s.createTestClaimer("standby-instance")
+	standby.ctx, standby.cancelFn = context.WithCancel(s.ctx)
+	defer standby.cancelFn()
+	s.Require().NoError(standby.registerInstance(s.ctx))
+	standby.allSuppliers = suppliers
+	s.Require().NoError(standby.initialClaim(s.ctx))
+	s.Require().Equal(0, standby.ClaimedCount())
+
+	claimKey := s.redisClient.KB().MinerClaimKey("supplierA")
+	s.Require().NoError(s.redisClient.Del(s.ctx, claimKey).Err())
+	standby.recoverUnclaimedSuppliers()
+
+	s.Require().True(standby.IsClaimed("supplierA"))
+	s.Require().False(standby.IsClaimed("supplierB"))
+	owner, err := s.redisClient.Get(s.ctx, claimKey).Result()
 	s.Require().NoError(err)
-
-	suppliers := []string{"supplierA", "supplierB", "supplierC"}
-	claimer.allSuppliers = suppliers
-
-	for _, supplier := range suppliers {
-		ok := claimer.TryClaim(s.ctx, supplier)
-		s.Require().True(ok, "TryClaim should succeed for %s", supplier)
-	}
-
-	// Set deterministic timestamps
-	now := time.Now()
-	claimer.claimedMu.Lock()
-	claimer.claimed["supplierA"] = now.Add(-2 * time.Second) // oldest
-	claimer.claimed["supplierB"] = now.Add(-1 * time.Second)
-	claimer.claimed["supplierC"] = now // newest
-	claimer.claimedMu.Unlock()
-
-	var releasedOrder []string
-	claimer.onReleaseFn = func(_ context.Context, supplier string) error {
-		releasedOrder = append(releasedOrder, supplier)
-		return nil
-	}
-
-	// Release all (count >= claimed)
-	claimer.releaseExcess(5)
-
-	s.Require().Equal(0, claimer.ClaimedCount(), "all suppliers should be released")
-	s.Require().Len(releasedOrder, 3)
-	s.Require().Equal("supplierC", releasedOrder[0], "supplierC (newest) should be released first")
-	s.Require().Equal("supplierB", releasedOrder[1], "supplierB should be released second")
-	s.Require().Equal("supplierA", releasedOrder[2], "supplierA (oldest) should be released last")
+	s.Require().Equal("standby-instance", owner)
 }
 
 // TestClaimedMapTimestamp verifies that after TryClaim succeeds, the claimed map

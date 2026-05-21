@@ -2,10 +2,7 @@ package miner
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"math"
-	"sort"
 	"sync"
 	"time"
 
@@ -29,7 +26,7 @@ import (
 //
 // Failover timing:
 //   - If a miner crashes, its claims expire after ClaimTTL (90s)
-//   - Other miners detect orphaned claims in the next rebalance cycle (~30s)
+//   - Other miners detect orphaned claims in the next scan cycle (~30s)
 //   - Maximum failover time: ClaimTTL + RebalanceInterval = ~120s
 //
 // These can be overridden via supplier_claiming config in miner YAML.
@@ -52,8 +49,9 @@ const (
 	// Matches RenewRate for consistency.
 	InstanceHeartbeatRate = 10 * time.Second
 
-	// RebalanceInterval is how often to check for rebalancing.
-	// When new miners join, suppliers are redistributed within this interval.
+	// RebalanceInterval is how often to check for orphaned suppliers.
+	// In single-primary mode, miners do not redistribute healthy claims; standby
+	// miners only pick up claims that expire or are otherwise missing.
 	RebalanceInterval = 30 * time.Second
 )
 
@@ -75,18 +73,18 @@ type SupplierClaimerConfig struct {
 	// Default: 10s
 	InstanceHeartbeatRate time.Duration
 
-	// RebalanceInterval is how often to check for rebalancing.
+	// RebalanceInterval is how often to check for orphaned suppliers.
 	// Default: 30s
 	RebalanceInterval time.Duration
 }
 
 // SupplierClaimer manages distributed supplier claiming using Redis-based leases.
-// It provides fair distribution of suppliers across multiple miner instances.
+// It uses a single-primary model: the first healthy miner claims every supplier
+// it can, and standby miners only claim suppliers whose leases expire.
 //
 // Key features:
 // - Lease-based claiming with automatic renewal
-// - Fair share rebalancing when miners join/leave
-// - Automatic reclaim of orphaned suppliers (failed miners)
+// - Classic failover through automatic reclaim of orphaned suppliers
 // - Instance registration with heartbeat
 type SupplierClaimer struct {
 	logger      logging.Logger
@@ -144,7 +142,7 @@ func NewSupplierClaimer(
 	componentLogger.Info().
 		Dur("claim_ttl", cfg.ClaimTTL).
 		Dur("renew_rate", cfg.RenewRate).
-		Dur("rebalance_interval", cfg.RebalanceInterval).
+		Dur("orphan_scan_interval", cfg.RebalanceInterval).
 		Msg("supplier claimer timing configuration")
 
 	return &SupplierClaimer{
@@ -167,7 +165,7 @@ func (c *SupplierClaimer) SetCallbacks(
 	c.onReleaseFn = onReleaseFn
 }
 
-// Start initializes the claimer and begins the claim/renew/rebalance loops.
+// Start initializes the claimer and begins the claim, renew, and orphan scan loops.
 func (c *SupplierClaimer) Start(ctx context.Context, suppliers []string) error {
 	c.ctx, c.cancelFn = context.WithCancel(ctx)
 
@@ -180,7 +178,7 @@ func (c *SupplierClaimer) Start(ctx context.Context, suppliers []string) error {
 		Dur("claim_ttl", c.config.ClaimTTL).
 		Dur("renew_rate", c.config.RenewRate).
 		Dur("instance_ttl", c.config.InstanceTTL).
-		Dur("rebalance_interval", c.config.RebalanceInterval).
+		Dur("orphan_scan_interval", c.config.RebalanceInterval).
 		Msg("supplier claimer configuration")
 
 	// Register this instance
@@ -197,7 +195,7 @@ func (c *SupplierClaimer) Start(ctx context.Context, suppliers []string) error {
 	c.wg.Add(3)
 	go c.instanceHeartbeatLoop()
 	go c.renewLoop()
-	go c.rebalanceLoop()
+	go c.orphanScanLoop()
 
 	c.logger.Info().
 		Int("suppliers", len(suppliers)).
@@ -289,7 +287,7 @@ func (c *SupplierClaimer) TryClaim(ctx context.Context, supplier string) bool {
 	c.claimed[supplier] = time.Now()
 	c.claimedMu.Unlock()
 
-	c.logger.Info().
+	c.logger.Debug().
 		Str("supplier", supplier).
 		Str("claim_key", claimKey).
 		Dur("ttl", c.config.ClaimTTL).
@@ -323,7 +321,7 @@ func (c *SupplierClaimer) Release(ctx context.Context, supplier string) error {
 	// Redis claim key alive to prevent orphan-reclaim thrashing.
 	if c.onReleaseFn != nil {
 		if err := c.onReleaseFn(ctx, supplier); err != nil {
-			c.logger.Info().
+			c.logger.Debug().
 				Err(err).
 				Str("supplier", supplier).
 				Msg("release vetoed by callback, keeping claim")
@@ -357,7 +355,7 @@ func (c *SupplierClaimer) Release(ctx context.Context, supplier string) error {
 	delete(c.claimed, supplier)
 	c.claimedMu.Unlock()
 
-	c.logger.Info().
+	c.logger.Debug().
 		Str("supplier", supplier).
 		Msg("released supplier claim")
 
@@ -430,58 +428,29 @@ func (c *SupplierClaimer) unregisterInstance(ctx context.Context) error {
 	return nil
 }
 
-// initialClaim attempts to claim suppliers on startup.
+// initialClaim attempts to claim every configured supplier on startup. Existing
+// claims owned by another miner are left untouched, which makes additional
+// miners passive standbys until the primary's leases expire.
 func (c *SupplierClaimer) initialClaim(ctx context.Context) error {
 	c.allSuppliersMu.RLock()
 	suppliers := make([]string, len(c.allSuppliers))
 	copy(suppliers, c.allSuppliers)
 	c.allSuppliersMu.RUnlock()
 
-	// Calculate fair share
-	fairShare := c.calculateFairShare(ctx)
-
-	var errors int
+	skipped := 0
 	for _, supplier := range suppliers {
-		if c.ClaimedCount() >= fairShare {
-			break // Already at fair share
-		}
-
 		if !c.TryClaim(ctx, supplier) {
-			errors++
+			skipped++
 		}
 	}
 
 	c.logger.Info().
-		Int("fair_share", fairShare).
+		Int("configured", len(suppliers)).
 		Int("claimed", c.ClaimedCount()).
-		Int("errors", errors).
+		Int("skipped", skipped).
 		Msg("initial claim complete")
 
 	return nil
-}
-
-// calculateFairShare calculates the fair share of suppliers for this instance.
-func (c *SupplierClaimer) calculateFairShare(ctx context.Context) int {
-	activeSetKey := c.redisClient.KB().MinerActiveSetKey()
-
-	// Get active miner count
-	activeMiners, err := c.redisClient.SCard(ctx, activeSetKey).Result()
-	if err != nil || activeMiners == 0 {
-		activeMiners = 1 // At least this instance
-	}
-
-	c.allSuppliersMu.RLock()
-	totalSuppliers := len(c.allSuppliers)
-	c.allSuppliersMu.RUnlock()
-
-	if totalSuppliers == 0 {
-		return 0
-	}
-
-	// Fair share = ceil(totalSuppliers / activeMiners)
-	fairShare := int(math.Ceil(float64(totalSuppliers) / float64(activeMiners)))
-
-	return fairShare
 }
 
 // instanceHeartbeatLoop periodically renews instance registration.
@@ -628,8 +597,10 @@ func (c *SupplierClaimer) renewAllClaims() {
 	}
 }
 
-// rebalanceLoop periodically checks and rebalances supplier distribution.
-func (c *SupplierClaimer) rebalanceLoop() {
+// orphanScanLoop periodically checks for supplier claims that are missing or
+// expired. It intentionally does not release healthy claims for fair-share
+// balancing; this keeps miner failover classic and avoids active/active churn.
+func (c *SupplierClaimer) orphanScanLoop() {
 	defer c.wg.Done()
 
 	ticker := time.NewTicker(c.config.RebalanceInterval)
@@ -640,129 +611,34 @@ func (c *SupplierClaimer) rebalanceLoop() {
 		case <-c.ctx.Done():
 			return
 		case <-ticker.C:
-			c.rebalance()
+			c.recoverUnclaimedSuppliers()
 		}
 	}
 }
 
-// rebalance adjusts supplier claims to achieve fair distribution.
-func (c *SupplierClaimer) rebalance() {
-	fairShare := c.calculateFairShare(c.ctx)
+// recoverUnclaimedSuppliers claims suppliers whose Redis claim is missing. In
+// normal operation this is a no-op for standby miners until the primary dies and
+// its claim leases expire.
+func (c *SupplierClaimer) recoverUnclaimedSuppliers() {
 	currentCount := c.ClaimedCount()
-
-	supplierClaimedGauge.WithLabelValues(c.instanceID).Set(float64(currentCount))
-	supplierFairShareGauge.WithLabelValues(c.instanceID).Set(float64(fairShare))
-
-	c.logger.Debug().
-		Int("fair_share", fairShare).
-		Int("current", currentCount).
-		Msg("rebalance check")
-
-	if currentCount > fairShare {
-		// Release excess suppliers
-		excess := currentCount - fairShare
-		c.releaseExcess(excess)
-	} else if currentCount < fairShare {
-		// Try to claim more suppliers
-		needed := fairShare - currentCount
-		c.claimMore(needed)
-	}
-
-	// Always check for orphaned suppliers that no miner instance has claimed.
-	// This catches suppliers that fell through the cracks during initial claiming
-	// or whose claim keys expired without being renewed.
-	c.claimOrphaned()
-}
-
-// releaseExcess releases excess suppliers to allow other miners to claim them.
-// Suppliers are released newest-first (most recently claimed = least established)
-// to minimize session handoff churn during rebalancing.
-func (c *SupplierClaimer) releaseExcess(count int) {
-	type claimEntry struct {
-		supplier  string
-		claimedAt time.Time
-	}
-
-	c.claimedMu.RLock()
-	entries := make([]claimEntry, 0, len(c.claimed))
-	for supplier, claimedAt := range c.claimed {
-		entries = append(entries, claimEntry{supplier: supplier, claimedAt: claimedAt})
-	}
-	c.claimedMu.RUnlock()
-
-	// Sort newest-first (most recently claimed = least established)
-	sort.Slice(entries, func(i, j int) bool {
-		return entries[i].claimedAt.After(entries[j].claimedAt)
-	})
-
-	released := 0
-	vetoed := 0
-	for _, entry := range entries {
-		if released >= count {
-			break
-		}
-
-		if err := c.Release(c.ctx, entry.supplier); err != nil {
-			if errors.Is(err, ErrDrainAborted) {
-				// Release was vetoed (supplier still staked) — not an error,
-				// just means this supplier can't be rebalanced right now.
-				vetoed++
-				continue
-			}
-			c.logger.Warn().Err(err).Str("supplier", entry.supplier).Msg("failed to release excess supplier")
-			continue
-		}
-
-		released++
-		c.logger.Info().
-			Str("supplier", entry.supplier).
-			Int("released", released).
-			Int("target", count).
-			Time("claimed_at", entry.claimedAt).
-			Msg("released supplier for rebalancing (newest-first)")
-	}
-
-	if vetoed > 0 {
-		c.logger.Info().
-			Int("vetoed", vetoed).
-			Int("released", released).
-			Int("target", count).
-			Msg("rebalance: some releases vetoed (suppliers still staked)")
-	}
-}
-
-// claimMore attempts to claim unclaimed suppliers.
-func (c *SupplierClaimer) claimMore(count int) {
 	c.allSuppliersMu.RLock()
-	suppliers := make([]string, len(c.allSuppliers))
-	copy(suppliers, c.allSuppliers)
+	totalSuppliers := len(c.allSuppliers)
 	c.allSuppliersMu.RUnlock()
 
-	claimed := 0
-	for _, supplier := range suppliers {
-		if claimed >= count {
-			break
-		}
+	supplierClaimedGauge.WithLabelValues(c.instanceID).Set(float64(currentCount))
+	supplierFairShareGauge.WithLabelValues(c.instanceID).Set(float64(totalSuppliers))
 
-		if c.IsClaimed(supplier) {
-			continue // Already claimed by us
-		}
+	c.logger.Debug().
+		Int("configured", totalSuppliers).
+		Int("current", currentCount).
+		Msg("orphan supplier scan")
 
-		if c.TryClaim(c.ctx, supplier) {
-			claimed++
-			c.logger.Info().
-				Str("supplier", supplier).
-				Int("claimed", claimed).
-				Int("target", count).
-				Msg("claimed additional supplier for rebalancing")
-		}
-	}
+	c.claimOrphaned()
 }
 
 // claimOrphaned scans all configured suppliers and claims any that have no active
 // claim key in Redis. This catches suppliers that fell through the cracks — e.g.,
-// when both miners are at fair share but one supplier's claim expired, neither
-// miner's rebalance logic would detect it since both check only their own count.
+// when a primary miner dies and its supplier claim leases expire.
 func (c *SupplierClaimer) claimOrphaned() {
 	c.allSuppliersMu.RLock()
 	suppliers := make([]string, len(c.allSuppliers))
@@ -790,7 +666,7 @@ func (c *SupplierClaimer) claimOrphaned() {
 
 		if exists == 0 {
 			orphaned++
-			c.logger.Warn().Str("supplier", supplier).
+			c.logger.Debug().Str("supplier", supplier).
 				Msg("detected orphaned supplier (no claim key), attempting to claim")
 			if c.TryClaim(c.ctx, supplier) {
 				claimed++
@@ -810,6 +686,23 @@ func (c *SupplierClaimer) claimOrphaned() {
 // UpdateSuppliers updates the list of configured suppliers.
 // Called when KeyManager detects a config change.
 func (c *SupplierClaimer) UpdateSuppliers(suppliers []string) {
+	c.allSuppliersMu.RLock()
+	unchanged := len(c.allSuppliers) == len(suppliers)
+	if unchanged {
+		for i := range suppliers {
+			if c.allSuppliers[i] != suppliers[i] {
+				unchanged = false
+				break
+			}
+		}
+	}
+	c.allSuppliersMu.RUnlock()
+
+	if unchanged {
+		c.logger.Debug().Int("suppliers", len(suppliers)).Msg("supplier list unchanged")
+		return
+	}
+
 	c.allSuppliersMu.Lock()
 	c.allSuppliers = suppliers
 	c.allSuppliersMu.Unlock()
@@ -818,6 +711,8 @@ func (c *SupplierClaimer) UpdateSuppliers(suppliers []string) {
 		Int("suppliers", len(suppliers)).
 		Msg("updated supplier list")
 
-	// Trigger rebalance
-	go c.rebalance()
+	// Re-scan immediately so a primary can pick up newly configured suppliers.
+	if c.ctx != nil {
+		c.recoverUnclaimedSuppliers()
+	}
 }
