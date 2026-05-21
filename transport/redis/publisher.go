@@ -25,10 +25,10 @@ type StreamsPublisher struct {
 	// cacheTTL is the TTL for relay stream data (backup safety net)
 	cacheTTL time.Duration
 
-	// ttlSet tracks which stream keys already have TTL set.
-	// Avoids calling EXPIRE on every publish (saves 1 Redis round-trip per relay).
-	// Bounded by supplier count (stream names are ha:relays:{supplierAddr}).
-	ttlSet sync.Map // map[string]struct{}
+	// ttlLastRefresh tracks the last time each stream TTL was refreshed. Refreshing
+	// periodically avoids immortal relay streams while still avoiding an EXPIRE
+	// round-trip on every relay.
+	ttlLastRefresh sync.Map // map[string]time.Time
 
 	// mu protects closed state
 	mu     sync.RWMutex
@@ -118,11 +118,11 @@ func (p *StreamsPublisher) Publish(ctx context.Context, msg *transport.MinedRela
 		Str("message_id", messageID).
 		Msg("relay published to stream")
 
-	// Set stream TTL only once per stream (not on every publish).
-	// Saves 1 Redis round-trip per relay. TTL is a backup safety net.
-	if _, alreadySet := p.ttlSet.LoadOrStore(streamName, struct{}{}); !alreadySet {
+	// Refresh stream TTL at a bounded cadence. TTL is a backup safety net for
+	// streams created by consumers or entries missed by ack/delete cleanup.
+	if p.shouldRefreshTTL(streamName) {
 		if ttlErr := p.client.Expire(ctx, streamName, p.cacheTTL).Err(); ttlErr != nil {
-			p.ttlSet.Delete(streamName) // retry next publish
+			p.ttlLastRefresh.Delete(streamName) // retry next publish
 			p.logger.Warn().
 				Err(ttlErr).
 				Str(logging.FieldStreamID, streamName).
@@ -229,10 +229,10 @@ func (p *StreamsPublisher) PublishBatch(ctx context.Context, msgs []*transport.M
 		}
 	}
 
-	// Set TTLs only for streams that haven't had TTL set yet
+	// Refresh TTLs only for streams due for refresh.
 	var needsTTL []string
 	for streamName := range streamTTLs {
-		if _, alreadySet := p.ttlSet.LoadOrStore(streamName, struct{}{}); !alreadySet {
+		if p.shouldRefreshTTL(streamName) {
 			needsTTL = append(needsTTL, streamName)
 		}
 	}
@@ -242,9 +242,9 @@ func (p *StreamsPublisher) PublishBatch(ctx context.Context, msgs []*transport.M
 			ttlPipe.Expire(ctx, streamName, streamTTLs[streamName])
 		}
 		if _, ttlErr := ttlPipe.Exec(ctx); ttlErr != nil {
-			// Remove from ttlSet so we retry next batch
+			// Remove from refresh tracker so we retry next batch.
 			for _, streamName := range needsTTL {
-				p.ttlSet.Delete(streamName)
+				p.ttlLastRefresh.Delete(streamName)
 			}
 			p.logger.Warn().Err(ttlErr).Msg("failed to set TTLs for some streams")
 		}
@@ -263,6 +263,25 @@ func (p *StreamsPublisher) PublishBatch(ctx context.Context, msgs []*transport.M
 		Msg("published batch of mined relays to supplier streams")
 
 	return nil
+}
+
+func (p *StreamsPublisher) shouldRefreshTTL(streamName string) bool {
+	refreshInterval := p.cacheTTL / 4
+	if refreshInterval < time.Minute {
+		refreshInterval = time.Minute
+	}
+
+	now := time.Now()
+	lastAny, exists := p.ttlLastRefresh.Load(streamName)
+	if exists {
+		last, ok := lastAny.(time.Time)
+		if ok && now.Sub(last) < refreshInterval {
+			return false
+		}
+	}
+
+	p.ttlLastRefresh.Store(streamName, now)
+	return true
 }
 
 // Close gracefully shuts down the publisher.

@@ -1784,52 +1784,58 @@ func (m *SupplierManager) runStreamTrimmer(ctx context.Context) {
 	}
 }
 
-// trimAllSupplierStreams trims old entries from all claimed supplier streams.
+// trimAllSupplierStreams trims old entries from all relay streams in Redis,
+// including streams for suppliers that are no longer actively claimed. This is a
+// retention safety net: active streams are normally cleaned by ack+delete, but
+// orphaned streams would otherwise keep growing until manual cleanup.
 // Submits work to the pool for parallel execution and waits for completion.
 func (m *SupplierManager) trimAllSupplierStreams(ctx context.Context, maxAge time.Duration) {
-	m.suppliersMu.RLock()
-	suppliers := make([]*SupplierState, 0, len(m.suppliers))
-	for _, state := range m.suppliers {
-		suppliers = append(suppliers, state)
-	}
-	m.suppliersMu.RUnlock()
+	streamPrefix := m.config.RedisClient.KB().StreamPrefix()
+	pattern := streamPrefix + ":*"
+	iter := m.config.RedisClient.Scan(ctx, 0, pattern, 1000).Iterator()
 
-	if len(suppliers) == 0 {
+	streamNames := make([]string, 0)
+	for iter.Next(ctx) {
+		streamNames = append(streamNames, iter.Val())
+	}
+	if err := iter.Err(); err != nil {
+		m.logger.Warn().Err(err).Str("pattern", pattern).Msg("failed to scan relay streams for trimming")
+		return
+	}
+
+	if len(streamNames) == 0 {
 		return
 	}
 
 	m.logger.Debug().
-		Int("suppliers", len(suppliers)).
+		Int("streams", len(streamNames)).
 		Dur("max_age", maxAge).
-		Msg("starting stream trimming for all suppliers")
+		Msg("starting relay stream trimming")
+
+	minID := fmt.Sprintf("%d-0", time.Now().Add(-maxAge).UnixMilli())
 
 	// Create a task group to wait for all trim operations
 	group := m.querySubpool.NewGroup()
 	var totalTrimmed int64
-	var trimmedSuppliers int
+	var trimmedStreams int
 	var mu sync.Mutex // Protect counters
 
-	for _, state := range suppliers {
-		// Skip if consumer is nil (shouldn't happen but defensive)
-		if state.Consumer == nil {
-			continue
-		}
-
+	for _, streamName := range streamNames {
 		// Submit trimming work to the group
-		supplier := state // capture for closure
+		stream := streamName // capture for closure
 		group.SubmitErr(func() error {
-			trimmed, err := supplier.Consumer.TrimStream(ctx, maxAge)
+			trimmed, err := m.config.RedisClient.XTrimMinID(ctx, stream, minID).Result()
 			if err != nil {
 				m.logger.Warn().
 					Err(err).
-					Str("supplier", supplier.OperatorAddr).
+					Str("stream", stream).
 					Msg("failed to trim stream")
 				return nil // Don't fail the group for individual stream errors
 			}
 			if trimmed > 0 {
 				mu.Lock()
 				totalTrimmed += trimmed
-				trimmedSuppliers++
+				trimmedStreams++
 				mu.Unlock()
 			}
 			return nil
@@ -1850,8 +1856,9 @@ func (m *SupplierManager) trimAllSupplierStreams(ctx context.Context, maxAge tim
 	if totalTrimmed > 0 {
 		m.logger.Info().
 			Int64("total_trimmed", totalTrimmed).
-			Int("suppliers_trimmed", trimmedSuppliers).
-			Int("total_suppliers", len(suppliers)).
+			Int("streams_trimmed", trimmedStreams).
+			Int("total_streams", len(streamNames)).
+			Str("min_id", minID).
 			Dur("max_age", maxAge).
 			Msg("stream trimming completed")
 	}

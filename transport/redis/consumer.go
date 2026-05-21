@@ -40,6 +40,11 @@ type StreamsConsumer struct {
 	closed   bool
 	cancelFn context.CancelFunc
 	wg       sync.WaitGroup
+
+	// xackDelFallbackOnce logs at most once when Redis does not support XACKDEL
+	// or rejects it. The fallback path uses XACK + XDEL, preserving the intended
+	// post-processing cleanup without spamming logs on every relay.
+	xackDelFallbackOnce sync.Once
 }
 
 // NewStreamsConsumer creates a new Redis Streams consumer.
@@ -239,7 +244,7 @@ func (c *StreamsConsumer) consumeMessagesUntilError(ctx context.Context) error {
 					Str(logging.FieldMessageID, message.ID).
 					Msg("failed to parse message")
 				// Acknowledge AND delete bad message to avoid redelivery and keep stream clean
-				if err := c.client.XAckDel(ctx, c.streamName, c.config.ConsumerGroup, "DELREF", message.ID).Err(); err != nil {
+				if err := c.ackDeleteMessages(ctx, c.streamName, message.ID); err != nil {
 					c.logger.Warn().Err(err).Str(logging.FieldMessageID, message.ID).Msg("failed to XAckDel bad message")
 				}
 				continue
@@ -324,7 +329,7 @@ func (c *StreamsConsumer) claimPendingMessages(ctx context.Context) {
 		if parseErr != nil {
 			deserializationErrors.WithLabelValues(c.config.SupplierOperatorAddress).Inc()
 			// Acknowledge AND delete bad message to keep stream clean
-			_ = c.client.XAckDel(ctx, c.streamName, c.config.ConsumerGroup, "DELREF", message.ID)
+			_ = c.ackDeleteMessages(ctx, c.streamName, message.ID)
 			continue
 		}
 		msg.IsReclaim = true
@@ -391,10 +396,9 @@ func (c *StreamsConsumer) AckMessage(ctx context.Context, msg transport.StreamMe
 		return fmt.Errorf("message missing stream name")
 	}
 
-	// Use XAckDel with DELREF to acknowledge AND delete the message from stream.
-	// This prevents streams from growing unbounded - messages are removed after processing.
-	// DELREF removes all references from all consumer groups (we only have one).
-	err := c.client.XAckDel(ctx, msg.StreamName, c.config.ConsumerGroup, "DELREF", msg.ID).Err()
+	// Acknowledge AND delete the message from stream. This prevents streams from
+	// growing unbounded after processing.
+	err := c.ackDeleteMessages(ctx, msg.StreamName, msg.ID)
 	if err != nil {
 		return fmt.Errorf("failed to ack+delete message %s: %w", msg.ID, err)
 	}
@@ -425,19 +429,72 @@ func (c *StreamsConsumer) AckMessageBatch(ctx context.Context, msgs []transport.
 		byStream[msg.StreamName] = append(byStream[msg.StreamName], msg.ID)
 	}
 
-	// Use pipeline to acknowledge AND delete all messages from streams.
-	// XAckDel with DELREF prevents streams from growing unbounded.
-	pipe := c.client.Pipeline()
-	for streamName, ids := range byStream {
-		pipe.XAckDel(ctx, streamName, c.config.ConsumerGroup, "DELREF", ids...)
-	}
-
-	_, err := pipe.Exec(ctx)
+	err := c.ackDeleteMessagesByStream(ctx, byStream)
 	if err != nil {
 		return fmt.Errorf("failed to batch ack+delete: %w", err)
 	}
 
 	ackedTotal.WithLabelValues(c.config.SupplierOperatorAddress).Add(float64(len(msgs)))
+	return nil
+}
+
+func (c *StreamsConsumer) ackDeleteMessages(ctx context.Context, streamName string, ids ...string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+
+	if err := c.client.XAckDel(ctx, streamName, c.config.ConsumerGroup, "DELREF", ids...).Err(); err == nil {
+		return nil
+	} else if ctx.Err() != nil {
+		return err
+	} else {
+		return c.fallbackAckDelete(ctx, map[string][]string{streamName: ids}, err)
+	}
+}
+
+func (c *StreamsConsumer) ackDeleteMessagesByStream(ctx context.Context, byStream map[string][]string) error {
+	if len(byStream) == 0 {
+		return nil
+	}
+
+	pipe := c.client.Pipeline()
+	for streamName, ids := range byStream {
+		if len(ids) > 0 {
+			pipe.XAckDel(ctx, streamName, c.config.ConsumerGroup, "DELREF", ids...)
+		}
+	}
+
+	_, err := pipe.Exec(ctx)
+	if err == nil {
+		return nil
+	}
+	if ctx.Err() != nil {
+		return err
+	}
+
+	return c.fallbackAckDelete(ctx, byStream, err)
+}
+
+func (c *StreamsConsumer) fallbackAckDelete(ctx context.Context, byStream map[string][]string, xackDelErr error) error {
+	c.xackDelFallbackOnce.Do(func() {
+		c.logger.Warn().
+			Err(xackDelErr).
+			Msg("Redis XACKDEL failed, falling back to XACK plus XDEL")
+	})
+
+	pipe := c.client.Pipeline()
+	for streamName, ids := range byStream {
+		if len(ids) == 0 {
+			continue
+		}
+		pipe.XAck(ctx, streamName, c.config.ConsumerGroup, ids...)
+		pipe.XDel(ctx, streamName, ids...)
+	}
+
+	if _, err := pipe.Exec(ctx); err != nil {
+		return fmt.Errorf("XACKDEL failed (%w), fallback XACK+XDEL failed: %w", xackDelErr, err)
+	}
+
 	return nil
 }
 

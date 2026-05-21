@@ -3,9 +3,14 @@
 package redis
 
 import (
+	"context"
+	"fmt"
 	"testing"
+	"time"
 
+	"github.com/alicebob/miniredis/v2"
 	"github.com/redis/go-redis/v9"
+	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -115,4 +120,92 @@ func TestParseMessage_InvalidPayloadReleasesPooledMessage(t *testing.T) {
 	assert.Empty(t, clean.SessionId)
 	assert.Empty(t, clean.RelayBytes)
 	transport.ReleaseMinedRelayMessage(clean)
+}
+
+func TestAckMessageFallsBackToAckAndDelete(t *testing.T) {
+	mr, err := miniredis.Run()
+	require.NoError(t, err)
+	defer mr.Close()
+
+	ctx := context.Background()
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	defer func() { require.NoError(t, client.Close()) }()
+
+	streamName := "ha:relays:pokt1supplier"
+	groupName := "ha-miners"
+	messageID, err := client.XAdd(ctx, &redis.XAddArgs{
+		Stream: streamName,
+		Values: map[string]interface{}{"data": "payload"},
+	}).Result()
+	require.NoError(t, err)
+	require.NoError(t, client.XGroupCreate(ctx, streamName, groupName, "0").Err())
+
+	streams, err := client.XReadGroup(ctx, &redis.XReadGroupArgs{
+		Group:    groupName,
+		Consumer: "consumer-1",
+		Streams:  []string{streamName, ">"},
+		Count:    1,
+	}).Result()
+	require.NoError(t, err)
+	require.Len(t, streams, 1)
+	require.Len(t, streams[0].Messages, 1)
+	require.Equal(t, messageID, streams[0].Messages[0].ID)
+
+	consumer := &StreamsConsumer{
+		logger: zerolog.Nop(),
+		client: client,
+		config: transport.ConsumerConfig{
+			ConsumerGroup: groupName,
+		},
+	}
+
+	require.NoError(t, consumer.AckMessage(ctx, transport.StreamMessage{
+		ID:         messageID,
+		StreamName: streamName,
+	}))
+
+	xlen, err := client.XLen(ctx, streamName).Result()
+	require.NoError(t, err)
+	require.Zero(t, xlen, "ack+delete must remove processed stream entries")
+}
+
+func TestPublisherRefreshesStreamTTLRateLimited(t *testing.T) {
+	mr, err := miniredis.Run()
+	require.NoError(t, err)
+	defer mr.Close()
+
+	ctx := context.Background()
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	defer func() { require.NoError(t, client.Close()) }()
+
+	publisher := NewStreamsPublisher(zerolog.Nop(), client, "ha:relays", 4*time.Minute)
+	msg := newTestMinedRelayMessage("pokt1supplier", "session-1")
+	require.NoError(t, publisher.Publish(ctx, msg))
+
+	streamName := "ha:relays:pokt1supplier"
+	initialTTL := mr.TTL(streamName)
+	require.Greater(t, initialTTL, 3*time.Minute)
+
+	mr.FastForward(2 * time.Minute)
+	publisher.ttlLastRefresh.Store(streamName, time.Now().Add(-2*time.Minute))
+	msg = newTestMinedRelayMessage("pokt1supplier", "session-1")
+	require.NoError(t, publisher.Publish(ctx, msg))
+
+	refreshedTTL := mr.TTL(streamName)
+	require.Greater(t, refreshedTTL, 3*time.Minute, "TTL should refresh after the rate limit interval")
+}
+
+func newTestMinedRelayMessage(supplier, sessionID string) *transport.MinedRelayMessage {
+	return &transport.MinedRelayMessage{
+		RelayHash:               []byte{0x01, 0x02, 0x03, 0x04},
+		RelayBytes:              []byte(fmt.Sprintf("relay-%s", sessionID)),
+		ComputeUnitsPerRelay:    100,
+		SessionId:               sessionID,
+		SessionEndHeight:        200,
+		SupplierOperatorAddress: supplier,
+		ServiceId:               "svc-A",
+		ApplicationAddress:      "pokt1app",
+		ArrivalBlockHeight:      150,
+		SessionStartHeight:      100,
+	}
 }
