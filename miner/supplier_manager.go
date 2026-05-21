@@ -719,7 +719,7 @@ func (m *SupplierManager) onSupplierReleased(ctx context.Context, supplier strin
 	shouldDrain, verifyResult := m.verifySupplierUnstaked(ctx, supplier, "rebalance_release")
 	supplierDrainDecisionTotal.WithLabelValues("rebalance_release", verifyResult).Inc()
 
-	m.logger.Info().
+	m.logger.Debug().
 		Str("supplier", supplier).
 		Str("drain_trigger", "rebalance_release").
 		Str("on_chain_result", verifyResult).
@@ -728,11 +728,15 @@ func (m *SupplierManager) onSupplierReleased(ctx context.Context, supplier strin
 		Msg("drain decision audit")
 
 	if !shouldDrain {
-		m.logger.Warn().
+		logEvent := m.logger.Debug()
+		if verifyResult == "error" {
+			logEvent = m.logger.Warn()
+		}
+		logEvent.
 			Str("supplier", supplier).
 			Str("on_chain_result", verifyResult).
 			Str("instance_id", m.config.MinerID).
-			Msg("DRAIN ABORTED: supplier is staked on-chain, keeping claim")
+			Msg("supplier release skipped, keeping claim")
 		return ErrDrainAborted
 	}
 
@@ -924,7 +928,7 @@ func (m *SupplierManager) handleKeyChange(ctx context.Context, operatorAddr stri
 		// Supplier is staked - proceed with adding
 		if m.claimer != nil {
 			// Distributed claiming mode: update claimer's supplier list
-			// The claimer will handle claiming via rebalance
+			// The claimer will claim the supplier if this miner is primary.
 			allSuppliers := m.keyManager.ListSuppliers()
 			stakedSuppliers := m.filterStakedSuppliers(ctx, allSuppliers)
 			m.claimer.UpdateSuppliers(stakedSuppliers)
@@ -1626,8 +1630,9 @@ func (m *SupplierManager) removeSupplier(operatorAddr string) {
 	delete(m.suppliers, operatorAddr)
 
 	// Only remove from registry and cache if no other miner has already claimed
-	// this supplier. During rebalance, miner1 may release a supplier that miner2
-	// has already claimed and registered — deleting here would clobber miner2's entries.
+	// this supplier. During failover, a standby may claim an expired supplier
+	// before the previous owner finishes cleanup; deleting here would clobber the
+	// new owner's entries.
 	claimKey := m.config.RedisClient.KB().MinerClaimKey(operatorAddr)
 	claimOwner, claimErr := m.config.RedisClient.Get(ctx, claimKey).Result()
 	reclaimedByOther := claimErr == nil && claimOwner != "" && claimOwner != m.config.MinerID
