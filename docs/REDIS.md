@@ -1,6 +1,17 @@
 # Redis Architecture
 
-Redis is the central state store for distributed coordination. **It's NOT just a cache** - it stores critical revenue-generating data.
+Redis is the central coordination and queueing system in the current RC. It is
+not just a cache today: it still stores revenue-critical session and SMST data.
+This is transitional, not the target long-term miner hot path.
+
+Target direction for this fork:
+
+- Relayers remain stateless and horizontally scalable.
+- Relay queues stay durable and bounded.
+- Each miner shard is the single writer for its assigned suppliers/sessions.
+- SMST mutation moves to local memory with a durable local WAL/checkpoints.
+- Redis remains for coordination, caches, lightweight metadata, and compatibility
+  during migration.
 
 ## Configuration
 
@@ -59,7 +70,7 @@ redis:
     base_prefix: "ha"           # Root prefix for all keys
     cache_prefix: "cache"       # Cache data
     events_prefix: "events"     # Pub/sub channels
-    streams_prefix: "relays"    # Redis Streams (WAL)
+    streams_prefix: "relays"    # Redis Streams (current RC relay queue)
     miner_prefix: "miner"       # Miner state
     supplier_prefix: "supplier" # Supplier registry
     meter_prefix: "meter"       # Relay metering
@@ -92,17 +103,26 @@ Reference: `transport/redis/namespace.go`
 
 ## Key Patterns
 
-### Critical Data (Must Persist)
+### Current RC Critical Data (Must Persist Until Migration)
 
 | Pattern                                      | Type   | Purpose                              |
 |----------------------------------------------|--------|--------------------------------------|
 | `ha:smst:{sessionID}:nodes`                  | Hash   | SMST tree nodes for proof generation |
-| `ha:relays:{supplierAddress}`                | Stream | WAL for mined relays                 |
+| `ha:relays:{supplierAddress}`                | Stream | Durable relay queue between relayers and miners |
 | `ha:miner:sessions:{supplier}:{sessionID}`   | String | Session metadata                     |
 | `ha:miner:sessions:{supplier}:state:{state}` | Set    | Session state indexes                |
 | `ha:miner:sessions:{supplier}:index`         | Set    | All session IDs                      |
 
-**Loss Impact**: Cannot generate proofs → revenue loss
+**Loss Impact**: Cannot generate claims/proofs for affected sessions, causing
+revenue loss. Relay streams are queue data and must be bounded with ACK+delete,
+retention, and TTL; they are not intended to grow indefinitely.
+
+### Target Critical Data
+
+In the target architecture, the miner's revenue-critical SMST state is local to
+the single writer for a supplier/session and is protected by a durable local WAL
+plus periodic checkpoints. Redis should no longer be required for every SMST
+mutation on the miner hot path.
 
 ### Rebuildable Data (Optional Persist)
 

@@ -1,9 +1,17 @@
 - [X] Test with PATH
 - [X] CI - fmt, lint, build, docker image
 - [X] Docker Compose example (community contribution needed here!)
-- [] Config review
-- [] Code Review with the team and operators
-- [] Backend Health checks (like path to answer fast error)
-- [] Health checks (live vs. ready)
-- [] Redis Cluster in Tilt
-- [] E2E Tests
+- [X] RC: simplify miner claiming to primary/standby with orphan reclaim
+- [X] RC: bound Redis relay stream retention with ACK+delete fallback, TTL refresh, and global trimming
+- [ ] Config review
+- [ ] Code review with the team and operators
+- [ ] Backend health checks (fast failure like PATH expects)
+- [ ] Health checks (live vs. ready)
+- [ ] E2E tests
+- [ ] Fix miner shutdown semantics: do not ACK relays unless SMST/WAL persistence completed
+- [ ] Add explicit miner drain mode for safe upgrades
+- [ ] Design local SMST + durable WAL/checkpoint format
+- [ ] Benchmark local SMST/WAL against current Redis-backed SMST
+- [ ] Design supplier/session sharding with exactly one active miner writer per shard
+- [ ] Evaluate durable relay queue options beyond transitional Redis Streams
+- [ ] Redis Cluster in Tilt, if Redis remains part of the transitional queue/cache layer

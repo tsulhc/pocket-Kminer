@@ -95,9 +95,9 @@ scripts/loadtest/backends.sh sweep --include-broken > /tmp/sweep-all.csv
 
 The default `light` preset sends a minimal `eth_blockNumber`-shaped
 request (~70 bytes). That's fine for probe/ceiling but **wildly
-underestimates the cost of real production traffic** — on breeze we
-measured sui/op with p95 request bodies of 7-9 KB, 100x the light
-preset. Pool tuning with light payloads will under-provision pools
+underestimates the cost of real production traffic**. Production traces
+for batch-heavy services can have p95 request bodies of 7-9 KB, 100x the
+light preset. Pool tuning with light payloads will under-provision pools
 for services whose real traffic is batch-heavy or uses large methods.
 
 ```bash

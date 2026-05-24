@@ -252,23 +252,19 @@ leader_election:
   heartbeat_rate_seconds: 10  # Attempt acquire/renew every 10s
 
 # ==============================================================================
-# Supplier Claiming (HA Multi-Miner)
+# Supplier Claiming (Current RC HA)
 # ==============================================================================
-# Suppliers are automatically distributed across miner replicas using Redis leases.
+# Suppliers are claimed by miner replicas using Redis leases.
 # - Single miner: Claims all configured suppliers
-# - Multiple miners: Fair distribution with automatic rebalancing
+# - Multiple miners: A healthy primary can hold all suppliers; standbys reclaim
+#   only missing or expired claims. There is no fair-share rebalancing in the RC.
 #
 # How it works:
 #   1. Each miner claims suppliers via Redis SET NX with TTL
 #   2. Miners register in an "active" set with heartbeat
-#   3. Fair share is calculated: ceil(totalSuppliers / activeMiners)
-#   4. Rebalancing releases excess claims when new miners join
-#   5. If a miner crashes, its claims expire after claim_ttl_seconds
-#
-# Example with 3 miners and 9 suppliers:
-#   - Fair share = ceil(9/3) = 3 suppliers per miner
-#   - Each miner claims up to 3 suppliers
-#   - If miner-1 crashes, miner-2 and miner-3 claim its 3 suppliers
+#   3. Healthy claims are renewed by the current owner
+#   4. Standby miners scan for missing/expired claims on rebalance_interval_seconds
+#   5. If a miner crashes, its claims expire after claim_ttl_seconds and are reclaimed
 #
 # IMPORTANT: With 500+ suppliers, the renewal loop runs sequentially and can
 # take several seconds per cycle. If claim_ttl_seconds is too low, claims
@@ -277,7 +273,7 @@ leader_election:
 supplier_claiming:
   claim_ttl_seconds: 90      # Lease duration (default: 90s, increase for 500+ suppliers)
   renew_rate_seconds: 10     # Renewal frequency (default: 10s)
-  rebalance_interval_seconds: 30  # Redistribution check (default: 30s)
+  rebalance_interval_seconds: 30  # Orphan claim scan interval (default: 30s)
   # [HIGH LOAD 500-1000 suppliers] claim_ttl_seconds: 120
   # [HIGH LOAD 1000+ suppliers] claim_ttl_seconds: 180
   # Maximum failover time: claim_ttl_seconds + rebalance_interval_seconds
@@ -285,8 +281,10 @@ supplier_claiming:
 # ==============================================================================
 # Processing Configuration
 # ==============================================================================
-# NOTE: Session trees (SMST) are always stored in Redis and committed after each relay.
-# Redis streams serve as the WAL for relays, enabling HA compatibility and data durability.
+# NOTE: In the current RC, session trees (SMST) are stored in Redis and committed
+# after each relay. Redis Streams are the durable relayer-to-miner queue and must
+# stay bounded by ACK+delete, trimming, and TTL. The fork's target architecture
+# moves SMST mutation to local miner memory with a durable local WAL/checkpoints.
 deduplication_ttl_blocks: 10  # Keep relay hashes for 10 blocks to prevent duplicates
 batch_size: 1000  # Relay batch size for XREADGROUP (increased from 100 for better throughput)
 ack_batch_size: 50  # Acknowledge messages in batches (pipelined Redis XACK)

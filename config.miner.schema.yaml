@@ -440,7 +440,7 @@ properties:
 
   supplier_claiming:
     type: object
-    description: Distributed supplier claiming configuration (HA multi-miner). Controls Redis lease timing for distributing suppliers across miner replicas.
+    description: Distributed supplier claiming configuration for current RC primary/standby HA. Controls Redis lease timing for supplier ownership and orphan reclaim; it does not fair-share suppliers across active miners.
     properties:
       claim_ttl_seconds:
         type: integer
@@ -454,7 +454,7 @@ properties:
         minimum: 1
       rebalance_interval_seconds:
         type: integer
-        description: How often to check supplier distribution and scan for orphans (seconds).
+        description: How often to scan for missing or expired supplier claims (seconds). Kept under the historical rebalance name for config compatibility.
         default: 30
         minimum: 5
 
@@ -489,7 +489,7 @@ properties:
 
   cache_ttl:
     type: string
-    description: TTL for Redis cached data (sessions, SMST trees). Backup safety net - manual cleanup is primary.
+    description: TTL for Redis-backed session and SMST data in the current RC. Backup safety net for cleanup and retained for compatibility during migration toward local miner SMST/WAL.
     default: 2h
     pattern: ^[0-9]+(ns|us|µs|ms|s|m|h)$
 

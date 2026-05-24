@@ -1,6 +1,8 @@
 # Docker Compose Development Environment
 
-This directory contains a Docker Compose setup for running the complete Pocket RelayMiner stack locally.
+This directory contains a Docker Compose setup for running the complete Pocket
+RelayMiner stack locally. It uses the current RC architecture: stateless relayer,
+Redis-backed relay queue/session/SMST state, and primary/standby miner leases.
 
 ## Prerequisites
 
@@ -51,7 +53,7 @@ docker-compose down -v
 
 | Service       | Ports                                             | Description                        |
 |---------------|---------------------------------------------------|------------------------------------|
-| Redis         | 6379                                              | Shared state and message broker    |
+| Redis         | 6379                                              | RC queue, cache, coordination, SMST |
 | Validator     | 26657 (RPC), 9090 (gRPC), 1317 (REST)             | Pocket Network local node          |
 | Backend       | 8545 (HTTP), 50051 (gRPC), 9095 (Metrics)         | Demo backend server                |
 | accounts-init | -                                                 | Registers app pubkeys (runs once)  |

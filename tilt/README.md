@@ -1,6 +1,8 @@
 # Pocket RelayMiner - Tilt Development Environments
 
-This directory contains Tilt-based development environments for Pocket RelayMiner (HA mode).
+This directory contains Tilt-based development environments for Pocket RelayMiner.
+The local stack exercises the current RC architecture: stateless relayers,
+Redis-backed queues/session/SMST state, and primary/standby miner leases.
 
 ## Directory Structure
 
@@ -103,7 +105,7 @@ Pre-configured dashboards for monitoring:
 
 | Service | Docker Port | K8s Port | Description |
 |---------|-------------|----------|-------------|
-| Redis | 6379 | 6379 | Shared state |
+| Redis | 6379 | 6379 | RC queue, cache, coordination, and SMST state |
 | Validator RPC | 26657 | 26657 | Pocket node |
 | Validator gRPC | 9090 | 9090 | Pocket queries |
 | Backend HTTP | 8545 | 8545 | Demo backend |
@@ -174,24 +176,24 @@ Client → PATH Gateway → Relayer → Backend
               Miner → Validator (claims/proofs)
 ```
 
-### HA Failover
+### RC Miner Failover
 
 ```
 ┌─────────────┐     ┌─────────────┐
 │   Miner 1   │────▶│   Miner 2   │
-│  (Leader)   │     │  (Standby)  │
+│ (Primary)   │     │  (Standby)  │
 └─────────────┘     └─────────────┘
        │                   │
        └───────┬───────────┘
                ↓
-         Redis Lock
-      (Leader Election)
+       Redis Leases
+      (Orphan Reclaim)
 ```
 
 ## Performance Targets
 
 - **Relayer**: 1000+ RPS per replica
 - **Relay Validation**: <1ms average
-- **SMST Update**: <100µs
+- **SMST Update**: <100µs target; current RC stores SMST in Redis, target design moves this hot path local
 - **Cache L1 Hit**: <100ns
 - **Cache L2 Hit**: <2ms

@@ -1,6 +1,11 @@
 # Testing Guide
 
-This document describes how to verify the relay lifecycle is working correctly.
+This document describes how to verify the relay lifecycle is working correctly in
+the current RC architecture.
+
+The RC uses Redis Streams as the relayer-to-miner queue and Redis-backed
+session/SMST state. Multi-miner tests should expect primary/standby supplier
+claiming with orphan reclaim, not fair-share rebalancing across active miners.
 
 ## Prerequisites
 
@@ -21,7 +26,8 @@ This test verifies the complete relay lifecycle:
 ### Step 1: Check Baseline State
 
 ```bash
-# Check supplier distribution (should show 3 miners with ~5 suppliers each)
+# Check supplier claims. In the RC, one healthy primary may hold all suppliers;
+# standby miners should reclaim only missing/expired claims.
 # Note: Suppliers are auto-discovered from keyring keys
 pocket-relay-miner redis supplier --claims --redis redis://localhost:6379
 

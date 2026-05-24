@@ -1,12 +1,15 @@
-# Pocket RelayMiner (High Availability)
+# Pocket RelayMiner Fork
 
-Production-grade, horizontally scalable relay mining service for Pocket Network.
+Production-grade relay mining service for Pocket Network. This fork is evolving
+from the current Redis-backed high-availability implementation toward stateless
+relayers with durable, single-writer miner shards.
 
 ## Features
 
 - **Multi-Transport Support**: JSON-RPC (HTTP), WebSocket, gRPC, REST/Streaming (SSE)
 - **Horizontal Scaling**: Stateless relayers scale independently behind load balancers
-- **High Availability**: Redis-backed shared state with automatic leader election
+- **Current RC HA**: Redis Streams, Redis-backed session/SMST state, and miner lease failover
+- **Target Miner Design**: Single-writer miner shards with local SMST state and durable WAL
 - **Relay Validation**: Ring signature verification, session validation, supplier signing
 - **Relay Metering**: Rate limiting based on application stake
 - **Observability**: Prometheus metrics, pprof profiling, structured logging
@@ -25,19 +28,25 @@ Production-grade, horizontally scalable relay mining service for Pocket Network.
            └───────────────┼───────────────┘
                            │
                     ┌──────┴──────┐
-                    │    Redis    │  (shared state)
+                    │    Redis    │  (RC: streams, cache, coordination, SMST)
                     └──────┬──────┘
                            │
               ┌────────────┴────────────┐
               │                         │
         ┌─────┴─────┐             ┌─────┴─────┐
-        │   Miner   │             │   Miner   │  (leader election)
-        │ (Leader)  │             │ (Standby) │
+        │   Miner   │             │   Miner   │  (primary/standby leases)
+        │ (Primary) │             │ (Standby) │
         └───────────┘             └───────────┘
 ```
 
-**Relayer**: Validates relay requests, signs responses, publishes to Redis Streams
-**Miner**: Consumes relays, builds SMST trees, submits claims/proofs to blockchain
+**Relayer**: Validates relay requests, signs responses, publishes mined relays to streams.
+
+**Miner**: Consumes relays, builds SMST trees, submits claims/proofs to blockchain.
+
+The current release-candidate architecture still stores SMST/session state in Redis
+for compatibility. The target architecture keeps relayers stateless but moves the
+miner hot path to local in-memory SMST plus a durable local WAL, with Redis retained
+for coordination, cache, metadata, and transitional relay streams.
 
 ## Requirements
 
@@ -169,6 +178,7 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md) for development workflow and guidelines
 ## Documentation
 
 - [`docs/PROTOCOL_SPEC.md`](docs/PROTOCOL_SPEC.md) - Relay protocol specification
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) - Current RC and target architecture direction
 - [`docs/REDIS.md`](docs/REDIS.md) - Redis architecture and key patterns
 - [`docs/TESTING.md`](docs/TESTING.md) - Testing guide
 - [`docs/WEBSOCKET_HANDSHAKE_PROTOCOL.md`](docs/WEBSOCKET_HANDSHAKE_PROTOCOL.md) - WebSocket protocol details

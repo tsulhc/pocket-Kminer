@@ -249,8 +249,8 @@ http_transport:
 # ==============================================================================
 # Off by default. The relayer does NOT gzip the signed relay responses it
 # returns to the gateway unless this is explicitly enabled. gzip was shown
-# to consume ~9% of relayer CPU at 200 RPS on the Apr 14 2026 pprof profile
-# from breeze, so the default prioritises CPU over bandwidth. The gateway
+# to consume ~9% of relayer CPU at 200 RPS in profiling, so the default
+# prioritises CPU over bandwidth. The gateway
 # still negotiates compression with downstream clients independently.
 #
 # When enabled, compression only actually runs when both:

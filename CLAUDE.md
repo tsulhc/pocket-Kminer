@@ -84,10 +84,14 @@ This file (CLAUDE.md) provides AI-specific guidance. For general contribution ru
 
 ## Project Overview
 
-**Pocket RelayMiner (HA)** is a production-grade, horizontally scalable relay mining service for Pocket Network with full multi-transport support.
+**Pocket RelayMiner** is a production-grade, horizontally scalable relay mining
+service for Pocket Network with full multi-transport support. This repository is
+a fork: the current RC remains Redis-backed for compatibility, while the target
+architecture moves miner SMST mutation to local memory plus durable WAL/checkpoints.
 
 - **Language**: Go 1.24.3
-- **Architecture**: Distributed microservices with Redis-backed state
+- **Current RC Architecture**: Distributed microservices with Redis-backed queues/session/SMST state
+- **Target Architecture**: Stateless relayers plus single-writer miner shards with local SMST/WAL
 - **Transports**: JSON-RPC (HTTP), WebSocket, gRPC, REST/Streaming (SSE)
 - **Performance Target**: 1000+ RPS per relayer replica
 - **Availability**: 99.9% uptime with automatic failover
@@ -105,9 +109,9 @@ This file (CLAUDE.md) provides AI-specific guidance. For general contribution ru
      - **Validation**: <1ms (ring signature + session verification)
      - **Connection Pool**: 5x defaults (500/100/500) handles 1000 RPS @ 500ms backend latency
 
-2. **Miner** (`miner/`): Stateful claim/proof submission with leader election
+2. **Miner** (`miner/`): Stateful claim/proof submission with Redis lease ownership in the current RC
    - Consumes from Redis Streams
-   - Builds SMST trees in Redis
+   - Builds SMST trees in Redis today; target is local SMST + durable WAL/checkpoints
    - Submits claims and proofs to blockchain
    - **Performance**: ~30µs per SMST operation (Redis Hash operations)
 
@@ -293,13 +297,16 @@ If any gate fails, fix it before reporting completion. Do NOT report "done" with
 
 ## Redis Architecture
 
-**ALL session state is in Redis - no local disk storage.**
+**Current RC:** session state and SMST nodes are in Redis for compatibility.
+**Target fork direction:** miner SMST mutation moves to local memory with a
+durable local WAL/checkpoints; Redis remains for coordination/cache/metadata and
+transitional relay queues.
 
 ### Key Patterns
 
 Reference: See full mapping in `cmd/cmd_redis_debug.go` and subcommands
 
-- **WAL**: `ha:relays:{supplierAddress}` (Redis Streams)
+- **Relay Queue**: `ha:relays:{supplierAddress}` (Redis Streams)
 - **SMST Nodes**: `ha:smst:{sessionID}:nodes` (Redis Hashes)
 - **Session Metadata**: `ha:miner:sessions:{supplier}:{sessionID}` (Redis Strings/JSON)
 - **Session Indexes**:
@@ -669,7 +676,7 @@ pocket-relay-miner redis flush --pattern "ha:test:*"
 **Available debug commands:**
 - `sessions`: Inspect session metadata and lifecycle state
 - `smst`: View SMST tree node data
-- `streams`: Monitor Redis Streams (WAL) and consumer groups
+- `streams`: Monitor Redis Streams relay queues and consumer groups
 - `cache`: Inspect/invalidate cache entries (L2 Redis layer)
 - `leader`: Check global leader election status and TTL
 - `dedup`: Inspect relay deduplication sets
