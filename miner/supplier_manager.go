@@ -2,7 +2,6 @@ package miner
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"runtime/debug"
 	"sync"
@@ -32,11 +31,6 @@ type SupplierQueryClient interface {
 	// the next GetSupplier call fetches fresh data from the chain.
 	InvalidateSupplier(operatorAddress string)
 }
-
-// ErrDrainAborted is returned by onSupplierReleased when the drain is vetoed
-// because the supplier is still staked on-chain. This tells the claimer to
-// keep the Redis claim key alive instead of releasing it.
-var ErrDrainAborted = errors.New("drain aborted: supplier still staked on-chain")
 
 // SupplierStatus represents the state of a supplier in the miner.
 type SupplierStatus int
@@ -714,34 +708,20 @@ func (m *SupplierManager) onSupplierClaimed(ctx context.Context, supplier string
 }
 
 // onSupplierReleased is called when a supplier claim is released.
-// It verifies on-chain staking status before draining to prevent false drains.
+// Internal releases are miner handoffs, not chain-level unstake events. We keep
+// the chain query for audit metrics, but staking status must not veto release.
 func (m *SupplierManager) onSupplierReleased(ctx context.Context, supplier string) error {
-	shouldDrain, verifyResult := m.verifySupplierUnstaked(ctx, supplier, "rebalance_release")
+	_, verifyResult := m.verifySupplierUnstaked(ctx, supplier, "rebalance_release")
 	supplierDrainDecisionTotal.WithLabelValues("rebalance_release", verifyResult).Inc()
 
 	m.logger.Debug().
 		Str("supplier", supplier).
 		Str("drain_trigger", "rebalance_release").
 		Str("on_chain_result", verifyResult).
-		Bool("drain_aborted", !shouldDrain).
 		Str("instance_id", m.config.MinerID).
 		Msg("drain decision audit")
 
-	if !shouldDrain {
-		logEvent := m.logger.Debug()
-		if verifyResult == "error" {
-			logEvent = m.logger.Warn()
-		}
-		logEvent.
-			Str("supplier", supplier).
-			Str("on_chain_result", verifyResult).
-			Str("instance_id", m.config.MinerID).
-			Msg("supplier release skipped, keeping claim")
-		return ErrDrainAborted
-	}
-
-	// Remove the supplier (with drain)
-	m.removeSupplier(supplier)
+	go m.removeSupplier(supplier)
 	return nil
 }
 

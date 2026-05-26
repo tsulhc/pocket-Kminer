@@ -165,26 +165,21 @@ func TestVerifySupplierUnstaked_NoQueryClient(t *testing.T) {
 }
 
 // =============================================================================
-// DRAIN-05: onSupplierReleased aborts drain when supplier is staked
+// DRAIN-05: onSupplierReleased drains even when supplier is staked
 // =============================================================================
 
-func TestOnSupplierReleased_AbortsWhenStaked(t *testing.T) {
+func TestOnSupplierReleased_DrainsEvenWhenStaked(t *testing.T) {
 	client := newStakedQueryClient("pokt1staked")
 	mgr := newTestSupplierManager(t, client)
 
-	// Pre-populate supplier in the map
-	st := &SupplierState{OperatorAddr: "pokt1staked"}
-	st.StoreStatus(SupplierStatusActive)
-	mgr.suppliers["pokt1staked"] = st
+	beforeStaked := testutil.ToFloat64(supplierDrainDecisionTotal.WithLabelValues("rebalance_release", "staked"))
 
 	err := mgr.onSupplierReleased(context.Background(), "pokt1staked")
-	require.ErrorIs(t, err, ErrDrainAborted, "staked supplier release should return ErrDrainAborted")
+	require.NoError(t, err, "internal release must not be vetoed by on-chain staking status")
 
-	// Supplier should still exist (drain was aborted)
-	mgr.suppliersMu.RLock()
-	_, exists := mgr.suppliers["pokt1staked"]
-	mgr.suppliersMu.RUnlock()
-	assert.True(t, exists, "supplier should still exist after drain aborted (staked on-chain)")
+	afterStaked := testutil.ToFloat64(supplierDrainDecisionTotal.WithLabelValues("rebalance_release", "staked"))
+	assert.Equal(t, beforeStaked+1, afterStaked,
+		"audit metric should still record on-chain status even though release proceeds")
 }
 
 func TestOnSupplierReleased_ProceedsWhenNotFound(t *testing.T) {
@@ -224,10 +219,8 @@ func TestOnKeyChange_RemovalDrainsIfStaked(t *testing.T) {
 	assert.False(t, shouldDrain, "verifySupplierUnstaked returns false for staked supplier")
 	assert.Equal(t, "staked", result)
 
-	// But the onKeyChange removal branch proceeds regardless (operator explicit action).
-	// Verify by checking the metric label would be "key_removal"/"staked" and that
-	// the code does NOT abort (unlike onSupplierReleased which DOES abort).
-	// The key difference: onKeyChange always calls removeSupplier; onSupplierReleased aborts.
+	// onKeyChange removal proceeds regardless (operator explicit action). Internal
+	// release also proceeds; the difference is only the drain_trigger label.
 	beforeStaked := testutil.ToFloat64(supplierDrainDecisionTotal.WithLabelValues("key_removal", "staked"))
 	supplierDrainDecisionTotal.WithLabelValues("key_removal", result).Inc()
 	afterStaked := testutil.ToFloat64(supplierDrainDecisionTotal.WithLabelValues("key_removal", "staked"))
@@ -243,18 +236,10 @@ func TestDrainMetric_RebalanceRelease(t *testing.T) {
 	client := newStakedQueryClient("pokt1staked")
 	mgr := newTestSupplierManager(t, client)
 
-	// Pre-populate supplier
-	st := &SupplierState{OperatorAddr: "pokt1staked"}
-	st.StoreStatus(SupplierStatusActive)
-	mgr.suppliers["pokt1staked"] = st
-
-	// Get the counter value before
 	beforeStaked := testutil.ToFloat64(supplierDrainDecisionTotal.WithLabelValues("rebalance_release", "staked"))
 
-	// Trigger drain decision (will be aborted because staked)
 	_ = mgr.onSupplierReleased(context.Background(), "pokt1staked")
 
-	// Counter should have incremented
 	afterStaked := testutil.ToFloat64(supplierDrainDecisionTotal.WithLabelValues("rebalance_release", "staked"))
 	assert.Equal(t, beforeStaked+1, afterStaked,
 		"drain decision metric should increment for rebalance_release/staked")

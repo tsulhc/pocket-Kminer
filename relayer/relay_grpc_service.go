@@ -526,6 +526,7 @@ func (s *RelayGRPCService) forwardToBackend(
 	if backendParsed.Path != "" && backendParsed.Path != "/" {
 		requestURL.Path = backendParsed.Path + requestURL.Path
 	}
+	requestURL.Path = normalizeBackendPath(requestURL.Path)
 
 	// Create HTTP request
 	req, err := http.NewRequestWithContext(ctx, poktHTTPRequest.Method, requestURL.String(), bytes.NewReader(poktHTTPRequest.BodyBz))

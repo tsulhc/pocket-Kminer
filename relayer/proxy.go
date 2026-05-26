@@ -1471,6 +1471,9 @@ func (p *ProxyServer) forwardToBackendWithStreaming(
 		// Merge the backend URL path (or explicit base_path) with the client
 		// request path. See mergeBackendPath for the precedence rules.
 		requestURL.Path = mergeBackendPath(parsedBackendURL.Path, basePath, poktURL.Path)
+		// Normalize multi-slash artifacts before dispatch. Some raw backends
+		// return 404 for paths like `//` instead of normalizing them.
+		requestURL.Path = normalizeBackendPath(requestURL.Path)
 
 		// Merge query parameters from both backend URL and POKT request
 		query := requestURL.Query()
@@ -1501,7 +1504,7 @@ func (p *ProxyServer) forwardToBackendWithStreaming(
 	} else {
 		// Fallback: forward the raw body for non-relay traffic
 		fullBackendURL := backendURL
-		merged := mergeBackendPath(parsedBackendURL.Path, basePath, originalReq.URL.Path)
+		merged := normalizeBackendPath(mergeBackendPath(parsedBackendURL.Path, basePath, originalReq.URL.Path))
 		if merged != parsedBackendURL.Path {
 			// Copy parsedBackendURL to avoid mutating the shared pool endpoint URL
 			fallbackURL := *parsedBackendURL
@@ -2400,4 +2403,13 @@ func mergeBackendPath(urlPath, basePath, clientPath string) string {
 		}
 	}
 	return stdpath.Join(prefix, clientPath)
+}
+
+// normalizeBackendPath collapses multi-slash artifacts so raw backends without
+// a normalizing reverse proxy don't reject requests such as `POST //`.
+func normalizeBackendPath(p string) string {
+	if p == "" {
+		return ""
+	}
+	return stdpath.Clean(p)
 }

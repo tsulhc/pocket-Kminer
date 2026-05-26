@@ -312,19 +312,18 @@ func (c *SupplierClaimer) TryClaim(ctx context.Context, supplier string) bool {
 }
 
 // Release releases a supplier claim.
-// The release callback is invoked BEFORE the Redis claim key is deleted.
-// If the callback returns an error (e.g., ErrDrainAborted), the claim key
-// is kept and the supplier stays claimed by this instance.
+// The release callback is invoked BEFORE the Redis claim key is deleted. If the
+// callback returns an error, the claim key is kept and the supplier stays
+// claimed by this instance.
 func (c *SupplierClaimer) Release(ctx context.Context, supplier string) error {
-	// Invoke release callback FIRST — it may veto the release (e.g., supplier
-	// is still staked on-chain). If it returns an error, we abort and keep the
-	// Redis claim key alive to prevent orphan-reclaim thrashing.
+	// Invoke release callback FIRST. If it returns an error, we abort and keep
+	// the Redis claim key alive to prevent orphan-reclaim thrashing.
 	if c.onReleaseFn != nil {
 		if err := c.onReleaseFn(ctx, supplier); err != nil {
 			c.logger.Debug().
 				Err(err).
 				Str("supplier", supplier).
-				Msg("release vetoed by callback, keeping claim")
+				Msg("release callback failed, keeping claim")
 			return err
 		}
 	}

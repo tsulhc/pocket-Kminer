@@ -158,6 +158,29 @@ func TestMergeBackendPath(t *testing.T) {
 	}
 }
 
+func TestNormalizeBackendPath(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"empty stays empty", "", ""},
+		{"single slash unchanged", "/", "/"},
+		{"double slash collapses", "//", "/"},
+		{"triple slash collapses", "///", "/"},
+		{"leading double slash", "//rpc", "/rpc"},
+		{"internal double slash", "/foo//bar", "/foo/bar"},
+		{"trailing slash dropped", "/foo/", "/foo"},
+		{"plain path unchanged", "/v1/users", "/v1/users"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, normalizeBackendPath(tt.in))
+		})
+	}
+}
+
 func TestShouldCompressResponse(t *testing.T) {
 	tests := []struct {
 		name        string
