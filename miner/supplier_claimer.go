@@ -3,6 +3,7 @@ package miner
 import (
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -168,6 +169,8 @@ func (c *SupplierClaimer) SetCallbacks(
 // Start initializes the claimer and begins the claim, renew, and orphan scan loops.
 func (c *SupplierClaimer) Start(ctx context.Context, suppliers []string) error {
 	c.ctx, c.cancelFn = context.WithCancel(ctx)
+	suppliers = append([]string(nil), suppliers...)
+	sort.Strings(suppliers)
 
 	c.allSuppliersMu.Lock()
 	c.allSuppliers = suppliers
@@ -685,6 +688,9 @@ func (c *SupplierClaimer) claimOrphaned() {
 // UpdateSuppliers updates the list of configured suppliers.
 // Called when KeyManager detects a config change.
 func (c *SupplierClaimer) UpdateSuppliers(suppliers []string) {
+	suppliers = append([]string(nil), suppliers...)
+	sort.Strings(suppliers)
+
 	c.allSuppliersMu.RLock()
 	unchanged := len(c.allSuppliers) == len(suppliers)
 	if unchanged {

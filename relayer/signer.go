@@ -38,6 +38,7 @@ type Signer interface {
 // supplier whose key is loaded.
 type ResponseSigner struct {
 	logger logging.Logger
+	mu     sync.RWMutex
 
 	// signers maps supplier operator address -> signer
 	signers map[string]Signer
@@ -74,15 +75,50 @@ func NewResponseSigner(
 	return rs, nil
 }
 
+// UpdateKeys atomically replaces the signer set with the provided keys.
+func (rs *ResponseSigner) UpdateKeys(keys map[string]cryptotypes.PrivKey) {
+	signers := make(map[string]Signer, len(keys))
+	operatorAddresses := make([]string, 0, len(keys))
+	for operatorAddr, privKey := range keys {
+		signers[operatorAddr] = &privKeySigner{privKey: privKey}
+		operatorAddresses = append(operatorAddresses, operatorAddr)
+	}
+
+	rs.mu.Lock()
+	rs.signers = signers
+	rs.operatorAddresses = operatorAddresses
+	rs.mu.Unlock()
+
+	rs.logger.Info().Int("count", len(keys)).Msg("response signer keys updated")
+}
+
 // GetOperatorAddresses returns the list of operator addresses that can sign.
 func (rs *ResponseSigner) GetOperatorAddresses() []string {
-	return rs.operatorAddresses
+	rs.mu.RLock()
+	defer rs.mu.RUnlock()
+	out := make([]string, len(rs.operatorAddresses))
+	copy(out, rs.operatorAddresses)
+	return out
 }
 
 // HasSigner returns true if a signer exists for the given operator address.
 func (rs *ResponseSigner) HasSigner(operatorAddress string) bool {
+	rs.mu.RLock()
+	defer rs.mu.RUnlock()
 	_, ok := rs.signers[operatorAddress]
 	return ok
+}
+
+func (rs *ResponseSigner) getSigner(supplierOperatorAddr string) (Signer, []string, bool) {
+	rs.mu.RLock()
+	defer rs.mu.RUnlock()
+	signer, ok := rs.signers[supplierOperatorAddr]
+	if ok {
+		return signer, nil, true
+	}
+	operatorAddresses := make([]string, len(rs.operatorAddresses))
+	copy(operatorAddresses, rs.operatorAddresses)
+	return nil, operatorAddresses, false
 }
 
 // SignRelayResponse signs a relay response for the given supplier operator.
@@ -91,9 +127,9 @@ func (rs *ResponseSigner) SignRelayResponse(
 	relayResponse *servicetypes.RelayResponse,
 	supplierOperatorAddr string,
 ) error {
-	signer, ok := rs.signers[supplierOperatorAddr]
+	signer, available, ok := rs.getSigner(supplierOperatorAddr)
 	if !ok {
-		return fmt.Errorf("no signer for operator %s (available: %v)", supplierOperatorAddr, rs.operatorAddresses)
+		return fmt.Errorf("no signer for operator %s (available: %v)", supplierOperatorAddr, available)
 	}
 
 	// Ensure payload hash is set
@@ -126,9 +162,9 @@ func (rs *ResponseSigner) SignRelayResponseWithContext(
 	relayResponse *servicetypes.RelayResponse,
 	supplierOperatorAddr string,
 ) ([]byte, error) {
-	signer, ok := rs.signers[supplierOperatorAddr]
+	signer, available, ok := rs.getSigner(supplierOperatorAddr)
 	if !ok {
-		return nil, fmt.Errorf("no signer for operator %s (available: %v)", supplierOperatorAddr, rs.operatorAddresses)
+		return nil, fmt.Errorf("no signer for operator %s (available: %v)", supplierOperatorAddr, available)
 	}
 
 	// Ensure payload hash is set

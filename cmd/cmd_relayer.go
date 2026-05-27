@@ -516,28 +516,26 @@ func runHARelayer(cmd *cobra.Command, _ []string) error {
 	if len(keyProviders) == 0 {
 		logger.Warn().Msg("no key providers configured - response signing will be disabled (relays will fail)")
 	} else {
-		// Load keys from all providers (both return map[string]cryptotypes.PrivKey)
-		loadedKeys := make(map[string]cryptotypes.PrivKey)
-		for _, provider := range keyProviders {
-			providerKeys, loadErr := provider.LoadKeys(ctx)
-			if loadErr != nil {
-				logger.Warn().Err(loadErr).Str("provider", provider.Name()).Msg("failed to load keys from provider")
-				continue
-			}
-			for addr, key := range providerKeys {
-				loadedKeys[addr] = key
-			}
-			logger.Info().Str("provider", provider.Name()).Int("keys", len(providerKeys)).Msg("loaded keys from provider")
+		keyManager := keys.NewMultiProviderKeyManager(
+			logger,
+			keyProviders,
+			keys.KeyManagerConfig{HotReloadEnabled: true},
+		)
+		defer func() { _ = keyManager.Close() }()
+
+		if err := keyManager.Start(ctx); err != nil {
+			return fmt.Errorf("failed to start relayer key manager: %w", err)
 		}
 
-		// Close providers
-		for _, provider := range keyProviders {
-			_ = provider.Close()
+		loadedKeys, loadErr := collectKeyManagerSigners(keyManager)
+		if loadErr != nil {
+			return fmt.Errorf("failed to collect relayer signing keys: %w", loadErr)
 		}
 
 		if len(loadedKeys) == 0 {
-			logger.Warn().Msg("no keys found - response signing will be disabled")
-		} else {
+			logger.Warn().Msg("no keys found - response signing initialized empty for hot-reload")
+		}
+		{
 			responseSigner, signerErr := relayer.NewResponseSigner(logger, loadedKeys)
 			if signerErr != nil {
 				return fmt.Errorf("failed to create response signer: %w", signerErr)
@@ -623,6 +621,26 @@ func runHARelayer(cmd *cobra.Command, _ []string) error {
 			logger.Info().
 				Int("allowed_suppliers", len(validatorConfig.AllowedSupplierAddresses)).
 				Msg("full relay validator initialized with session validation")
+
+			keyManager.OnKeyChange(func(operatorAddr string, added bool) {
+				currentKeys, err := collectKeyManagerSigners(keyManager)
+				if err != nil {
+					logger.Error().
+						Err(err).
+						Str("operator", operatorAddr).
+						Bool("added", added).
+						Msg("failed to refresh relayer signing keys")
+					return
+				}
+
+				responseSigner.UpdateKeys(currentKeys)
+				fullValidator.UpdateAllowedSuppliers(responseSigner.GetOperatorAddresses())
+				logger.Info().
+					Str("operator", operatorAddr).
+					Bool("added", added).
+					Int("num_keys", len(currentKeys)).
+					Msg("relayer signing keys hot-reloaded")
+			})
 
 			// Create RelayProcessor for proper relay mining with session metadata
 			signerAdapter := relayer.NewResponseSignerAdapter(responseSigner)
@@ -897,4 +915,17 @@ func verifyGRPCConnectivity(ctx context.Context, logger logging.Logger, grpcURL 
 		Msg("gRPC endpoint responded successfully to GetParams query")
 
 	return nil
+}
+
+func collectKeyManagerSigners(keyManager keys.KeyManager) (map[string]cryptotypes.PrivKey, error) {
+	suppliers := keyManager.ListSuppliers()
+	signers := make(map[string]cryptotypes.PrivKey, len(suppliers))
+	for _, supplier := range suppliers {
+		signer, err := keyManager.GetSigner(supplier)
+		if err != nil {
+			return nil, fmt.Errorf("get signer for supplier %s: %w", supplier, err)
+		}
+		signers[supplier] = signer
+	}
+	return signers, nil
 }

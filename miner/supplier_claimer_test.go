@@ -144,6 +144,21 @@ func (s *SupplierClaimerTestSuite) TestClaimedMapTimestamp() {
 		"claimed timestamp should be <= after time")
 }
 
+func (s *SupplierClaimerTestSuite) TestUpdateSuppliersIgnoresOrderOnlyChanges() {
+	claimer := s.createTestClaimer("test-instance-order")
+	claimer.ctx, claimer.cancelFn = context.WithCancel(s.ctx)
+	defer claimer.cancelFn()
+
+	claimer.UpdateSuppliers([]string{"supplierB", "supplierA", "supplierC"})
+	claimer.UpdateSuppliers([]string{"supplierC", "supplierB", "supplierA"})
+
+	claimer.allSuppliersMu.RLock()
+	suppliers := append([]string(nil), claimer.allSuppliers...)
+	claimer.allSuppliersMu.RUnlock()
+
+	s.Require().Equal([]string{"supplierA", "supplierB", "supplierC"}, suppliers)
+}
+
 func TestSupplierClaimerTestSuite(t *testing.T) {
 	suite.Run(t, new(SupplierClaimerTestSuite))
 }

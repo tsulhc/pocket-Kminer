@@ -31,6 +31,9 @@ type RelayValidator interface {
 	// SetCurrentBlockHeight updates the current block height.
 	// This should be called when a new block is received.
 	SetCurrentBlockHeight(height int64)
+
+	// UpdateAllowedSuppliers atomically replaces the allowed supplier set.
+	UpdateAllowedSuppliers(addresses []string)
 }
 
 // ValidatorConfig contains configuration for the relay validator.
@@ -60,6 +63,7 @@ type relayValidator struct {
 
 	// allowedSuppliers is a set of allowed supplier operator addresses.
 	allowedSuppliers map[string]struct{}
+	allowedMu        sync.RWMutex
 }
 
 // NewRelayValidator creates a new relay validator.
@@ -85,6 +89,30 @@ func NewRelayValidator(
 	}
 }
 
+// UpdateAllowedSuppliers atomically replaces the allowed supplier set.
+func (rv *relayValidator) UpdateAllowedSuppliers(addresses []string) {
+	allowedSuppliers := make(map[string]struct{}, len(addresses))
+	for _, addr := range addresses {
+		allowedSuppliers[addr] = struct{}{}
+	}
+
+	rv.allowedMu.Lock()
+	rv.allowedSuppliers = allowedSuppliers
+	rv.allowedMu.Unlock()
+
+	rv.logger.Info().Int("count", len(addresses)).Msg("relay validator allowed suppliers updated")
+}
+
+func (rv *relayValidator) isSupplierAllowed(supplierAddr string) bool {
+	rv.allowedMu.RLock()
+	defer rv.allowedMu.RUnlock()
+	if len(rv.allowedSuppliers) == 0 {
+		return true
+	}
+	_, ok := rv.allowedSuppliers[supplierAddr]
+	return ok
+}
+
 // ValidateRelayRequest validates a relay request.
 func (rv *relayValidator) ValidateRelayRequest(
 	ctx context.Context,
@@ -102,7 +130,7 @@ func (rv *relayValidator) ValidateRelayRequest(
 
 	// Check if the supplier is allowed
 	supplierAddr := meta.GetSupplierOperatorAddress()
-	if _, ok := rv.allowedSuppliers[supplierAddr]; !ok && len(rv.allowedSuppliers) > 0 {
+	if !rv.isSupplierAllowed(supplierAddr) {
 		return fmt.Errorf("supplier %s is not allowed by this relayer", supplierAddr)
 	}
 
