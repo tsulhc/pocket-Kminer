@@ -45,22 +45,14 @@ func decodeBroadcastTxTimeoutTimestamp(t *testing.T, txBytes []byte) time.Time {
 }
 
 // TestComputeEffectiveTxTimeout_HardLimitSafety is the regression guard
-// for the `unordered tx ttl exceeds 10m0s` CheckTx rejection observed
-// by operators after build 4b09780. The previous defaults handed the
-// chain a timeoutTimestamp that sat exactly at the cosmos-sdk 10-minute
-// hard ceiling, and any amount of clock skew between miner host and
-// validator pushed CheckTx over the edge.
-//
-// The fix: subtract a configurable clock-skew buffer from the raw
-// window-based deadline BEFORE clamping, and default the absolute max
-// to 500 ms below the cosmos-sdk hard limit.
+// for unordered TX TTL selection. Window-based claim/proof submissions
+// must use the maximum safe mempool TTL, not a guessed protocol-window
+// duration, while still staying below the cosmos-sdk 10-minute hard limit.
 func TestComputeEffectiveTxTimeout_HardLimitSafety(t *testing.T) {
 	const (
 		hardLimit = 10 * time.Minute
-		min       = 2 * time.Minute                  // DefaultTxTimeoutMin
-		max       = hardLimit - 500*time.Millisecond // DefaultTxTimeoutMax
-		skew      = 60 * time.Second                 // DefaultTxTimeoutClockSkewBuffer
-		fallback  = 2 * time.Minute                  // DefaultTxTimeoutDefault
+		max       = hardLimit - 10*time.Second
+		fallback  = 2 * time.Minute // DefaultTxTimeoutDefault
 	)
 
 	tests := []struct {
@@ -68,7 +60,7 @@ func TestComputeEffectiveTxTimeout_HardLimitSafety(t *testing.T) {
 		raw            time.Duration
 		wantTimeout    time.Duration
 		wantSource     string
-		lowerThanLimit bool // true iff the result leaves room under hardLimit
+		windowBased    bool
 	}{
 		{
 			name:        "no raw window falls back to default",
@@ -77,50 +69,41 @@ func TestComputeEffectiveTxTimeout_HardLimitSafety(t *testing.T) {
 			wantSource:  "default",
 		},
 		{
-			name:        "raw smaller than min after skew clamps up to min",
-			raw:         30 * time.Second, // 30s - 60s = -30s → clamp to min
-			wantTimeout: min,
-			wantSource:  "min_clamp",
+			name:        "small raw window still gets maximum safe TTL",
+			raw:         30 * time.Second,
+			wantTimeout: max,
+			wantSource:  "window_max",
+			windowBased: true,
 		},
 		{
-			name:           "typical mid-window deadline subtracts skew cleanly",
-			raw:            5 * time.Minute, // 300 - 60 = 240s = 4min
-			wantTimeout:    5*time.Minute - skew,
-			wantSource:     "window",
-			lowerThanLimit: true,
+			name:        "typical mid-window deadline gets maximum safe TTL",
+			raw:         5 * time.Minute,
+			wantTimeout: max,
+			wantSource:  "window_max",
+			windowBased: true,
 		},
 		{
-			name: "raw at the cosmos-sdk hard limit lands safely under via skew subtraction",
-			raw:  hardLimit, // exactly 10min raw
-			// hardLimit - skew = 9m, inside [min, max] → "window" path
-			// lands at 9min. Crucially, NOT at hardLimit: jitter cannot
-			// push CheckTx over the 10m ceiling.
-			wantTimeout:    hardLimit - skew,
-			wantSource:     "window",
-			lowerThanLimit: true,
+			name:        "raw at the cosmos-sdk hard limit still uses configured safe max",
+			raw:         hardLimit,
+			wantTimeout: max,
+			wantSource:  "window_max",
+			windowBased: true,
 		},
 		{
-			name:           "raw above hard limit still produces a timeout strictly below hard limit",
-			raw:            2 * hardLimit,
-			wantTimeout:    max,
-			wantSource:     "max_clamp",
-			lowerThanLimit: true,
-		},
-		{
-			name:           "raw slightly above (max + skew) clamps to max, NOT to raw-skew",
-			raw:            max + skew + time.Second, // would yield max+1s after skew — must clamp
-			wantTimeout:    max,
-			wantSource:     "max_clamp",
-			lowerThanLimit: true,
+			name:        "raw above hard limit still uses configured safe max",
+			raw:         2 * hardLimit,
+			wantTimeout: max,
+			wantSource:  "window_max",
+			windowBased: true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, source := computeEffectiveTxTimeout(tt.raw, skew, min, max, fallback)
+			got, source := computeEffectiveTxTimeout(tt.raw, max, fallback)
 			require.Equal(t, tt.wantSource, source, "source classification wrong for raw=%s", tt.raw)
 			require.Equal(t, tt.wantTimeout, got, "effective timeout wrong for raw=%s", tt.raw)
-			if tt.lowerThanLimit {
+			if tt.windowBased {
 				// The entire reason this helper exists: never hand the
 				// chain a timeoutTimestamp at or past the hard limit.
 				require.Less(t, got, hardLimit,
@@ -130,40 +113,42 @@ func TestComputeEffectiveTxTimeout_HardLimitSafety(t *testing.T) {
 	}
 }
 
-// TestComputeEffectiveTxTimeout_SkewSubtractionOrder proves that the
-// skew is subtracted BEFORE clamping, not after. If the order were
-// reversed (clamp → subtract), a raw deadline of exactly max would
-// survive as max and only get the skew treatment post-facto, but the
-// hard-limit safety of the max ceiling would be broken. We verify the
-// window path produces (raw - skew) for an in-range input.
-func TestComputeEffectiveTxTimeout_SkewSubtractionOrder(t *testing.T) {
-	const (
-		min      = 1 * time.Minute
-		max      = 9 * time.Minute
-		skew     = 45 * time.Second
-		fallback = 2 * time.Minute
+// TestComputeEffectiveTxTimeout_ProductionProofTimeoutRegression pins the
+// exact incident shape from settlement block 790233: 10 remaining blocks,
+// configured as 30s each, with a 120s skew buffer. The old algorithm produced
+// a 180s TTL; the proof tx expired before the next non-empty block. Window
+// submissions must instead use the safe max TTL.
+func TestComputeEffectiveTxTimeout_ProductionProofTimeoutRegression(t *testing.T) {
+	got, source := computeEffectiveTxTimeout(
+		5*time.Minute,
+		10*time.Minute-10*time.Second,
+		2*time.Minute,
 	)
 
-	// Pick a raw that is comfortably inside the window so no clamping
-	// happens. The result MUST be raw - skew exactly.
-	raw := 5 * time.Minute
-	got, source := computeEffectiveTxTimeout(raw, skew, min, max, fallback)
-
-	require.Equal(t, "window", source)
-	require.Equal(t, raw-skew, got,
-		"effective timeout must equal (raw - skew) inside the window; got %s", got)
+	require.Equal(t, "window_max", source)
+	require.Equal(t, 10*time.Minute-10*time.Second, got)
 }
 
-// TestComputeEffectiveTxTimeout_ZeroSkew mirrors an operator who
-// explicitly sets tx_timeout_clock_skew_buffer_seconds: 0 (tightly
-// co-located miner + validator, no jitter). The adjusted path should
-// pass raw through unchanged, still clamped by [min, max].
-func TestComputeEffectiveTxTimeout_ZeroSkew(t *testing.T) {
-	got, source := computeEffectiveTxTimeout(
-		5*time.Minute, 0, 1*time.Minute, 9*time.Minute, 2*time.Minute,
-	)
-	require.Equal(t, "window", source)
-	require.Equal(t, 5*time.Minute, got)
+func TestNewTxClient_RaisesLowConfiguredTxTimeoutMax(t *testing.T) {
+	testServer := setupMockGRPCServer(t)
+	defer testServer.cleanup()
+
+	supplierAddr := "pokt1supplier-low-max"
+	logger := logging.NewLoggerFromConfig(logging.DefaultConfig())
+	km := setupTestKeyManager(t, supplierAddr)
+	defer km.Close()
+
+	tc, err := NewTxClient(logger, km, TxClientConfig{
+		GRPCEndpoint: testServer.address,
+		ChainID:      "test-chain",
+		GasLimit:     100000,
+		GasPrice:     parseGasPrice(t, "0.000001upokt"),
+		TxTimeoutMax: 400 * time.Second,
+	})
+	require.NoError(t, err)
+	defer tc.Close()
+
+	require.Equal(t, DefaultTxTimeoutMax, tc.config.TxTimeoutMax)
 }
 
 // TestDefaultTxTimeout_Max_BelowCosmosHardLimit pins the invariant

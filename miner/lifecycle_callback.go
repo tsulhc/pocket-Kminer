@@ -972,7 +972,7 @@ func (lc *LifecycleCallback) OnSessionsNeedClaim(ctx context.Context, snapshots 
 			Int64("current_height", currentBlock.Height()).
 			Int64("claim_window_close", claimWindowClose).
 			Int64("blocks_remaining", claimBlocksLeft).
-			Dur("tx_deadline", rawClaimTimeout).
+			Dur("window_remaining_estimate", rawClaimTimeout).
 			Int("batch_size", len(claimMsgs)).
 			Msg("submitting claims")
 
@@ -1789,7 +1789,7 @@ func (lc *LifecycleCallback) OnSessionsNeedProof(ctx context.Context, snapshots 
 			Int64("current_height", currentBlock.Height()).
 			Int64("proof_window_close", proofWindowClose).
 			Int64("blocks_remaining", proofBlocksRemaining).
-			Dur("tx_deadline", rawProofTimeout).
+			Dur("window_remaining_estimate", rawProofTimeout).
 			Int("batch_size", len(proofMsgs)).
 			Msg("submitting proofs")
 

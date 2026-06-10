@@ -314,23 +314,15 @@ type TransactionConfig struct {
 	// Default: false (batching enabled for gas efficiency)
 	DisableProofBatching bool `yaml:"disable_proof_batching,omitempty"`
 
-	// TxTimeoutMinSeconds is the floor for window-based TX broadcast deadlines.
-	// Even when the claim/proof window is almost closed the TX still gets at least
-	// this many seconds to land on-chain before the unordered-TX TTL expires.
-	// Default: 120 (2 minutes — restored to the original pre-dynamic-timeout
-	// value; the earlier 30s intermediate default starved claims whose
-	// window was still wide open but per-attempt time was small)
+	// TxTimeoutMinSeconds is retained for config compatibility. Window-based
+	// claim/proof submissions use TxTimeoutMaxSeconds; non-window submissions use
+	// TxTimeoutDefaultSeconds.
 	TxTimeoutMinSeconds int64 `yaml:"tx_timeout_min_seconds,omitempty"`
 
-	// TxTimeoutMaxSeconds is the cap for window-based TX broadcast deadlines.
-	// Defaults to 500 ms below the cosmos-sdk 10-minute hard limit for
-	// unordered TXs so clock jitter cannot push the TX over the edge and
-	// trigger `unordered tx ttl exceeds 10m0s` CheckTx rejections.
-	// Operators who set this explicitly should stay strictly below 600;
-	// setting exactly 600 will intermittently fail CheckTx. If set to 0
-	// (unset), the default DefaultTxTimeoutMax in tx/tx_client.go is used
-	// (10min - 500ms, sub-second precision).
-	// Default: 600 (and unset falls back to 599.5s internally)
+	// TxTimeoutMaxSeconds is the safe unordered-TX TTL used for window-based
+	// claim/proof submissions. Defaults to 10 seconds below the cosmos-sdk
+	// 10-minute hard limit. Values below the code default are raised internally
+	// to avoid mempool expiry before inclusion during slow/empty blocks.
 	TxTimeoutMaxSeconds int64 `yaml:"tx_timeout_max_seconds,omitempty"`
 
 	// TxTimeoutDefaultSeconds is the fallback deadline when no window-based value
@@ -339,11 +331,9 @@ type TransactionConfig struct {
 	// Default: 120
 	TxTimeoutDefaultSeconds int64 `yaml:"tx_timeout_default_seconds,omitempty"`
 
-	// TxTimeoutClockSkewBufferSeconds is subtracted from the raw
-	// window-based TX deadline BEFORE clamping to [Min, Max]. Tune
-	// higher if the miner host's clock drifts from the validator (NTP
-	// glitches, VM steal, large-region topology), lower if hosts are
-	// tightly co-located and synced. Zero/negative picks up the default.
+	// TxTimeoutClockSkewBufferSeconds is retained for config compatibility.
+	// Window-based claim/proof submissions no longer spend this budget from the
+	// protocol window; they use TxTimeoutMaxSeconds instead.
 	// Default: 60
 	TxTimeoutClockSkewBufferSeconds int64 `yaml:"tx_timeout_clock_skew_buffer_seconds,omitempty"`
 

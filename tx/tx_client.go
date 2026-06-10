@@ -163,16 +163,16 @@ type TxClientConfig struct {
 	// TimeoutBlocks is the number of blocks after which a transaction times out.
 	TimeoutBlocks uint64
 
-	// TxTimeoutMin is the floor for window-based TX broadcast deadlines.
-	// Prevents a near-expired window from producing an unreasonably short deadline.
-	// Default: 2min
+	// TxTimeoutMin is retained for config compatibility. Window-based
+	// claim/proof submissions use TxTimeoutMax; non-window submissions use
+	// TxTimeoutDefault.
 	TxTimeoutMin time.Duration
 
-	// TxTimeoutMax is the cap for window-based TX broadcast deadlines.
-	// Defaults to 500 ms below the cosmos-sdk 10-minute hard limit for
-	// unordered TXs so a round-trip of clock jitter can't push us over
-	// and trigger `unordered tx ttl exceeds 10m0s` CheckTx rejections.
-	// Default: 10min - 500ms
+	// TxTimeoutMax is the safe unordered-TX TTL used for window-based
+	// claim/proof submissions. Values below DefaultTxTimeoutMax are raised
+	// during client construction because undersized mempool TTLs can expire
+	// valid proofs before a slow/non-empty block includes them.
+	// Default: 10min - 10s
 	TxTimeoutMax time.Duration
 
 	// TxTimeoutDefault is used when no window-based deadline is injected via context.
@@ -180,10 +180,9 @@ type TxClientConfig struct {
 	// Default: 2min
 	TxTimeoutDefault time.Duration
 
-	// TxTimeoutClockSkewBuffer is subtracted from the raw window-based
-	// deadline BEFORE clamping to [TxTimeoutMin, TxTimeoutMax]. Tune
-	// higher if the miner host's clock drifts from the validator,
-	// lower if both hosts are tightly synced. Default: 60s.
+	// TxTimeoutClockSkewBuffer is retained for fallback/default deadline
+	// compatibility. Window-based claim/proof submissions no longer spend
+	// this budget from the protocol window; they use TxTimeoutMax instead.
 	TxTimeoutClockSkewBuffer time.Duration
 
 	// UseTLS enables TLS for the gRPC connection.
@@ -259,6 +258,12 @@ func NewTxClient(
 		config.TxTimeoutMin = DefaultTxTimeoutMin
 	}
 	if config.TxTimeoutMax <= 0 {
+		config.TxTimeoutMax = DefaultTxTimeoutMax
+	} else if config.TxTimeoutMax < DefaultTxTimeoutMax {
+		logger.Warn().
+			Dur("configured_tx_timeout_max", config.TxTimeoutMax).
+			Dur("effective_tx_timeout_max", DefaultTxTimeoutMax).
+			Msg("tx_timeout_max below safe unordered-TX TTL; raising to default to avoid mempool expiry before inclusion")
 		config.TxTimeoutMax = DefaultTxTimeoutMax
 	}
 	if config.TxTimeoutDefault <= 0 {
@@ -438,45 +443,32 @@ func (tc *TxClient) SubmitProofs(
 // txWindowTimeoutKey is the context key used to carry a window-based TX deadline.
 type txWindowTimeoutKey struct{}
 
-// WithTxWindowTimeout injects a raw window-based duration into ctx.
-// signAndBroadcast reads it, subtracts TxTimeoutClockSkewBuffer, then
-// clamps to [TxTimeoutMin, TxTimeoutMax]. If not set, signAndBroadcast
+// WithTxWindowTimeout marks ctx as carrying a protocol-window submission.
+// The duration is preserved for observability, but signAndBroadcast uses the
+// maximum safe unordered-TX TTL for these submissions so slow blocks do not
+// expire valid claim/proof txs before inclusion. If not set, signAndBroadcast
 // falls back to TxTimeoutDefault.
 func WithTxWindowTimeout(ctx context.Context, d time.Duration) context.Context {
 	return context.WithValue(ctx, txWindowTimeoutKey{}, d)
 }
 
 // computeEffectiveTxTimeout is the pure math of the deadline decision.
-// Extracted so the skew→clamp pipeline can be tested directly without
-// building a full TxClient. source is one of:
+// Extracted so timeout selection can be tested directly without building a
+// full TxClient. source is one of:
 //
-//	"default"   — no raw window in context; fallbackDefault used
-//	"min_clamp" — raw - skew fell below min
-//	"max_clamp" — raw - skew exceeded max
-//	"window"    — raw - skew fit inside [min, max]
+//	"default"    — no raw window in context; fallbackDefault used
+//	"window_max" — protocol-window tx; use max safe unordered-TX TTL
 //
-// skew MUST be subtracted BEFORE clamping: if we clamped first and then
-// subtracted, a raw value close to max would end up between max and
-// max-skew, but a raw value AT max would get clamped to max and then
-// land at max-skew — fine — but then the edge case where raw sits
-// exactly at the cosmos-sdk hard limit (600s) would hand the chain a
-// timeoutTimestamp at (now + max) with zero jitter headroom. Subtract
-// first so max stays an absolute ceiling.
-func computeEffectiveTxTimeout(
-	raw, skewBuffer, min, max, fallbackDefault time.Duration,
-) (timeout time.Duration, source string) {
+// The raw window duration is intentionally not used as the tx TTL. The chain
+// enforces claim/proof window validity at DeliverTx, while unordered mempool
+// TTL controls only how long a valid tx is allowed to wait for inclusion. Using
+// blocks_remaining*configured_block_time as TTL caused production proof txs to
+// expire in mempool when block cadence was slower than the configured estimate.
+func computeEffectiveTxTimeout(raw, max, fallbackDefault time.Duration) (timeout time.Duration, source string) {
 	if raw <= 0 {
 		return fallbackDefault, "default"
 	}
-	adjusted := raw - skewBuffer
-	switch {
-	case adjusted < min:
-		return min, "min_clamp"
-	case adjusted > max:
-		return max, "max_clamp"
-	default:
-		return adjusted, "window"
-	}
+	return max, "window_max"
 }
 
 // signAndBroadcast signs and broadcasts a transaction.
@@ -521,15 +513,12 @@ func (tc *TxClient) signAndBroadcast(
 	// With unordered, TXs don't check sequence numbers and can be included in any order
 	txBuilder.SetUnordered(true)
 
-	// Compute the effective deadline via the shared pure helper so the
-	// skew-then-clamp pipeline is testable and consistent across code
-	// paths. See computeEffectiveTxTimeout for the algorithm and
-	// invariants.
+	// Compute the effective deadline via the shared pure helper so timeout
+	// selection is testable and consistent across code paths. See
+	// computeEffectiveTxTimeout for the algorithm and invariants.
 	raw, _ := ctx.Value(txWindowTimeoutKey{}).(time.Duration)
 	timeoutDuration, timeoutSource := computeEffectiveTxTimeout(
 		raw,
-		tc.config.TxTimeoutClockSkewBuffer,
-		tc.config.TxTimeoutMin,
 		tc.config.TxTimeoutMax,
 		tc.config.TxTimeoutDefault,
 	)

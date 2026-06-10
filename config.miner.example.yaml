@@ -107,24 +107,21 @@ pocket_node:
   # Increase if transactions fail with code 11 (out of gas) despite simulation
   # gas_adjustment: 1.7
 
-  # TX broadcast deadline — window-based dynamic timeout
-  # The miner computes the remaining blocks in the claim/proof window as
-  # (remaining_blocks * block_time_seconds), SUBTRACTS tx_timeout_clock_skew_buffer_seconds
-  # to leave headroom for clock drift between miner host and validator, then clamps
-  # to [tx_timeout_min_seconds, tx_timeout_max_seconds]. tx_timeout_default_seconds
-  # is used only when no window info is available (legacy paths / tests).
+  # TX broadcast deadline
+  # Claim/proof submissions inside a protocol window use the maximum safe
+  # unordered-TX TTL so slow/empty blocks do not expire valid txs in mempool
+  # before inclusion. tx_timeout_default_seconds is used only when no window
+  # info is available (legacy paths / tests).
   #
   # The cosmos-sdk hard-rejects unordered TXs whose timeoutTimestamp is >10 min
   # ahead of validator time with `unordered tx ttl exceeds 10m0s`. The default
-  # max is internally set 500ms below that ceiling; setting tx_timeout_max_seconds
-  # to 600 here will intermittently fail CheckTx due to clock jitter — stay below.
+  # max is internally set 10s below that ceiling. Values below the safe default
+  # are raised internally to avoid claim/proof loss from undersized mempool TTLs.
   #
-  # tx_timeout_min_seconds: 120               # Floor (default: 120 = 2min)
-  # tx_timeout_max_seconds: 599               # Cap (default: 10min - 500ms when unset)
+  # tx_timeout_min_seconds: 120               # Compatibility knob (default: 120 = 2min)
+  # tx_timeout_max_seconds: 590               # Safe TTL cap (default: 10min - 10s when unset)
   # tx_timeout_default_seconds: 120           # Fallback when window info unavailable (default: 120)
-  # tx_timeout_clock_skew_buffer_seconds: 60  # Subtracted before clamping (default: 60).
-                                              # Raise on hosts with known NTP drift;
-                                              # lower on tightly co-located + synced hosts.
+  # tx_timeout_clock_skew_buffer_seconds: 60  # Compatibility knob; window submissions use max TTL.
 
   # NOTE: Unordered transactions with SYNC broadcast mode
   # We use unordered=true with dynamic timeout_timestamp to eliminate account
