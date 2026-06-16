@@ -40,6 +40,13 @@ type TestConfig struct {
 
 	// ForceProofTxError forces proof transaction submission to fail (for testing proof error path)
 	ForceProofTxError bool
+
+	// FailOriginalProofSubmit fails ONLY the lifecycle's original proof submit
+	// (the SubmitProofs wrapper), letting the inclusion reconciler's resend (which
+	// calls SubmitProofsReturningHash directly) succeed. Used to validate the
+	// never-broadcast self-heal end-to-end: original fails → entry persisted with
+	// OrigTxHash="" → reconciler resends → proof lands → claim VALIDATED.
+	FailOriginalProofSubmit bool
 }
 
 var (
@@ -52,6 +59,7 @@ func getTestConfig() TestConfig {
 	testConfigOnce.Do(func() {
 		testConfig.ForceClaimTxError = os.Getenv("TEST_FORCE_CLAIM_TX_ERROR") == "true"
 		testConfig.ForceProofTxError = os.Getenv("TEST_FORCE_PROOF_TX_ERROR") == "true"
+		testConfig.FailOriginalProofSubmit = os.Getenv("TEST_FAIL_ORIGINAL_PROOF_SUBMIT") == "true"
 	})
 	return testConfig
 }
@@ -1099,24 +1107,43 @@ func (c *HASupplierClient) GetEstimatedFeeUpokt(ctx context.Context) uint64 {
 }
 
 // CreateClaims implements client.SupplierClient.
+// CreateClaims implements client.SupplierClient. The resulting tx hash is
+// stashed for retrieval via GetLastClaimTxHash. Callers that need the hash
+// atomically (e.g. concurrent in-window rebroadcasts sharing one client) should
+// use CreateClaimsReturningHash, which avoids the CreateClaims()+GetLastClaimTxHash()
+// cross-attribution race.
 func (c *HASupplierClient) CreateClaims(
 	ctx context.Context,
 	timeoutHeight int64,
 	claimMsgs ...pocktclient.MsgCreateClaim,
 ) error {
+	_, err := c.CreateClaimsReturningHash(ctx, timeoutHeight, claimMsgs...)
+	return err
+}
+
+// CreateClaimsReturningHash submits claims and returns the resulting tx hash
+// directly, alongside still stashing it for GetLastClaimTxHash. Returning the
+// hash inline lets concurrent rebroadcasts of different sessions through the
+// same shared client each record their own tx hash, instead of racing on the
+// shared lastClaimTxHash field.
+func (c *HASupplierClient) CreateClaimsReturningHash(
+	ctx context.Context,
+	timeoutHeight int64,
+	claimMsgs ...pocktclient.MsgCreateClaim,
+) (string, error) {
 	// DEBUG/TEST: Force claim TX error to test claim_tx_error state transition
 	// Set environment variable TEST_FORCE_CLAIM_TX_ERROR=true to enable
 	if testCfg := getTestConfig(); testCfg.ForceClaimTxError {
 		c.logger.Warn().
 			Msg("TEST MODE: TEST_FORCE_CLAIM_TX_ERROR detected - forcing claim TX error")
-		return fmt.Errorf("TEST MODE: simulated claim transaction error")
+		return "", fmt.Errorf("TEST MODE: simulated claim transaction error")
 	}
 
 	claims := make([]*prooftypes.MsgCreateClaim, len(claimMsgs))
 	for i, msg := range claimMsgs {
 		claim, ok := msg.(*prooftypes.MsgCreateClaim)
 		if !ok {
-			return fmt.Errorf("invalid claim message type: %T", msg)
+			return "", fmt.Errorf("invalid claim message type: %T", msg)
 		}
 		claims[i] = claim
 	}
@@ -1124,7 +1151,7 @@ func (c *HASupplierClient) CreateClaims(
 	// Call TxClient and capture TX hash for deduplication
 	txHash, err := c.txClient.CreateClaims(ctx, c.operatorAddr, timeoutHeight, claims)
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	// Store TX hash for retrieval by caller (1 line after broadcast)
@@ -1138,28 +1165,53 @@ func (c *HASupplierClient) CreateClaims(
 	// possibly-stale spike.
 	c.InvalidateFeeCache()
 
-	return nil
+	return txHash, nil
 }
 
-// SubmitProofs implements client.SupplierClient.
+// SubmitProofs implements client.SupplierClient. The resulting tx hash is
+// stashed for retrieval via GetLastProofTxHash. Callers that need the hash
+// atomically (e.g. concurrent in-window rebroadcasts sharing one client) should
+// use SubmitProofsReturningHash instead, which avoids the
+// SubmitProofs()+GetLastProofTxHash() cross-attribution race.
 func (c *HASupplierClient) SubmitProofs(
 	ctx context.Context,
 	timeoutHeight int64,
 	proofMsgs ...pocktclient.MsgSubmitProof,
 ) error {
+	// TEST: fail ONLY the lifecycle's original submit (this wrapper), so the
+	// inclusion reconciler's self-heal resend (SubmitProofsReturningHash, called
+	// directly) can still land. Validates the never-broadcast self-heal path.
+	if getTestConfig().FailOriginalProofSubmit {
+		c.logger.Warn().Msg("TEST MODE: TEST_FAIL_ORIGINAL_PROOF_SUBMIT - failing original proof submit (reconciler resend will recover)")
+		return fmt.Errorf("TEST MODE: simulated original proof submit error")
+	}
+	_, err := c.SubmitProofsReturningHash(ctx, timeoutHeight, proofMsgs...)
+	return err
+}
+
+// SubmitProofsReturningHash submits proofs and returns the resulting tx hash
+// directly, alongside still stashing it for GetLastProofTxHash. Returning the
+// hash inline lets concurrent rebroadcasts of different sessions through the
+// same shared client each record their own tx hash, instead of racing on the
+// shared lastProofTxHash field.
+func (c *HASupplierClient) SubmitProofsReturningHash(
+	ctx context.Context,
+	timeoutHeight int64,
+	proofMsgs ...pocktclient.MsgSubmitProof,
+) (string, error) {
 	// DEBUG/TEST: Force proof TX error to test proof_tx_error state transition
 	// Set environment variable TEST_FORCE_PROOF_TX_ERROR=true to enable
 	if testCfg := getTestConfig(); testCfg.ForceProofTxError {
 		c.logger.Warn().
 			Msg("TEST MODE: TEST_FORCE_PROOF_TX_ERROR detected - forcing proof TX error")
-		return fmt.Errorf("TEST MODE: simulated proof transaction error")
+		return "", fmt.Errorf("TEST MODE: simulated proof transaction error")
 	}
 
 	proofs := make([]*prooftypes.MsgSubmitProof, len(proofMsgs))
 	for i, msg := range proofMsgs {
 		proof, ok := msg.(*prooftypes.MsgSubmitProof)
 		if !ok {
-			return fmt.Errorf("invalid proof message type: %T", msg)
+			return "", fmt.Errorf("invalid proof message type: %T", msg)
 		}
 		proofs[i] = proof
 	}
@@ -1167,7 +1219,7 @@ func (c *HASupplierClient) SubmitProofs(
 	// Call TxClient and capture TX hash for deduplication
 	txHash, err := c.txClient.SubmitProofs(ctx, c.operatorAddr, timeoutHeight, proofs)
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	// Store TX hash for retrieval by caller (1 line after broadcast)
@@ -1179,7 +1231,7 @@ func (c *HASupplierClient) SubmitProofs(
 	// most recent successful submission.
 	c.InvalidateFeeCache()
 
-	return nil
+	return txHash, nil
 }
 
 // OperatorAddress implements client.SupplierClient.

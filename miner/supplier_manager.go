@@ -13,12 +13,14 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/pokt-network/pocket-relay-miner/cache"
+	localclient "github.com/pokt-network/pocket-relay-miner/client"
 	"github.com/pokt-network/pocket-relay-miner/keys"
 	"github.com/pokt-network/pocket-relay-miner/logging"
 	"github.com/pokt-network/pocket-relay-miner/transport"
 	redistransport "github.com/pokt-network/pocket-relay-miner/transport/redis"
 	"github.com/pokt-network/pocket-relay-miner/tx"
 	"github.com/pokt-network/poktroll/pkg/client"
+	prooftypes "github.com/pokt-network/poktroll/x/proof/types"
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 	suppliertypes "github.com/pokt-network/poktroll/x/supplier/types"
 )
@@ -159,15 +161,15 @@ type SupplierManagerConfig struct {
 
 	// ProofQueryClient is used by the pre-proof GetClaim guard to verify each
 	// session's claim exists on-chain before proof submission, and by the
-	// InclusionTracker to record the real on-chain outcome after each claim
+	// the inclusion reconciler to record the real on-chain outcome after each claim
 	// broadcast. If nil, the guard is skipped (legacy behavior, unsafe in
 	// production — sessions whose claim tx was evicted from mempool will
 	// trigger "claim not found" FailedPrecondition storms).
 	ProofQueryClient client.ProofQueryClient
 
-	// InclusionTrackerConfig controls the post-broadcast GetClaim poller.
-	// See miner.InclusionTrackerConfig for fields.
-	InclusionTrackerConfig InclusionTrackerConfig
+	// InclusionReconcilerConfig controls the block-driven claim+proof inclusion
+	// reconciler + rebroadcaster. See miner.InclusionReconcilerConfig for fields.
+	InclusionReconcilerConfig InclusionReconcilerConfig
 
 	// ServiceFactorProvider provides service factor configuration for claim ceiling warnings.
 	// If nil, no ceiling warnings are logged.
@@ -255,10 +257,29 @@ type SupplierManager struct {
 	// Streams redeliver a relay (consumer reclaim, transient ack failure).
 	deduplicator Deduplicator
 
-	// Inclusion tracker polls GetClaim for each broadcast claim to record
-	// the real on-chain outcome. Owned by SupplierManager so Close() drains
-	// its worker pool cleanly on shutdown.
-	inclusionTracker *InclusionTracker
+	// inclusionReconciler is the process-wide, block-driven verifier +
+	// rebroadcaster for BOTH claims and proofs. It reads the rebroadcastStore
+	// (what we submitted) and x/proof module state (what's on-chain), then
+	// re-broadcasts the still-missing while the window is open. Owned by
+	// SupplierManager so Close() drains its pool and stops the block loop.
+	inclusionReconciler *InclusionReconciler
+
+	// rebroadcastStore persists built claim/proof messages for the reconciler.
+	rebroadcastStore *RebroadcastStore
+
+	// reconcilerCancel stops the block-subscription loop driving the reconciler.
+	reconcilerCancel context.CancelFunc
+	reconcilerWG     sync.WaitGroup
+
+	// sharedSubmissionTracker + sharedTrackersOnce make the submission tracker,
+	// rebroadcast store, and inclusion reconciler process-wide singletons (one
+	// worker pool / one block loop) instead of one-per-supplier-key. Operators
+	// run hundreds of keys per miner; per-key instances meant hundreds of pools
+	// and a Close() that drained only the last key's. They are stateless across
+	// suppliers — identity is passed per check — so a single shared instance is
+	// correct.
+	sharedSubmissionTracker *SubmissionTracker
+	sharedTrackersOnce      sync.Once
 
 	// Lifecycle
 	//
@@ -1092,28 +1113,18 @@ func (m *SupplierManager) addSupplierWithData(ctx context.Context, operatorAddr 
 		// This stops the consumer from reading stale messages and frees Redis memory
 		lifecycleCallback.SetStreamDeleter(consumer)
 
-		// Wire submission tracker for debugging claim/proof submissions
-		// Tracks tx hashes, success/failure, errors, and timing for post-mortem analysis
-		submissionTracker := NewSubmissionTracker(m.logger, m.config.RedisClient, m.config.SubmissionTrackingTTL)
-		lifecycleCallback.SetSubmissionTracker(submissionTracker)
-
-		// Wire the claim inclusion tracker so that after each claim broadcast
-		// the miner polls GetClaim(supplier, sessionID) until the claim is
-		// on-chain or the claim window closes, recording the real outcome
-		// to the submission tracker. GetClaim queries x/proof module state —
-		// independent of the Tendermint tx indexer, so this works against
-		// nodes configured with tx_index=null.
-		if m.config.ProofQueryClient != nil {
-			inclusionTracker := NewInclusionTracker(
-				m.logger,
-				m.config.ProofQueryClient,
-				m.config.SharedClient,
-				m.config.BlockClient,
-				submissionTracker,
-				m.config.InclusionTrackerConfig,
-			)
-			lifecycleCallback.SetInclusionTracker(inclusionTracker)
-			m.inclusionTracker = inclusionTracker
+		// Wire the process-wide submission tracker + rebroadcast store (built
+		// once; see ensureSharedTrackers and the field docs). The submission
+		// tracker records tx hashes / success / errors / timing; the rebroadcast
+		// store persists each built claim/proof message so the block-driven
+		// InclusionReconciler can verify on-chain inclusion (x/proof module
+		// state — tx_index=null safe) and re-broadcast a still-missing
+		// claim/proof into its still-open window (fix for silent
+		// CLAIM_MISSING/PROOF_MISSING forfeits).
+		m.ensureSharedTrackers()
+		lifecycleCallback.SetSubmissionTracker(m.sharedSubmissionTracker)
+		if m.rebroadcastStore != nil {
+			lifecycleCallback.SetRebroadcastStore(m.rebroadcastStore)
 		}
 
 		// Wire build pool for bounded parallel claim/proof building
@@ -1690,6 +1701,17 @@ func (m *SupplierManager) Close() error {
 		}
 	}
 
+	// Stop the reconciler BEFORE tearing down suppliers, so an in-flight
+	// OnBlock pass cannot reconcile / ResubmitMessage against a supplier whose
+	// client is being closed out from under it.
+	if m.reconcilerCancel != nil {
+		m.reconcilerCancel()
+	}
+	m.reconcilerWG.Wait()
+	if m.inclusionReconciler != nil {
+		_ = m.inclusionReconciler.Close()
+	}
+
 	// Wait for all suppliers to finish
 	m.suppliersMu.Lock()
 	for _, state := range m.suppliers {
@@ -1716,11 +1738,6 @@ func (m *SupplierManager) Close() error {
 	// Stop query subpool gracefully (drains queued tasks)
 	if m.querySubpool != nil {
 		m.querySubpool.StopAndWait()
-	}
-
-	// Drain the claim inclusion tracker so in-flight polls finish cleanly.
-	if m.inclusionTracker != nil {
-		_ = m.inclusionTracker.Close()
 	}
 
 	m.logger.Info().Msg("supplier manager closed")
@@ -1841,5 +1858,198 @@ func (m *SupplierManager) trimAllSupplierStreams(ctx context.Context, maxAge tim
 			Str("min_id", minID).
 			Dur("max_age", maxAge).
 			Msg("stream trimming completed")
+	}
+}
+
+// ensureSharedTrackers lazily constructs the process-wide submission tracker and
+// the claim/proof inclusion trackers exactly once, regardless of how many
+// supplier keys this manager drives. They are stateless across suppliers
+// (supplier/session identity is passed per call), so one shared instance per
+// miner — rather than one per key — is both correct and far cheaper at the
+// hundreds-of-keys scale operators actually run. Safe under concurrent
+// addSupplier* calls via sync.Once.
+func (m *SupplierManager) ensureSharedTrackers() {
+	m.sharedTrackersOnce.Do(func() {
+		m.sharedSubmissionTracker = NewSubmissionTracker(m.logger, m.config.RedisClient, m.config.SubmissionTrackingTTL)
+
+		// Only build the rebroadcast store + reconciler when we can actually run
+		// it. Leaving m.rebroadcastStore nil means the lifecycle callback skips
+		// persistence entirely — no orphaned Redis writes that nothing consumes.
+		if m.config.ProofQueryClient == nil {
+			m.logger.Warn().Msg("no proof query client; inclusion reconciler disabled (fire-once claim/proof, no rebroadcast)")
+			return
+		}
+		inclusionQuery, ok := m.config.ProofQueryClient.(InclusionQueryClient)
+		if !ok {
+			// Misconfiguration, not a benign default: without this the silent
+			// CLAIM_MISSING/PROOF_MISSING forfeits the reconciler exists to fix
+			// go unobserved and unrecovered. Error, not Warn.
+			m.logger.Error().
+				Msg("proof query client does not expose AllProofs/AllClaims by supplier; inclusion reconciler DISABLED — claims/proofs are fire-once with no verification or rebroadcast")
+			return
+		}
+		if m.config.InclusionReconcilerConfig.Disabled {
+			m.logger.Info().Msg("inclusion reconciler disabled by config; claims/proofs are fire-once (no verification or rebroadcast)")
+			return
+		}
+		m.rebroadcastStore = NewRebroadcastStore(m.config.RedisClient, 0) // 0 → default TTL
+
+		recordClaimOutcome := func(ctx context.Context, e rebroadcastEntry, supplier string, _ int64, _, outcome string, inclusionHeight int64) {
+			claimInclusionOutcomeTotal.WithLabelValues(supplier, e.ServiceID, outcome).Inc()
+			if m.sharedSubmissionTracker != nil {
+				// Claim outcome is matched by the ORIGINAL submit tx hash (the one
+				// stored on the submission record); a rebroadcast changes the
+				// latest hash but the record key does not, so look up by OrigTxHash.
+				origHash := e.OrigTxHash
+				if origHash == "" {
+					origHash = e.TxHash
+				}
+				_ = m.sharedSubmissionTracker.UpdateClaimOnChainOutcome(ctx, ClaimOnChainUpdate{
+					Supplier:        supplier,
+					TxHash:          origHash,
+					Outcome:         outcome,
+					InclusionHeight: inclusionHeight,
+				})
+			}
+		}
+		recordProofOutcome := func(ctx context.Context, e rebroadcastEntry, supplier string, sessionEnd int64, sessionID, outcome string, inclusionHeight int64) {
+			proofInclusionOutcomeTotal.WithLabelValues(supplier, e.ServiceID, outcome).Inc()
+			if m.sharedSubmissionTracker != nil {
+				_ = m.sharedSubmissionTracker.UpdateProofOnChainOutcome(ctx, ProofOnChainUpdate{
+					Supplier:        supplier,
+					SessionEnd:      sessionEnd,
+					SessionID:       sessionID,
+					Outcome:         outcome,
+					InclusionHeight: inclusionHeight,
+					NewProofTxHash:  e.TxHash,
+					Rebroadcasts:    e.Rebroadcasts,
+				})
+			}
+		}
+
+		claimPhase := reconcilePhase{
+			phase:             RebroadcastPhaseClaim,
+			windowCloseHeight: sharedtypes.GetClaimWindowCloseHeight,
+			onChainSessions:   inclusionQuery.GetSupplierClaimSessions,
+			recordOutcome:     recordClaimOutcome,
+			recordRebroadcast: func(supplier, serviceID, result string) {
+				claimRebroadcastsTotal.WithLabelValues(supplier, serviceID, result).Inc()
+			},
+		}
+		proofPhase := reconcilePhase{
+			phase:             RebroadcastPhaseProof,
+			windowCloseHeight: sharedtypes.GetProofWindowCloseHeight,
+			// Proof inclusion is read from the claim's ProofValidationStatus
+			// (VALIDATED), not from proofs: a submitted proof is validated and
+			// deleted in the EndBlocker of its submission block, so it is not
+			// queryable afterwards. See query.GetSupplierProvenSessions.
+			onChainSessions: inclusionQuery.GetSupplierProvenSessions,
+			recordOutcome:   recordProofOutcome,
+			recordRebroadcast: func(supplier, serviceID, result string) {
+				proofRebroadcastsTotal.WithLabelValues(supplier, serviceID, result).Inc()
+			},
+		}
+
+		m.inclusionReconciler = NewInclusionReconciler(
+			m.logger,
+			m.config.SharedClient,
+			m.rebroadcastStore,
+			m, // SupplierManager implements MessageResubmitter
+			claimPhase,
+			proofPhase,
+			m.config.InclusionReconcilerConfig,
+		)
+		// Per-supplier ownership: only reconcile suppliers this replica controls
+		// (matches the SupplierClaimer SetNX submission-coordination model).
+		m.inclusionReconciler.SetOwnershipFilter(func(supplier string) bool {
+			_, owned := m.suppliers.Load(supplier)
+			return owned
+		})
+
+		m.startReconcilerBlockLoop()
+	})
+}
+
+// startReconcilerBlockLoop drives reconciler.OnBlock once per new block from the
+// block client's event stream (the same stream the lifecycle uses). Runs on
+// every replica; the reconciler's per-supplier ownership filter ensures each
+// replica only acts on its own suppliers.
+func (m *SupplierManager) startReconcilerBlockLoop() {
+	subscriber, ok := m.config.BlockClient.(interface {
+		Subscribe(ctx context.Context, bufferSize int) <-chan *localclient.SimpleBlock
+	})
+	if !ok {
+		// Without a per-block trigger the reconciler never verifies/rebroadcasts —
+		// the forfeits it exists to fix go unrecovered. Error, not Warn.
+		m.logger.Error().Msg("block client does not support Subscribe(); inclusion reconciler will NOT run (no per-block trigger)")
+		return
+	}
+
+	// Derive from the manager lifecycle ctx so the loop also stops if the parent
+	// is canceled (not only via Close); fall back to Background if unset.
+	m.mu.RLock()
+	parent := m.ctx
+	m.mu.RUnlock()
+	if parent == nil {
+		parent = context.Background()
+	}
+	loopCtx, cancel := context.WithCancel(parent)
+	m.reconcilerCancel = cancel
+	m.reconcilerWG.Add(1)
+	go func() {
+		defer m.reconcilerWG.Done()
+		blockCh := subscriber.Subscribe(loopCtx, 2000)
+		for {
+			select {
+			case <-loopCtx.Done():
+				return
+			case block, chOpen := <-blockCh:
+				if !chOpen {
+					m.logger.Warn().Msg("inclusion reconciler block channel closed")
+					return
+				}
+				m.inclusionReconciler.OnBlock(block.Height())
+			}
+		}
+	}()
+}
+
+// ResubmitMessage implements MessageResubmitter: it routes a re-broadcast to the
+// owning supplier's tx client. Returns an error (not a panic) for suppliers this
+// replica does not control — the reconciler's ownership filter normally prevents
+// reaching here for non-owned suppliers.
+func (m *SupplierManager) ResubmitMessage(ctx context.Context, phase RebroadcastPhase, supplier string, msgBytes []byte, timeoutHeight int64) (string, error) {
+	state, ok := m.suppliers.Load(supplier)
+	if !ok || state.SupplierClient == nil {
+		return "", fmt.Errorf("no tx client for supplier %s (not owned by this replica)", supplier)
+	}
+
+	// Replicate the lifecycle's window-anchored tx deadline: a resend must carry
+	// a timeout that keeps it inside the remaining window.
+	blkTime := m.config.BlockTimeSeconds
+	if blkTime <= 0 {
+		blkTime = 30
+	}
+	remaining := timeoutHeight - m.config.BlockClient.LastBlock(ctx).Height()
+	if remaining < 1 {
+		remaining = 1
+	}
+	ctx = tx.WithTxWindowTimeout(ctx, time.Duration(remaining)*time.Duration(blkTime)*time.Second)
+
+	switch phase {
+	case RebroadcastPhaseClaim:
+		var msg prooftypes.MsgCreateClaim
+		if err := msg.Unmarshal(msgBytes); err != nil {
+			return "", fmt.Errorf("unmarshal MsgCreateClaim: %w", err)
+		}
+		return state.SupplierClient.CreateClaimsReturningHash(ctx, timeoutHeight, &msg)
+	case RebroadcastPhaseProof:
+		var msg prooftypes.MsgSubmitProof
+		if err := msg.Unmarshal(msgBytes); err != nil {
+			return "", fmt.Errorf("unmarshal MsgSubmitProof: %w", err)
+		}
+		return state.SupplierClient.SubmitProofsReturningHash(ctx, timeoutHeight, &msg)
+	default:
+		return "", fmt.Errorf("unknown rebroadcast phase %q", phase)
 	}
 }

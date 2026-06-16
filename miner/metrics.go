@@ -686,7 +686,7 @@ var (
 	)
 
 	// claimInclusionOutcomeTotal records the real on-chain fate of each
-	// broadcast claim as observed by the miner-layer InclusionTracker. It
+	// broadcast claim as observed by the inclusion reconciler. It
 	// polls GetClaim(supplier, sessionID) until the claim appears or the
 	// claim window closes — independent of the Tendermint tx indexer, so it
 	// works on nodes configured with tx_index=null.
@@ -704,6 +704,54 @@ var (
 			Help:      "Post-broadcast on-chain claim inclusion outcome (labeled by supplier, service_id, outcome)",
 		},
 		[]string{"supplier", "service_id", "outcome"},
+	)
+
+	// proofInclusionOutcomeTotal records the real on-chain fate of each
+	// broadcast proof as observed by the inclusion reconciler. It polls
+	// GetProof(supplier, sessionID) until the proof appears or the proof
+	// window closes — the proof-side analogue of claimInclusionOutcomeTotal.
+	//
+	// Outcomes (bounded enum):
+	//   on_chain_found   — proof is on-chain (possibly after a rebroadcast)
+	//   on_chain_missing — proof window closed without the proof landing
+	//   poll_error       — GetProof kept erroring through the poll horizon
+	//   poll_dropped     — inclusion pool queue saturated; no record taken
+	proofInclusionOutcomeTotal = observability.MinerFactory.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      "proof_inclusion_outcome_total",
+			Help:      "Post-broadcast on-chain proof inclusion outcome (labeled by supplier, service_id, outcome)",
+		},
+		[]string{"supplier", "service_id", "outcome"},
+	)
+
+	// proofRebroadcastsTotal counts in-window proof re-submissions triggered
+	// by the inclusion reconciler when a proof was CheckTx-accepted but not
+	// yet on-chain and the proof window was still open.
+	proofRebroadcastsTotal = observability.MinerFactory.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      "proof_rebroadcasts_total",
+			Help:      "In-window proof re-submissions attempted by the inclusion reconciler (labeled by supplier, service_id, result)",
+		},
+		[]string{"supplier", "service_id", "result"},
+	)
+
+	// claimRebroadcastsTotal counts in-window claim re-submissions triggered
+	// by the inclusion reconciler when a claim was CheckTx-accepted but not
+	// yet on-chain and the claim window was still open. Claim-side analogue of
+	// proofRebroadcastsTotal (claims previously had inclusion observation but
+	// no rebroadcast).
+	claimRebroadcastsTotal = observability.MinerFactory.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      "claim_rebroadcasts_total",
+			Help:      "In-window claim re-submissions attempted by the inclusion reconciler (labeled by supplier, service_id, result)",
+		},
+		[]string{"supplier", "service_id", "result"},
 	)
 
 	// Redis consumer metrics (reserved for future instrumentation)
