@@ -141,6 +141,7 @@ pocket_node:
   # {claim,proof}_inclusion_outcome_total / {claim,proof}_rebroadcasts_total
   # metrics. All fields are optional; defaults shown.
   # disable_inclusion_reconciler: false               # Master switch (default: enabled)
+  # disable_claim_inclusion_tracking: false           # Deprecated alias for disable_inclusion_reconciler
   # inclusion_reconciler_max_concurrent: 64           # Per-block group-reconcile pool size (default: 64)
   # max_rebroadcasts: 1                                # In-window re-submits; 0 = observe-only (default: 1)
   # rebroadcast_safety_blocks: 1                       # Stop rebroadcasting within N blocks of window close (default: 1)

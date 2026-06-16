@@ -179,6 +179,13 @@ properties:
           CLAIM_MISSING / PROOF_MISSING forfeits (accepted to mempool but never
           included, with no retry).
         default: false
+      disable_claim_inclusion_tracking:
+        type: boolean
+        description: |
+          Deprecated compatibility alias for disable_inclusion_reconciler. If
+          set to true, it disables the unified claim+proof inclusion reconciler.
+          Prefer disable_inclusion_reconciler for new configs.
+        default: false
       inclusion_reconciler_max_concurrent:
         type: integer
         description: Worker pool size for per-block group reconciliation (one task per owned supplier per block).

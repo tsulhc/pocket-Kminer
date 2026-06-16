@@ -1962,7 +1962,9 @@ func (m *SupplierManager) ensureSharedTrackers() {
 		// Per-supplier ownership: only reconcile suppliers this replica controls
 		// (matches the SupplierClaimer SetNX submission-coordination model).
 		m.inclusionReconciler.SetOwnershipFilter(func(supplier string) bool {
-			_, owned := m.suppliers.Load(supplier)
+			m.suppliersMu.RLock()
+			_, owned := m.suppliers[supplier]
+			m.suppliersMu.RUnlock()
 			return owned
 		})
 
@@ -2019,7 +2021,9 @@ func (m *SupplierManager) startReconcilerBlockLoop() {
 // replica does not control — the reconciler's ownership filter normally prevents
 // reaching here for non-owned suppliers.
 func (m *SupplierManager) ResubmitMessage(ctx context.Context, phase RebroadcastPhase, supplier string, msgBytes []byte, timeoutHeight int64) (string, error) {
-	state, ok := m.suppliers.Load(supplier)
+	m.suppliersMu.RLock()
+	state, ok := m.suppliers[supplier]
+	m.suppliersMu.RUnlock()
 	if !ok || state.SupplierClient == nil {
 		return "", fmt.Errorf("no tx client for supplier %s (not owned by this replica)", supplier)
 	}

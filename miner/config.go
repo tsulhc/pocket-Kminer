@@ -357,6 +357,10 @@ type TransactionConfig struct {
 	// is open. This is the fix for silent CLAIM_MISSING / PROOF_MISSING
 	// forfeits. Default: false (reconciler enabled).
 	DisableInclusionReconciler bool `yaml:"disable_inclusion_reconciler,omitempty"`
+	// DeprecatedDisableClaimInclusionTracking preserves the old claim-only
+	// tracker disable knob as a compatibility alias. If set, it disables the new
+	// unified claim+proof reconciler too.
+	DeprecatedDisableClaimInclusionTracking bool `yaml:"disable_claim_inclusion_tracking,omitempty"`
 
 	// InclusionReconcilerMaxConcurrent bounds the per-block group-reconcile
 	// worker pool (one task per owned supplier per block). Default: 64.
@@ -386,7 +390,7 @@ type TransactionConfig struct {
 // operator set. Callers pass the result to NewInclusionReconciler.
 func (c TransactionConfig) InclusionReconcilerConfig() InclusionReconcilerConfig {
 	cfg := DefaultInclusionReconcilerConfig()
-	cfg.Disabled = c.DisableInclusionReconciler
+	cfg.Disabled = c.DisableInclusionReconciler || c.DeprecatedDisableClaimInclusionTracking
 	if c.InclusionReconcilerMaxConcurrent > 0 {
 		cfg.MaxConcurrent = c.InclusionReconcilerMaxConcurrent
 	}
