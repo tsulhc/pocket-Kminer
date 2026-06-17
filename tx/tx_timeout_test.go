@@ -56,11 +56,11 @@ func TestComputeEffectiveTxTimeout_HardLimitSafety(t *testing.T) {
 	)
 
 	tests := []struct {
-		name           string
-		raw            time.Duration
-		wantTimeout    time.Duration
-		wantSource     string
-		windowBased    bool
+		name        string
+		raw         time.Duration
+		wantTimeout time.Duration
+		wantSource  string
+		windowBased bool
 	}{
 		{
 			name:        "no raw window falls back to default",

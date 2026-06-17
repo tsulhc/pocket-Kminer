@@ -1896,6 +1896,9 @@ func (m *SupplierManager) ensureSharedTrackers() {
 
 		recordClaimOutcome := func(ctx context.Context, e rebroadcastEntry, supplier string, _ int64, _, outcome string, inclusionHeight int64) {
 			claimInclusionOutcomeTotal.WithLabelValues(supplier, e.ServiceID, outcome).Inc()
+			if outcome == inclusionFound {
+				m.markReconciledClaimFound(ctx, supplier, e)
+			}
 			if m.sharedSubmissionTracker != nil {
 				// Claim outcome is matched by the ORIGINAL submit tx hash (the one
 				// stored on the submission record); a rebroadcast changes the
@@ -1914,6 +1917,9 @@ func (m *SupplierManager) ensureSharedTrackers() {
 		}
 		recordProofOutcome := func(ctx context.Context, e rebroadcastEntry, supplier string, sessionEnd int64, sessionID, outcome string, inclusionHeight int64) {
 			proofInclusionOutcomeTotal.WithLabelValues(supplier, e.ServiceID, outcome).Inc()
+			if outcome == inclusionFound {
+				m.markReconciledProofFound(ctx, supplier, sessionID, e)
+			}
 			if m.sharedSubmissionTracker != nil {
 				_ = m.sharedSubmissionTracker.UpdateProofOnChainOutcome(ctx, ProofOnChainUpdate{
 					Supplier:        supplier,
@@ -2016,14 +2022,93 @@ func (m *SupplierManager) startReconcilerBlockLoop() {
 	}()
 }
 
+func (m *SupplierManager) supplierState(supplier string) (*SupplierState, bool) {
+	m.suppliersMu.RLock()
+	state, ok := m.suppliers[supplier]
+	m.suppliersMu.RUnlock()
+	return state, ok
+}
+
+func (m *SupplierManager) markReconciledClaimFound(ctx context.Context, supplier string, entry rebroadcastEntry) {
+	state, ok := m.supplierState(supplier)
+	if !ok || state.SessionCoordinator == nil || state.SessionStore == nil {
+		return
+	}
+
+	var msg prooftypes.MsgCreateClaim
+	if err := msg.Unmarshal(entry.MsgBytes); err != nil {
+		m.logger.Warn().Err(err).Str("supplier", supplier).Msg("failed to unmarshal reconciled claim message")
+		return
+	}
+	if msg.SessionHeader == nil || msg.SessionHeader.SessionId == "" {
+		m.logger.Warn().Str("supplier", supplier).Msg("reconciled claim message missing session header")
+		return
+	}
+
+	snapshot, err := state.SessionStore.Get(ctx, msg.SessionHeader.SessionId)
+	if err != nil {
+		m.logger.Warn().Err(err).Str(logging.FieldSessionID, msg.SessionHeader.SessionId).Msg("failed to load session before reconciled claim state repair")
+		return
+	}
+	if snapshot == nil || snapshot.State.IsSuccess() || snapshot.State == SessionStateProving || snapshot.State == SessionStateProofTxError || snapshot.State == SessionStateProofWindowClosed {
+		return
+	}
+	if snapshot.State == SessionStateClaimed && len(snapshot.ClaimedRootHash) > 0 && snapshot.ClaimTxHash != "" {
+		return
+	}
+
+	txHash := entry.TxHash
+	if txHash == "" {
+		txHash = entry.OrigTxHash
+	}
+	if err := state.SessionCoordinator.OnSessionClaimed(ctx, snapshot.SessionID, msg.RootHash, txHash); err != nil {
+		m.logger.Warn().Err(err).Str(logging.FieldSessionID, snapshot.SessionID).Msg("failed to repair session state after reconciled claim inclusion")
+		return
+	}
+	if state.LifecycleManager != nil {
+		if repaired, getErr := state.SessionStore.Get(ctx, snapshot.SessionID); getErr == nil && repaired != nil {
+			state.LifecycleManager.activeSessions.Store(repaired.SessionID, repaired)
+		}
+	}
+}
+
+func (m *SupplierManager) markReconciledProofFound(ctx context.Context, supplier, sessionID string, entry rebroadcastEntry) {
+	state, ok := m.supplierState(supplier)
+	if !ok || state.SessionCoordinator == nil || state.SessionStore == nil {
+		return
+	}
+
+	snapshot, err := state.SessionStore.Get(ctx, sessionID)
+	if err != nil {
+		m.logger.Warn().Err(err).Str(logging.FieldSessionID, sessionID).Msg("failed to load session before reconciled proof state repair")
+		return
+	}
+	if snapshot == nil || snapshot.State.IsSuccess() {
+		return
+	}
+	if entry.TxHash != "" {
+		if err := state.SessionCoordinator.OnProofSubmitted(ctx, sessionID, entry.TxHash); err != nil {
+			m.logger.Warn().Err(err).Str(logging.FieldSessionID, sessionID).Msg("failed to store proof tx hash after reconciled proof inclusion")
+		}
+	}
+	if state.LifecycleCallback != nil {
+		if err := state.LifecycleCallback.OnSessionProved(ctx, snapshot); err != nil {
+			m.logger.Warn().Err(err).Str(logging.FieldSessionID, sessionID).Msg("failed to run proof cleanup after reconciled proof inclusion")
+			return
+		}
+		return
+	}
+	if err := state.SessionCoordinator.OnSessionProved(ctx, sessionID); err != nil {
+		m.logger.Warn().Err(err).Str(logging.FieldSessionID, sessionID).Msg("failed to repair session state after reconciled proof inclusion")
+	}
+}
+
 // ResubmitMessage implements MessageResubmitter: it routes a re-broadcast to the
 // owning supplier's tx client. Returns an error (not a panic) for suppliers this
 // replica does not control — the reconciler's ownership filter normally prevents
 // reaching here for non-owned suppliers.
 func (m *SupplierManager) ResubmitMessage(ctx context.Context, phase RebroadcastPhase, supplier string, msgBytes []byte, timeoutHeight int64) (string, error) {
-	m.suppliersMu.RLock()
-	state, ok := m.suppliers[supplier]
-	m.suppliersMu.RUnlock()
+	state, ok := m.supplierState(supplier)
 	if !ok || state.SupplierClient == nil {
 		return "", fmt.Errorf("no tx client for supplier %s (not owned by this replica)", supplier)
 	}

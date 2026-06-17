@@ -483,6 +483,10 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	if c.Transaction.TxTimeoutMaxSeconds >= 600 {
+		return fmt.Errorf("transaction.tx_timeout_max_seconds (%d) must be less than 600 to avoid cosmos-sdk unordered TX TTL rejection", c.Transaction.TxTimeoutMaxSeconds)
+	}
+
 	// Note: Storage validation removed - all session trees now use Redis
 
 	return nil

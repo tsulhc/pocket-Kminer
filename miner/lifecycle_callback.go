@@ -1085,6 +1085,7 @@ func (lc *LifecycleCallback) OnSessionsNeedClaim(ctx context.Context, snapshots 
 				}
 			} else {
 				// SUCCESS: Claim TX broadcast accepted to mempool
+				lastErr = nil
 				// Retrieve TX hash from HA client (stored immediately after broadcast)
 				if haClient, ok := lc.supplierClient.(*tx.HASupplierClient); ok {
 					claimTxHash = haClient.GetLastClaimTxHash()
@@ -1915,6 +1916,7 @@ func (lc *LifecycleCallback) OnSessionsNeedProof(ctx context.Context, snapshots 
 				}
 			} else {
 				// SUCCESS: Proof TX broadcast accepted to mempool
+				lastErr = nil
 				// Retrieve TX hash from HA client (stored immediately after broadcast)
 				if haClient, ok := lc.supplierClient.(*tx.HASupplierClient); ok {
 					proofTxHash = haClient.GetLastProofTxHash()

@@ -44,6 +44,31 @@ func TestConfig_Validate_Valid(t *testing.T) {
 	require.NoError(t, err)
 }
 
+func TestConfig_Validate_TxTimeoutMaxRejectsCosmosHardLimit(t *testing.T) {
+	cfg := &Config{
+		Redis: RedisConfig{
+			RedisConfig: config.RedisConfig{
+				URL: "redis://localhost:6379",
+			},
+		},
+		PocketNode: config.PocketNodeConfig{
+			QueryNodeRPCUrl:  "http://localhost:26657",
+			QueryNodeGRPCUrl: "localhost:9090",
+		},
+		Keys: config.KeysConfig{
+			KeysFile: "/path/to/keys.yaml",
+		},
+		Transaction: TransactionConfig{
+			TxTimeoutMaxSeconds: 600,
+		},
+	}
+
+	err := cfg.Validate()
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "transaction.tx_timeout_max_seconds")
+	require.Contains(t, err.Error(), "must be less than 600")
+}
+
 func TestConfig_Validate_MissingRedisURL(t *testing.T) {
 	cfg := &Config{
 		Redis: RedisConfig{
