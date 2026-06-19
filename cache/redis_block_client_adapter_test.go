@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -108,6 +109,34 @@ func TestPublishToSubscribers_DropsWhenSubscriberFull(t *testing.T) {
 	default:
 		t.Fatal("expected first block to be delivered")
 	}
+}
+
+func TestPublishToSubscribers_DropIsLoud(t *testing.T) {
+	a := newBareAdapter(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	ch := a.Subscribe(ctx, 1)
+	require.NotNil(t, ch)
+
+	before := testutil.ToFloat64(blockEventsDropped.WithLabelValues("fanout"))
+
+	a.publishToSubscribers(&BlockEvent{Height: 1, Hash: []byte{0x00}, Timestamp: time.Unix(0, 0)})
+	a.publishToSubscribers(&BlockEvent{Height: 2, Hash: []byte{0x00}, Timestamp: time.Unix(0, 0)})
+
+	after := testutil.ToFloat64(blockEventsDropped.WithLabelValues("fanout"))
+	assert.Equal(t, float64(1), after-before)
+}
+
+func TestBlockEvents_GuardGatesForwarding(t *testing.T) {
+	a := newBareAdapter(t)
+
+	assert.False(t, a.blockEventsRequested.Load())
+	_ = a.BlockEvents()
+	assert.True(t, a.blockEventsRequested.Load())
+	_ = a.BlockEvents()
+	assert.True(t, a.blockEventsRequested.Load())
 }
 
 // Compile-time assertion: localclient.NewSimpleBlock signature has not

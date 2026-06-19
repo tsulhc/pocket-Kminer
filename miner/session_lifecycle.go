@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/alitto/pond/v2"
@@ -384,39 +385,98 @@ func (m *SessionLifecycleManager) lifecycleChecker(ctx context.Context) {
 	}
 }
 
-// lifecycleCheckerEventDriven uses block events for immediate session transition checks.
+// blockEventSubscriberBuffer is the per-subscriber block-event channel buffer.
+// The decoupled reader drains this channel on arrival and block events arrive
+// one at a time, so steady-state occupancy is tiny; the buffer only cushions
+// transient reader scheduling jitter. The real backpressure is the transition
+// worker pool, which is observed via sessionTransitionQueueDepth.
+const blockEventSubscriberBuffer = 256
+
+// lifecycleCheckerEventDriven uses block events for immediate session
+// transition checks, while fully decoupling block ingestion from processing so
+// a slow transition pass cannot stall the block source.
 func (m *SessionLifecycleManager) lifecycleCheckerEventDriven(ctx context.Context, subscriber interface {
 	Subscribe(ctx context.Context, bufferSize int) <-chan *localclient.SimpleBlock
 }) {
-	lastHeight := int64(0)
+	blockCh := subscriber.Subscribe(ctx, blockEventSubscriberBuffer)
+	m.logger.Debug().Msg("using Subscribe() for block events (coalesced reader/processor)")
 
-	// Subscribe to block events with 2000-block buffer
-	blockCh := subscriber.Subscribe(ctx, 2000)
-	m.logger.Debug().Msg("using Subscribe() for block events (fan-out mode)")
+	lastHeight := int64(0)
+	runCoalescingBlockLoop(ctx, blockCh, func(height int64) {
+		if lastHeight > 0 {
+			sessionBlockProcessingLag.WithLabelValues(m.config.SupplierAddress).Set(float64(height - lastHeight))
+		}
+		lastHeight = height
+		currentBlockHeight.Set(float64(height))
+		m.recordTransitionQueueDepth()
+		m.checkSessionTransitions(ctx, height)
+	})
+
+	if ctx.Err() == nil {
+		m.logger.Warn().Msg("block events channel closed unexpectedly; session lifecycle block loop stopped")
+	}
+}
+
+// recordTransitionQueueDepth samples the transition subpool queue depth into
+// the per-supplier gauge. The subpool queue is intentionally unbounded, so a
+// growing depth is the early warning signal that work is outpacing settlement.
+func (m *SessionLifecycleManager) recordTransitionQueueDepth() {
+	if m.transitionSubpool == nil {
+		return
+	}
+	sessionTransitionQueueDepth.WithLabelValues(m.config.SupplierAddress).Set(float64(m.transitionSubpool.WaitingTasks()))
+}
+
+// runCoalescingBlockLoop consumes block-height events without ever blocking the
+// producer. A reader goroutine drains blockCh immediately and records only the
+// latest height; the outer goroutine processes that latest height in order. The
+// work is level-triggered by height, so coalescing redundant ticks never skips
+// a transition and prevents stale backlogs from wedging the channel.
+func runCoalescingBlockLoop(ctx context.Context, blockCh <-chan *localclient.SimpleBlock, onHeight func(height int64)) {
+	var latest atomic.Int64
+	wake := make(chan struct{}, 1)
+	readerDone := make(chan struct{})
+
+	go func() {
+		defer close(readerDone)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case block, ok := <-blockCh:
+				if !ok {
+					return
+				}
+				if h := block.Height(); h > latest.Load() {
+					latest.Store(h)
+				}
+				select {
+				case wake <- struct{}{}:
+				default:
+				}
+			}
+		}
+	}()
+
+	var lastProcessed int64
+	process := func() {
+		if h := latest.Load(); h > lastProcessed {
+			lastProcessed = h
+			onHeight(h)
+		}
+	}
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-
-		case block, ok := <-blockCh:
-			if !ok {
-				// Channel closed, block client shut down
-				m.logger.Warn().Msg("block events channel closed")
-				return
+		case <-readerDone:
+			if ctx.Err() == nil {
+				process()
 			}
-
-			currentHeight := block.Height()
-
-			// Only process if height actually increased
-			if currentHeight <= lastHeight {
-				continue
-			}
-			lastHeight = currentHeight
-			currentBlockHeight.Set(float64(currentHeight))
-
-			// Check all sessions for transitions at this block height
-			m.checkSessionTransitions(ctx, currentHeight)
+			return
+		case <-wake:
+			process()
 		}
 	}
 }

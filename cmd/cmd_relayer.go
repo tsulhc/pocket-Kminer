@@ -401,6 +401,7 @@ func runHARelayer(cmd *cobra.Command, _ []string) error {
 		redisBlockSubscriber,
 		nil, // Relayers only need block events, not specific block queries
 	)
+	blockEventsCh := blockSubscriber.BlockEvents()
 	if err := blockSubscriber.Start(ctx); err != nil {
 		return fmt.Errorf("failed to start block client adapter: %w", err)
 	}
@@ -462,7 +463,7 @@ func runHARelayer(cmd *cobra.Command, _ []string) error {
 			select {
 			case <-ctx.Done():
 				return
-			case block, ok := <-blockSubscriber.BlockEvents():
+			case block, ok := <-blockEventsCh:
 				if !ok {
 					// Channel closed
 					logger.Warn().Msg("block events channel closed")

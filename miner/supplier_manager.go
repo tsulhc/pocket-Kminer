@@ -2006,18 +2006,12 @@ func (m *SupplierManager) startReconcilerBlockLoop() {
 	m.reconcilerWG.Add(1)
 	go func() {
 		defer m.reconcilerWG.Done()
-		blockCh := subscriber.Subscribe(loopCtx, 2000)
-		for {
-			select {
-			case <-loopCtx.Done():
-				return
-			case block, chOpen := <-blockCh:
-				if !chOpen {
-					m.logger.Warn().Msg("inclusion reconciler block channel closed")
-					return
-				}
-				m.inclusionReconciler.OnBlock(block.Height())
-			}
+		blockCh := subscriber.Subscribe(loopCtx, blockEventSubscriberBuffer)
+		runCoalescingBlockLoop(loopCtx, blockCh, m.inclusionReconciler.OnBlock)
+		if loopCtx.Err() == nil {
+			m.logger.Warn().Msg("inclusion reconciler block channel closed unexpectedly; reconciler block loop stopped")
+		} else {
+			m.logger.Debug().Msg("inclusion reconciler block loop stopped")
 		}
 	}()
 }

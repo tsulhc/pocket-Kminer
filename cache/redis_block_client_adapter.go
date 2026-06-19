@@ -29,9 +29,14 @@ type RedisBlockClientAdapter struct {
 	cometClient     *http.HTTP // For querying specific block heights (proof generation)
 	lastBlock       atomic.Pointer[simpleBlock]
 	blockEventsCh   chan client.Block
-	ctx             context.Context
-	cancel          context.CancelFunc
-	wg              sync.WaitGroup
+	// blockEventsRequested is set once BlockEvents() is called. Until then,
+	// events are discarded on arrival instead of buffered into blockEventsCh.
+	// This avoids filling a channel that the miner never drains and keeps the
+	// relayer startup race from dropping blocks before a consumer is wired.
+	blockEventsRequested atomic.Bool
+	ctx                  context.Context
+	cancel               context.CancelFunc
+	wg                   sync.WaitGroup
 
 	// Fan-out subscribers for Subscribe() method
 	subscribersMu sync.RWMutex
@@ -97,18 +102,20 @@ func (a *RedisBlockClientAdapter) Start(ctx context.Context) error {
 				}
 				a.lastBlock.Store(block)
 
-				// Forward to blockEventsCh for components using BlockEvents()
-				// Non-blocking send to prevent Redis event loop from blocking
-				select {
-				case a.blockEventsCh <- block:
-					// Event forwarded successfully
-				case <-a.ctx.Done():
-					return
-				default:
-					// Drop if full - component is slow
-					a.logger.Warn().
-						Int64("height", event.Height).
-						Msg("block events channel full, dropping event")
+				// Forward to blockEventsCh only once a component has actually
+				// wired up BlockEvents(). The miner never consumes that channel,
+				// so forwarding there would just fill the buffer and log noise.
+				if a.blockEventsRequested.Load() {
+					select {
+					case a.blockEventsCh <- block:
+					case <-a.ctx.Done():
+						return
+					default:
+						blockEventsDropped.WithLabelValues("block_events").Inc()
+						a.logger.Warn().
+							Int64("height", event.Height).
+							Msg("block events channel full, dropping event (consumer not draining)")
+					}
 				}
 
 				// Fan-out to Subscribe() subscribers
@@ -186,11 +193,15 @@ func (a *RedisBlockClientAdapter) CommittedBlocksSequence(ctx context.Context) c
 }
 
 // BlockEvents returns a channel that receives block events from Redis.
+// Calling it marks BlockEvents() as having a consumer, which switches on
+// forwarding in the Redis event loop. Until the first call, events are
+// discarded on arrival rather than buffered.
 // This provides backward compatibility for components expecting BlockEvents().
 //
 // NOTE: This channel is populated from Redis pub/sub events, ensuring
 // all relayers see the same block progression as the miner.
 func (a *RedisBlockClientAdapter) BlockEvents() <-chan client.Block {
+	a.blockEventsRequested.Store(true)
 	return a.blockEventsCh
 }
 
@@ -250,15 +261,24 @@ func (a *RedisBlockClientAdapter) publishToSubscribers(event *BlockEvent) {
 	// know at least one subscriber will (try to) receive it.
 	block := localclient.NewSimpleBlock(event.Height, event.Hash, event.Timestamp)
 
+	dropped := 0
 	for _, ch := range a.subscribers {
 		select {
 		case ch <- block:
 			// Sent successfully
 		default:
-			// Channel full, skip (non-blocking)
+			dropped++
 		}
 	}
 	a.subscribersMu.RUnlock()
+
+	if dropped > 0 {
+		blockEventsDropped.WithLabelValues("fanout").Add(float64(dropped))
+		a.logger.Warn().
+			Int64("height", event.Height).
+			Int("subscribers_dropped", dropped).
+			Msg("block fan-out subscriber channel full, dropping event (subscriber not draining)")
+	}
 }
 
 // removeSubscriber removes a subscriber channel from the list.

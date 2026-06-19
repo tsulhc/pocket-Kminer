@@ -785,6 +785,35 @@ var (
 		},
 	)
 
+	// sessionBlockProcessingLag is how many blocks the lifecycle/reconciler
+	// processor advanced in a single pass (latest height minus the previously
+	// processed height). Steady state is 1. A sustained value > 1 means the
+	// processor is coalescing block ticks to stay at head — an early signal that
+	// the supplier's work (or Redis/RPC behind it) can't keep up.
+	sessionBlockProcessingLag = observability.MinerFactory.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      "session_block_processing_lag",
+			Help:      "Blocks advanced per session lifecycle / reconciler processing pass (1 = keeping up; >1 = coalescing to head under load)",
+		},
+		[]string{"supplier"},
+	)
+
+	// sessionTransitionQueueDepth is the number of tasks waiting in a supplier's
+	// transition worker subpool (claim/proof build+submit work that the lifecycle
+	// dispatched but no worker has picked up yet). The queue is intentionally
+	// unbounded; this gauge is the backpressure signal.
+	sessionTransitionQueueDepth = observability.MinerFactory.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      "session_transition_queue_depth",
+			Help:      "Tasks waiting in a supplier's transition worker subpool (unbounded; growth = work outpacing settlement)",
+		},
+		[]string{"supplier"},
+	)
+
 	// Block health metrics
 	configuredBlockTimeSeconds = observability.MinerFactory.NewGauge(
 		prometheus.GaugeOpts{

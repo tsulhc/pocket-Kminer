@@ -157,6 +157,24 @@ var (
 		},
 	)
 
+	// blockEventsDropped counts block events the RedisBlockClientAdapter dropped
+	// instead of delivering to a consumer. Dropping a block event is NEVER
+	// expected in steady state (every consumer is meant to drain on arrival), so
+	// any non-zero value is a loud signal that a block-event consumer is wedged —
+	// the exact failure mode that silently stalled claim/proof windows at high
+	// supplier counts. The channel label distinguishes:
+	//   - "fanout"       → a Subscribe() subscriber (lifecycle/reconciler/health) was full
+	//   - "block_events" → the BlockEvents() channel was full while a consumer was attached
+	blockEventsDropped = observability.SharedFactory.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      "block_events_dropped_total",
+			Help:      "Block events dropped because a consumer channel was full (should always be 0; non-zero = wedged consumer)",
+		},
+		[]string{"channel"},
+	)
+
 	currentBlockHeight = observability.SharedFactory.NewGauge(
 		prometheus.GaugeOpts{
 			Namespace: metricsNamespace,
