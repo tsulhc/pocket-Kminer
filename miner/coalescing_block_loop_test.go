@@ -137,29 +137,51 @@ func TestCoalescingBlockLoop_NeverBlocksProducer(t *testing.T) {
 	defer cancel()
 
 	ch := make(chan *localclient.SimpleBlock, 4)
-	wedge := make(chan struct{})
+	release := make(chan struct{})
+	started := make(chan struct{}, 1)
+	producerDone := make(chan struct{})
+	loopDone := make(chan struct{})
 
 	var seen int64
-	go runCoalescingBlockLoop(ctx, ch, func(h int64) {
-		if h > seen {
-			seen = h
-		}
-		<-wedge
-	})
+	go func() {
+		runCoalescingBlockLoop(ctx, ch, func(h int64) {
+			if h > seen {
+				seen = h
+			}
+			select {
+			case started <- struct{}{}:
+			default:
+			}
+			<-release
+		})
+		close(loopDone)
+	}()
+
+	// Ensure the processor is wedged before we send the burst, so the test really
+	// exercises the decoupled reader under backpressure.
+	ch <- blk(1)
+	<-started
 
 	const burst = 5000
-	done := make(chan struct{})
 	go func() {
-		for h := int64(1); h <= burst; h++ {
+		for h := int64(2); h <= burst; h++ {
 			ch <- blk(h)
 		}
-		close(done)
+		close(producerDone)
 	}()
 
 	select {
-	case <-done:
+	case <-producerDone:
 	case <-time.After(5 * time.Second):
 		t.Fatal("producer blocked")
+	}
+
+	close(release)
+	cancel()
+	select {
+	case <-loopDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("coalescing loop did not exit after release and cancel")
 	}
 }
 
