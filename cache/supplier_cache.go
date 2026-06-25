@@ -41,6 +41,25 @@ const (
 	// supplierCacheTTL = 5 * time.Minute
 )
 
+// supplierCacheL1TTL bounds how long an L1 (in-process) supplier entry — its
+// stake status and service list — is served before it is treated as a miss and
+// re-read from L2. Supplier stake/services are latest-semantics: they change
+// on-chain (stake, unstake, service add/remove) and the miner rewrites L2.
+// Without a TTL the L1 xsync map freezes the first value for the process
+// lifetime; it is only ever cleared by pub/sub invalidation, which the miner
+// fires on Set/Delete but which a relayer can miss (restart, dropped event),
+// stranding a stale stake/services view forever. Latest-semantics caches use a
+// 60s floor (mirrors application/service). var (not const) so tests can shrink
+// it without sleeping.
+var supplierCacheL1TTL = 60 * time.Second
+
+// supplierCacheL1Entry is an L1-cached supplier state plus the time it was
+// fetched, so the entry can be aged out by supplierCacheL1TTL.
+type supplierCacheL1Entry struct {
+	supplier *SupplierState
+	cachedAt time.Time
+}
+
 // SupplierState represents the cached state of a supplier.
 // This is stored in Redis and shared between miner (writer) and relayer (reader).
 type SupplierState struct {
@@ -98,10 +117,17 @@ func (s *SupplierState) isContaminated() bool {
 }
 
 // IsActive returns true if the supplier is active and should accept relays.
-// TODO_IMPROVE: Add session height comparison for proper unstaking grace period.
-// For now, any unstaking supplier is considered inactive.
+//
+// An unstaking supplier (Status == SupplierStatusUnstaking) is still considered
+// active: poktroll deactivates services at the next session-start boundary, not
+// immediately. The Services list is the precise gate — it empties at the
+// deactivation boundary (x/shared schedules it via activation_height /
+// deactivation_height on each ServiceConfig). proxy.go checks
+// len(Services)==0 and IsActiveForService, so the per-service timing is
+// enforced there. Only SupplierStatusNotStaked — meaning the address is not
+// staked on-chain at all — warrants rejecting relays here.
 func (s *SupplierState) IsActive() bool {
-	return s.Staked && s.Status == SupplierStatusActive && s.UnstakeSessionEndHeight == 0
+	return s.Staked && s.Status != SupplierStatusNotStaked
 }
 
 // IsActiveForService returns true if the supplier is active for the given service.
@@ -131,8 +157,9 @@ type SupplierCache struct {
 	keyPrefix string
 	failOpen  bool
 
-	// L1: In-memory cache (xsync for lock-free performance)
-	localCache *xsync.Map[string, *SupplierState]
+	// L1: In-memory cache (xsync for lock-free performance), TTL-bounded by
+	// supplierCacheL1TTL so an on-chain stake/services change is not frozen forever.
+	localCache *xsync.Map[string, supplierCacheL1Entry]
 
 	// Pub/sub
 	pubsub *redis.PubSub
@@ -173,7 +200,7 @@ func NewSupplierCache(
 		redis:      redisClient,
 		keyPrefix:  keyPrefix,
 		failOpen:   config.FailOpen,
-		localCache: xsync.NewMap[string, *SupplierState](),
+		localCache: xsync.NewMap[string, supplierCacheL1Entry](),
 	}
 }
 
@@ -188,8 +215,12 @@ func (c *SupplierCache) supplierKey(operatorAddress string) string {
 func (c *SupplierCache) GetSupplierState(ctx context.Context, operatorAddress string) (*SupplierState, error) {
 	start := time.Now()
 
-	// L1: Check local cache (xsync)
-	if cached, ok := c.localCache.Load(operatorAddress); ok {
+	// L1: Check local cache (xsync). Only a fresh entry (within
+	// supplierCacheL1TTL) is a hit; a stale one falls through to L2 so an
+	// on-chain stake/services change propagates instead of being frozen.
+	if entry, ok := c.localCache.Load(operatorAddress); ok && time.Since(entry.cachedAt) < supplierCacheL1TTL {
+		cached := entry.supplier
+
 		// Defensive guard: a pre-fix binary (or a warmup before this guard
 		// existed) may have populated L1 with a contaminated entry. Evict
 		// it and treat as a miss so the caller re-hydrates via L3.
@@ -267,7 +298,7 @@ func (c *SupplierCache) GetSupplierState(ctx context.Context, operatorAddress st
 	}
 
 	// Store in L1 for next time
-	c.localCache.Store(operatorAddress, &state)
+	c.localCache.Store(operatorAddress, supplierCacheL1Entry{supplier: &state, cachedAt: time.Now()})
 	cacheHits.WithLabelValues(supplierCacheType, CacheLevelL2).Inc()
 	cacheGetLatency.WithLabelValues(supplierCacheType, CacheLevelL2).Observe(time.Since(start).Seconds())
 
@@ -290,7 +321,7 @@ func (c *SupplierCache) SetSupplierState(ctx context.Context, state *SupplierSta
 	state.LastUpdated = time.Now().Unix()
 
 	// L1: Store in local cache
-	c.localCache.Store(state.OperatorAddress, state)
+	c.localCache.Store(state.OperatorAddress, supplierCacheL1Entry{supplier: state, cachedAt: time.Now()})
 
 	// L2: Store in Redis
 	data, err := json.Marshal(state)
@@ -519,7 +550,7 @@ func (c *SupplierCache) WarmupFromRedis(ctx context.Context, knownSupplierAddres
 				return
 			}
 
-			c.localCache.Store(addr, &state)
+			c.localCache.Store(addr, supplierCacheL1Entry{supplier: &state, cachedAt: time.Now()})
 			c.logger.Debug().
 				Str(logging.FieldSupplierOperator, addr).
 				Int("services", len(state.Services)).

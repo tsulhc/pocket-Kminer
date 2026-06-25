@@ -25,6 +25,24 @@ const (
 	serviceCacheTTL = 5 * time.Minute
 )
 
+// serviceCacheL1TTL bounds how long an L1 (in-process) service entry — including
+// its compute_units_per_relay — is served before it is treated as a miss and
+// re-read from L2/L3. CUPR can change on-chain; without a TTL the L1 xsync map
+// freezes the first value for the process lifetime (it is only ever cleared by
+// pub/sub invalidation, which never fires for services because the leader's
+// known-services set is empty). That froze the relayer's mined CUPR and the
+// relay meter at a stale value, mis-weighting claims. Kept below the L3 query
+// client's own TTL (serviceCacheTTL in query.go = 90s) so L1 never masks an L3
+// refresh. var (not const) so tests can shrink it without sleeping.
+var serviceCacheL1TTL = 60 * time.Second
+
+// serviceCacheL1Entry is an L1-cached service plus the time it was fetched, so
+// the entry can be aged out by serviceCacheL1TTL.
+type serviceCacheL1Entry struct {
+	svc      *sharedtypes.Service
+	cachedAt time.Time
+}
+
 // serviceCache implements KeyedEntityCache[string, *sharedtypes.Service]
 // for caching service metadata (compute units, relay difficulty, etc.).
 //
@@ -40,8 +58,9 @@ type serviceCache struct {
 	redisClient *redisutil.Client
 	queryClient ServiceQueryClient
 
-	// L1: In-memory cache (xsync for lock-free performance)
-	localCache *xsync.Map[string, *sharedtypes.Service]
+	// L1: In-memory cache (xsync for lock-free performance), TTL-bounded by
+	// serviceCacheL1TTL so an on-chain CUPR change is not frozen forever.
+	localCache *xsync.Map[string, serviceCacheL1Entry]
 
 	// Pub/sub
 	pubsub *redis.PubSub
@@ -56,6 +75,9 @@ type serviceCache struct {
 type ServiceQueryClient interface {
 	// GetService queries a service by ID from the chain.
 	GetService(ctx context.Context, serviceID string) (*sharedtypes.Service, error)
+	// InvalidateService drops any in-process cache for the given service so the
+	// next GetService fetches fresh data from chain (picks up CUPR changes).
+	InvalidateService(serviceID string)
 }
 
 // NewServiceCache creates a new service cache.
@@ -71,7 +93,7 @@ func NewServiceCache(
 		logger:      logging.ForComponent(logger, logging.ComponentQueryService),
 		redisClient: redisClient,
 		queryClient: queryClient,
-		localCache:  xsync.NewMap[string, *sharedtypes.Service](),
+		localCache:  xsync.NewMap[string, serviceCacheL1Entry](),
 	}
 }
 
@@ -119,14 +141,16 @@ func (c *serviceCache) Get(ctx context.Context, serviceID string, force ...bool)
 	forceRefresh := len(force) > 0 && force[0]
 
 	if !forceRefresh {
-		// L1: Check local cache (xsync)
-		if cached, ok := c.localCache.Load(serviceID); ok {
+		// L1: Check local cache (xsync). Only a fresh entry (within
+		// serviceCacheL1TTL) is a hit; a stale one falls through to L2/L3 so an
+		// on-chain CUPR change propagates instead of being frozen.
+		if entry, ok := c.localCache.Load(serviceID); ok && time.Since(entry.cachedAt) < serviceCacheL1TTL {
 			cacheHits.WithLabelValues(serviceCacheType, CacheLevelL1).Inc()
 			cacheGetLatency.WithLabelValues(serviceCacheType, CacheLevelL1).Observe(time.Since(start).Seconds())
 			c.logger.Debug().
 				Str(logging.FieldServiceID, serviceID).
 				Msg("service cache hit (L1)")
-			return cached, nil
+			return entry.svc, nil
 		}
 
 		// L2: Check Redis cache
@@ -136,7 +160,7 @@ func (c *serviceCache) Get(ctx context.Context, serviceID string, force ...bool)
 			svc := &sharedtypes.Service{} // CRITICAL FIX: Allocate on heap, not stack
 			if err := proto.Unmarshal(data, svc); err == nil {
 				// Store in L1 for next time
-				c.localCache.Store(serviceID, svc)
+				c.localCache.Store(serviceID, serviceCacheL1Entry{svc: svc, cachedAt: time.Now()})
 				cacheHits.WithLabelValues(serviceCacheType, CacheLevelL2).Inc()
 				cacheGetLatency.WithLabelValues(serviceCacheType, CacheLevelL2).Observe(time.Since(start).Seconds())
 
@@ -159,7 +183,10 @@ func (c *serviceCache) Get(ctx context.Context, serviceID string, force ...bool)
 	var err error
 
 	if forceRefresh {
-		// Leader force refresh: Direct query without lock (refreshes serially via pond workers)
+		// Leader force refresh: Direct query without lock (refreshes serially via pond workers).
+		// Drop the query layer's frozen copy first so GetService actually hits the
+		// chain — otherwise an on-chain CUPR change would never propagate.
+		c.queryClient.InvalidateService(serviceID)
 		chainQueries.WithLabelValues("service").Inc()
 		chainStart := time.Now()
 		svc, err = c.queryClient.GetService(ctx, serviceID)
@@ -219,7 +246,7 @@ func (c *serviceCache) Get(ctx context.Context, serviceID string, force ...bool)
 // Set stores a service in both L1 and L2 caches.
 func (c *serviceCache) Set(ctx context.Context, serviceID string, svc *sharedtypes.Service, ttl time.Duration) error {
 	// L1: Store in local cache
-	c.localCache.Store(serviceID, svc)
+	c.localCache.Store(serviceID, serviceCacheL1Entry{svc: svc, cachedAt: time.Now()})
 
 	// L2: Store in Redis (proto marshaling)
 	data, err := proto.Marshal(svc)
@@ -274,8 +301,9 @@ func (c *serviceCache) Invalidate(ctx context.Context, serviceID string) error {
 }
 
 // Refresh updates the cache from the chain (called by leader only).
-// NOTE: Services are discovered dynamically via CacheOrchestrator.RecordDiscoveredService()
-// This method is called by the orchestrator with the list of known services.
+// NOTE: Services are discovered from relay traffic by the supplier worker,
+// which SAdds them to the Redis known-set (ha:cache:known:services) the
+// orchestrator reads each refresh.
 func (c *serviceCache) Refresh(ctx context.Context) error {
 	// This method is intentionally empty because services are refreshed
 	// individually by the CacheOrchestrator based on the list of known services.
@@ -348,7 +376,7 @@ func (c *serviceCache) warmupSingleService(ctx context.Context, id string) error
 		return err
 	}
 
-	c.localCache.Store(id, svc)
+	c.localCache.Store(id, serviceCacheL1Entry{svc: svc, cachedAt: time.Now()})
 	return nil
 }
 
@@ -378,7 +406,7 @@ func (c *serviceCache) queryChainWithLock(ctx context.Context, serviceID string)
 		if err == nil {
 			svc := &sharedtypes.Service{} // CRITICAL FIX: Allocate on heap, not stack
 			if err := proto.Unmarshal(data, svc); err == nil {
-				c.localCache.Store(serviceID, svc)
+				c.localCache.Store(serviceID, serviceCacheL1Entry{svc: svc, cachedAt: time.Now()})
 				cacheHits.WithLabelValues(serviceCacheType, CacheLevelL2Retry).Inc()
 				return svc, nil
 			}
@@ -447,7 +475,7 @@ func (c *serviceCache) handleInvalidation(ctx context.Context, payload string) e
 			svc := &sharedtypes.Service{}
 			if err := proto.Unmarshal(data, svc); err == nil {
 				// Warm L1 cache immediately
-				c.localCache.Store(event.ServiceID, svc)
+				c.localCache.Store(event.ServiceID, serviceCacheL1Entry{svc: svc, cachedAt: time.Now()})
 				c.logger.Debug().
 					Str(logging.FieldServiceID, event.ServiceID).
 					Msg("eagerly reloaded service from L2 into L1")

@@ -11,6 +11,7 @@ import (
 
 	"github.com/pokt-network/pocket-relay-miner/logging"
 	servicetypes "github.com/pokt-network/poktroll/x/service/types"
+	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -37,7 +38,7 @@ func TestGetService_Success(t *testing.T) {
 	qc, err := NewQueryClients(logger, config)
 	require.NoError(t, err)
 	require.NotNil(t, qc)
-	defer qc.Close()
+	defer func() { _ = qc.Close() }()
 
 	// Query service
 	ctx := context.Background()
@@ -67,7 +68,7 @@ func TestGetService_NotFound(t *testing.T) {
 	qc, err := NewQueryClients(logger, config)
 	require.NoError(t, err)
 	require.NotNil(t, qc)
-	defer qc.Close()
+	defer func() { _ = qc.Close() }()
 
 	// Query non-existent service
 	ctx := context.Background()
@@ -96,7 +97,7 @@ func TestGetService_InvalidID(t *testing.T) {
 	qc, err := NewQueryClients(logger, config)
 	require.NoError(t, err)
 	require.NotNil(t, qc)
-	defer qc.Close()
+	defer func() { _ = qc.Close() }()
 
 	// Query with invalid ID
 	ctx := context.Background()
@@ -124,7 +125,7 @@ func TestGetService_NetworkError(t *testing.T) {
 	qc, err := NewQueryClients(logger, config)
 	require.NoError(t, err)
 	require.NotNil(t, qc)
-	defer qc.Close()
+	defer func() { _ = qc.Close() }()
 
 	// Query should fail with network error
 	ctx := context.Background()
@@ -153,7 +154,7 @@ func TestGetService_EmptyResponse(t *testing.T) {
 	qc, err := NewQueryClients(logger, config)
 	require.NoError(t, err)
 	require.NotNil(t, qc)
-	defer qc.Close()
+	defer func() { _ = qc.Close() }()
 
 	// Query should succeed with empty service
 	ctx := context.Background()
@@ -184,7 +185,7 @@ func TestGetService_Cache(t *testing.T) {
 	qc, err := NewQueryClients(logger, config)
 	require.NoError(t, err)
 	require.NotNil(t, qc)
-	defer qc.Close()
+	defer func() { _ = qc.Close() }()
 
 	ctx := context.Background()
 
@@ -224,7 +225,7 @@ func TestGetService_ConcurrentAccess(t *testing.T) {
 	qc, err := NewQueryClients(logger, config)
 	require.NoError(t, err)
 	require.NotNil(t, qc)
-	defer qc.Close()
+	defer func() { _ = qc.Close() }()
 
 	// Concurrent queries
 	ctx := context.Background()
@@ -267,7 +268,7 @@ func TestGetServiceRelayDifficulty_Success(t *testing.T) {
 	qc, err := NewQueryClients(logger, config)
 	require.NoError(t, err)
 	require.NotNil(t, qc)
-	defer qc.Close()
+	defer func() { _ = qc.Close() }()
 
 	// Query difficulty
 	ctx := context.Background()
@@ -296,7 +297,7 @@ func TestGetServiceRelayDifficulty_NotFound(t *testing.T) {
 	qc, err := NewQueryClients(logger, config)
 	require.NoError(t, err)
 	require.NotNil(t, qc)
-	defer qc.Close()
+	defer func() { _ = qc.Close() }()
 
 	// Query non-existent difficulty
 	ctx := context.Background()
@@ -306,8 +307,70 @@ func TestGetServiceRelayDifficulty_NotFound(t *testing.T) {
 	require.Contains(t, err.Error(), "failed to query relay mining difficulty")
 }
 
-// TestGetServiceRelayDifficulty_Cache tests difficulty caching
-func TestGetServiceRelayDifficulty_Cache(t *testing.T) {
+// TestGetService_TTLRefreshesCUPR is the regression test for the CUPR-frozen-cache
+// incident: GetService must serve from cache within serviceCacheTTL but re-query
+// the chain (and reflect a changed compute_units_per_relay) once the TTL expires.
+// Before the TTL was added, serviceCache was a permanent map and a CUPR change was
+// invisible for the process lifetime — relayers kept stamping the old CUPR and the
+// miner guard kept reading it, so claims were rejected on-chain.
+func TestGetService_TTLRefreshesCUPR(t *testing.T) {
+	_, address, cleanup, mock := setupMockQueryServer(t)
+	defer cleanup()
+
+	var cupr uint64 = 1000
+	queryCount := 0
+	mock.getServiceFunc = func(_ context.Context, req *servicetypes.QueryGetServiceRequest) (*servicetypes.QueryGetServiceResponse, error) {
+		queryCount++
+		return &servicetypes.QueryGetServiceResponse{
+			Service: sharedtypes.Service{Id: req.Id, ComputeUnitsPerRelay: cupr},
+		}, nil
+	}
+
+	orig := serviceCacheTTL
+	defer func() { serviceCacheTTL = orig }()
+	serviceCacheTTL = time.Hour // large: caching is active
+
+	qc, err := NewQueryClients(
+		logging.NewLoggerFromConfig(logging.DefaultConfig()),
+		ClientConfig{GRPCEndpoint: address, QueryTimeout: 5 * time.Second},
+	)
+	require.NoError(t, err)
+	defer func() { _ = qc.Close() }()
+	ctx := context.Background()
+
+	// First read hits the chain.
+	s1, err := qc.Service().GetService(ctx, "develop")
+	require.NoError(t, err)
+	require.Equal(t, uint64(1000), s1.ComputeUnitsPerRelay)
+	require.Equal(t, 1, queryCount)
+
+	// Within TTL: served from cache, no new query.
+	s2, err := qc.Service().GetService(ctx, "develop")
+	require.NoError(t, err)
+	require.Equal(t, uint64(1000), s2.ComputeUnitsPerRelay)
+	require.Equal(t, 1, queryCount, "within TTL must serve cache")
+
+	// CUPR changes on-chain; still within TTL → cache intentionally stale.
+	cupr = 1500
+	s3, err := qc.Service().GetService(ctx, "develop")
+	require.NoError(t, err)
+	require.Equal(t, uint64(1000), s3.ComputeUnitsPerRelay, "within TTL the cached value is served")
+	require.Equal(t, 1, queryCount)
+
+	// TTL expires → next read MUST re-query and reflect the new CUPR.
+	serviceCacheTTL = 0
+	s4, err := qc.Service().GetService(ctx, "develop")
+	require.NoError(t, err)
+	require.Equal(t, uint64(1500), s4.ComputeUnitsPerRelay,
+		"after TTL expiry GetService must reflect the new on-chain CUPR (regression: frozen cache)")
+	require.Equal(t, 2, queryCount)
+}
+
+// TestGetServiceRelayDifficulty_QueriesChainEachCall verifies the latest-difficulty
+// method is NOT cached: it queries the chain on every call. Caching "latest"
+// difficulty in an unkeyed, no-TTL map was a frozen-value foot-gun and was removed
+// (economic paths use the height-bound GetServiceRelayDifficultyAtHeight instead).
+func TestGetServiceRelayDifficulty_QueriesChainEachCall(t *testing.T) {
 	_, address, cleanup, mock := setupMockQueryServer(t)
 	defer cleanup()
 
@@ -328,23 +391,22 @@ func TestGetServiceRelayDifficulty_Cache(t *testing.T) {
 	qc, err := NewQueryClients(logger, config)
 	require.NoError(t, err)
 	require.NotNil(t, qc)
-	defer qc.Close()
+	defer func() { _ = qc.Close() }()
 
 	ctx := context.Background()
 
-	// First query
+	// First query hits the chain.
 	difficulty1, err := qc.Service().GetServiceRelayDifficulty(ctx, "develop")
 	require.NoError(t, err)
 	require.Equal(t, "develop", difficulty1.ServiceId)
 	require.Equal(t, 1, queryCount)
 
-	// Second query - should use cache
+	// Second query also hits the chain (no caching of the latest value).
 	difficulty2, err := qc.Service().GetServiceRelayDifficulty(ctx, "develop")
 	require.NoError(t, err)
 	require.Equal(t, "develop", difficulty2.ServiceId)
-	require.Equal(t, 1, queryCount) // Still 1
+	require.Equal(t, 2, queryCount)
 
-	// Same data
 	require.Equal(t, difficulty1.ServiceId, difficulty2.ServiceId)
 }
 
@@ -370,7 +432,7 @@ func TestGetService_Timeout(t *testing.T) {
 	qc, err := NewQueryClients(logger, config)
 	require.NoError(t, err)
 	require.NotNil(t, qc)
-	defer qc.Close()
+	defer func() { _ = qc.Close() }()
 
 	// Query may timeout or succeed depending on timing
 	ctx := context.Background()
@@ -399,7 +461,7 @@ func TestGetServiceRelayDifficultyAtHeight_Success(t *testing.T) {
 	qc, err := NewQueryClients(logger, config)
 	require.NoError(t, err)
 	require.NotNil(t, qc)
-	defer qc.Close()
+	defer func() { _ = qc.Close() }()
 
 	ctx := context.Background()
 	difficulty, err := qc.ServiceDifficulty().GetServiceRelayDifficultyAtHeight(ctx, "develop", 100)
@@ -429,7 +491,7 @@ func TestGetServiceRelayDifficultyAtHeight_Cache(t *testing.T) {
 	qc, err := NewQueryClients(logger, config)
 	require.NoError(t, err)
 	require.NotNil(t, qc)
-	defer qc.Close()
+	defer func() { _ = qc.Close() }()
 
 	ctx := context.Background()
 
@@ -469,7 +531,7 @@ func TestGetServiceRelayDifficultyAtHeight_NotFound(t *testing.T) {
 	qc, err := NewQueryClients(logger, config)
 	require.NoError(t, err)
 	require.NotNil(t, qc)
-	defer qc.Close()
+	defer func() { _ = qc.Close() }()
 
 	ctx := context.Background()
 	difficulty, err := qc.ServiceDifficulty().GetServiceRelayDifficultyAtHeight(ctx, "nonexistent", 100)
@@ -498,7 +560,7 @@ func TestGetService_MultipleServices(t *testing.T) {
 	qc, err := NewQueryClients(logger, config)
 	require.NoError(t, err)
 	require.NotNil(t, qc)
-	defer qc.Close()
+	defer func() { _ = qc.Close() }()
 
 	ctx := context.Background()
 
@@ -547,7 +609,7 @@ func TestGetServiceRelayDifficultyAtHeight_ConcurrentAccess(t *testing.T) {
 	qc, err := NewQueryClients(logger, config)
 	require.NoError(t, err)
 	require.NotNil(t, qc)
-	defer qc.Close()
+	defer func() { _ = qc.Close() }()
 
 	ctx := context.Background()
 	services := []string{"develop", "ethereum", "polygon", "solana", "avax"}
@@ -596,7 +658,7 @@ func TestGetServiceRelayDifficultyAtHeight_CacheEviction(t *testing.T) {
 	qc, err := NewQueryClients(logger, config)
 	require.NoError(t, err)
 	require.NotNil(t, qc)
-	defer qc.Close()
+	defer func() { _ = qc.Close() }()
 
 	ctx := context.Background()
 	serviceClient := qc.serviceClient

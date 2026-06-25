@@ -18,18 +18,11 @@ import (
 	"github.com/pokt-network/pocket-relay-miner/logging"
 	apptypes "github.com/pokt-network/poktroll/x/application/types"
 	prooftypes "github.com/pokt-network/poktroll/x/proof/types"
-	sessiontypes "github.com/pokt-network/poktroll/x/session/types"
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 )
 
-const (
-	// DefaultRefreshTimeout is the maximum time to wait for all cache refresh operations.
-	DefaultRefreshTimeout = 30 * time.Second
-
-	// RedisOperationTimeout is the timeout for Redis update operations during
-	// supplier registration/unregistration.
-	RedisOperationTimeout = 5 * time.Second
-)
+// DefaultRefreshTimeout is the maximum time to wait for all cache refresh operations.
+const DefaultRefreshTimeout = 30 * time.Second
 
 // CacheOrchestrator coordinates all caches and manages parallel refresh on block updates.
 //
@@ -37,8 +30,8 @@ const (
 // - Monitors block events from BlockSubscriber (WebSocket-based, no polling)
 // - Only refreshes caches when this instance is the GLOBAL leader
 // - Refreshes all caches in parallel using a worker pool
-// - Tracks discovered apps, services, and registered suppliers
-// - Warms up caches from Redis on startup
+// - Tracks apps and services discovered from relay traffic
+// - Warms up caches from Redis on startup (suppliers via the registry)
 type CacheOrchestrator struct {
 	logger logging.Logger
 	config CacheOrchestratorConfig
@@ -54,7 +47,6 @@ type CacheOrchestrator struct {
 
 	// All entity caches
 	sharedParamsCache   SingletonEntityCache[*sharedtypes.Params]
-	sessionParamsCache  SingletonEntityCache[*sessiontypes.Params]
 	proofParamsCache    SingletonEntityCache[*prooftypes.Params]
 	supplierParamsCache SupplierParamCache // Supplier module params (min_stake, etc.)
 	applicationCache    KeyedEntityCache[string, *apptypes.Application]
@@ -64,10 +56,8 @@ type CacheOrchestrator struct {
 
 	// Tracked entities - using xsync for lock-free performance
 	// Apps and Services: dynamically discovered from relay traffic
-	// Suppliers: registered from KeyManager when keyring/keyfile is loaded/updated
-	knownApps      *xsync.Map[string, struct{}]
-	knownServices  *xsync.Map[string, struct{}]
-	knownSuppliers *xsync.Map[string, struct{}]
+	knownApps     *xsync.Map[string, struct{}]
+	knownServices *xsync.Map[string, struct{}]
 
 	// Pond subpool for parallel cache refresh (I/O-bound network queries)
 	refreshSubpool pond.Pool
@@ -107,7 +97,6 @@ func NewCacheOrchestrator(
 	blockSubscriber BlockHeightSubscriber,
 	redisClient *redisutil.Client,
 	sharedParamsCache SingletonEntityCache[*sharedtypes.Params],
-	sessionParamsCache SingletonEntityCache[*sessiontypes.Params],
 	proofParamsCache SingletonEntityCache[*prooftypes.Params],
 	supplierParamsCache SupplierParamCache,
 	applicationCache KeyedEntityCache[string, *apptypes.Application],
@@ -144,7 +133,6 @@ func NewCacheOrchestrator(
 		blockSubscriber:     blockSubscriber,
 		redisClient:         redisClient,
 		sharedParamsCache:   sharedParamsCache,
-		sessionParamsCache:  sessionParamsCache,
 		proofParamsCache:    proofParamsCache,
 		supplierParamsCache: supplierParamsCache,
 		applicationCache:    applicationCache,
@@ -153,7 +141,6 @@ func NewCacheOrchestrator(
 		sessionCache:        sessionCache,
 		knownApps:           xsync.NewMap[string, struct{}](),
 		knownServices:       xsync.NewMap[string, struct{}](),
-		knownSuppliers:      xsync.NewMap[string, struct{}](),
 		refreshSubpool:      refreshSubpool,
 	}
 }
@@ -208,11 +195,6 @@ func (o *CacheOrchestrator) Close() error {
 	if o.sharedParamsCache != nil {
 		if err := o.sharedParamsCache.Close(); err != nil {
 			o.logger.Warn().Err(err).Msg("error closing shared params cache")
-		}
-	}
-	if o.sessionParamsCache != nil {
-		if err := o.sessionParamsCache.Close(); err != nil {
-			o.logger.Warn().Err(err).Msg("error closing session params cache")
 		}
 	}
 	if o.proofParamsCache != nil {
@@ -381,12 +363,14 @@ func (o *CacheOrchestrator) refreshAllCaches(ctx context.Context) error {
 		fn   func(context.Context) error
 	}{
 		{"shared_params", o.refreshSharedParams},
-		{"session_params", o.refreshSessionParams},
 		{"proof_params", o.refreshProofParams},
 		{"supplier_params", o.refreshSupplierParams},
 		{"applications", o.refreshApplications},
 		{"services", o.refreshServices},
-		{"suppliers", o.refreshSuppliers},
+		// Suppliers are NOT force-refreshed here: SupplierManager.reconcileLoop owns
+		// supplier freshness, and service discovery from relay traffic is handled by
+		// refreshServices' Redis known-set union. The old per-block refreshSuppliers
+		// iterated an always-empty known-set (RegisterSupplier had no callers) — dead.
 		// Note: Sessions are not refreshed globally, they're cached on-demand
 	}
 
@@ -429,11 +413,6 @@ func (o *CacheOrchestrator) refreshSharedParams(ctx context.Context) error {
 	return o.sharedParamsCache.Refresh(ctx)
 }
 
-// refreshSessionParams refreshes the session params cache.
-func (o *CacheOrchestrator) refreshSessionParams(ctx context.Context) error {
-	return o.sessionParamsCache.Refresh(ctx)
-}
-
 // refreshProofParams refreshes the proof params cache.
 func (o *CacheOrchestrator) refreshProofParams(ctx context.Context) error {
 	return o.proofParamsCache.Refresh(ctx)
@@ -444,14 +423,32 @@ func (o *CacheOrchestrator) refreshSupplierParams(ctx context.Context) error {
 	return o.supplierParamsCache.Refresh(ctx)
 }
 
+// mergeKnownFromRedis unions a Redis known-set (which recordDiscovered populates
+// from relay traffic on ANY replica, leader or not) into the leader's in-memory
+// set, then returns the merged membership. Without this the leader only ever
+// force-refreshes entities it warmed at startup, so an app/service first seen by a
+// non-leader replica is NEVER force-refreshed or pub/sub-invalidated and the
+// relayers follow an on-chain change only via their local cache TTL (minutes)
+// instead of within one block. It also closes the updateKnown*Set Del+SAdd clobber:
+// because we read Redis in first, the subsequent rewrite persists discovered
+// entries instead of wiping them.
+func (o *CacheOrchestrator) mergeKnownFromRedis(known *xsync.Map[string, struct{}], fromRedis []string) []string {
+	for _, id := range fromRedis {
+		known.Store(id, struct{}{})
+	}
+	var merged []string
+	known.Range(func(k string, _ struct{}) bool {
+		merged = append(merged, k)
+		return true
+	})
+	return merged
+}
+
 // refreshApplications refreshes all known applications.
 func (o *CacheOrchestrator) refreshApplications(ctx context.Context) error {
-	// Collect known apps using xsync.MapOf.Range()
-	var knownApps []string
-	o.knownApps.Range(func(addr string, _ struct{}) bool {
-		knownApps = append(knownApps, addr)
-		return true // continue iteration
-	})
+	// Union the Redis known-set (relay-traffic discovery from any replica) into the
+	// in-memory set so discovered apps are force-refreshed + pub/sub invalidated.
+	knownApps := o.mergeKnownFromRedis(o.knownApps, o.getKnownAppsFromRedis(ctx))
 
 	// Type assert to get RefreshEntity method
 	type RefreshableCache interface {
@@ -518,12 +515,12 @@ func (o *CacheOrchestrator) refreshApplications(ctx context.Context) error {
 
 // refreshServices refreshes all known services.
 func (o *CacheOrchestrator) refreshServices(ctx context.Context) error {
-	// Collect known services using xsync.MapOf.Range()
-	var knownServices []string
-	o.knownServices.Range(func(serviceID string, _ struct{}) bool {
-		knownServices = append(knownServices, serviceID)
-		return true // continue iteration
-	})
+	// Union the Redis known-set (relay-traffic discovery from any replica) into the
+	// in-memory set. This is the fix for ha:cache:known:services being effectively
+	// empty: recordDiscovered SAdds services there, but the leader never read them
+	// back, so develop-http was never force-refreshed → L2 stayed empty → no
+	// invalidation → relayers followed CUPR only via their 60s L1 TTL.
+	knownServices := o.mergeKnownFromRedis(o.knownServices, o.getKnownServicesFromRedis(ctx))
 
 	// Type assert to get RefreshEntity method
 	type RefreshableCache interface {
@@ -588,80 +585,11 @@ func (o *CacheOrchestrator) refreshServices(ctx context.Context) error {
 	return nil
 }
 
-// refreshSuppliers refreshes all known suppliers and discovers their services.
-func (o *CacheOrchestrator) refreshSuppliers(ctx context.Context) error {
-	// Note: Suppliers are NOT discovered from relay traffic
-	// They are registered via RegisterSupplier() when KeyManager loads them
-	// from keyring/keyfile
-
-	// Collect known suppliers
-	var knownSuppliers []string
-	o.knownSuppliers.Range(func(addr string, _ struct{}) bool {
-		knownSuppliers = append(knownSuppliers, addr)
-		return true
-	})
-
-	// For each supplier, get their state and discover their services IN PARALLEL
-	// This is critical for operators with 2000+ suppliers
-	group := o.refreshSubpool.NewGroup()
-	for _, supplierAddr := range knownSuppliers {
-		// Capture for closure
-		addr := supplierAddr
-		group.SubmitErr(func() error {
-			state, err := o.supplierCache.GetSupplierState(ctx, addr)
-			if err != nil {
-				// Check if it's a NotFound error (supplier was unstaked/deleted)
-				if st, ok := status.FromError(err); ok && st.Code() == codes.NotFound {
-					// Expected: Supplier was unstaked or deleted from chain
-					// Log at Debug level to reduce noise
-					o.logger.Debug().
-						Str("supplier_address", addr).
-						Msg("supplier not found on chain (likely unstaked)")
-					// TODO: Consider removing from knownSuppliers after N consecutive NotFound
-					return nil // Don't fail the group for NotFound
-				}
-				// Unexpected error (network, timeout, etc.)
-				o.logger.Warn().
-					Err(err).
-					Str("supplier_address", addr).
-					Msg("failed to get supplier state during refresh")
-				return err
-			}
-
-			if state == nil {
-				return nil
-			}
-
-			// Register services from this supplier
-			for _, serviceID := range state.Services {
-				if serviceID != "" {
-					o.knownServices.Store(serviceID, struct{}{})
-				}
-			}
-			return nil
-		})
-	}
-
-	// Wait for all supplier refreshes to complete
-	if err := group.Wait(); err != nil {
-		o.logger.Warn().Err(err).Msg("some supplier refreshes failed")
-		// Don't return error - continue with Redis update
-	}
-
-	// Update Redis set with known suppliers (for warmup on restart)
-	if err := o.updateKnownSuppliersSet(ctx, knownSuppliers); err != nil {
-		o.logger.Warn().Err(err).Msg("failed to update known suppliers set")
-	}
-
-	return nil
-}
-
 // warmupCaches populates L1 caches from Redis on startup.
 func (o *CacheOrchestrator) warmupCaches(ctx context.Context) error {
 	// Get known entities from Redis (stored by leader during refresh)
 	knownApps := o.getKnownAppsFromRedis(ctx)
 	knownServices := o.getKnownServicesFromRedis(ctx)
-	knownSuppliers := o.getKnownSuppliersFromRedis(ctx)
 
 	// Merge configured known applications with those from Redis
 	// This allows operators to pre-configure apps for faster first-request performance
@@ -700,21 +628,16 @@ func (o *CacheOrchestrator) warmupCaches(ctx context.Context) error {
 	for _, serviceID := range knownServices {
 		o.knownServices.Store(serviceID, struct{}{})
 	}
-	for _, supplierAddr := range knownSuppliers {
-		o.knownSuppliers.Store(supplierAddr, struct{}{})
-	}
 
 	o.logger.Info().
 		Int("apps", len(knownApps)).
 		Int("services", len(knownServices)).
-		Int("suppliers", len(knownSuppliers)).
 		Msg("discovered known entities from Redis")
 
 	// Warmup keyed caches in parallel using pond workers
 	o.logger.Info().
 		Int("apps", len(knownApps)).
 		Int("services", len(knownServices)).
-		Int("suppliers", len(knownSuppliers)).
 		Msg("warming up caches from Redis using pond workers")
 
 	// Create pond group for warmup tasks
@@ -740,9 +663,11 @@ func (o *CacheOrchestrator) warmupCaches(ctx context.Context) error {
 		}
 	}
 
-	// Warmup suppliers - use existing method (already handles concurrency internally)
+	// Warmup suppliers — nil triggers WarmupFromRedis' discover-all-from-registry
+	// path (ha:supplier:*), which is how suppliers were actually warmed all along
+	// (the removed knownSuppliers list was always empty).
 	group.SubmitErr(func() error {
-		return o.supplierCache.WarmupFromRedis(ctx, knownSuppliers)
+		return o.supplierCache.WarmupFromRedis(ctx, nil)
 	})
 
 	// Wait for all warmup tasks to complete
@@ -754,9 +679,6 @@ func (o *CacheOrchestrator) warmupCaches(ctx context.Context) error {
 	// Warmup singleton caches (params)
 	if shared, ok := o.sharedParamsCache.(*sharedParamsCache); ok {
 		_ = shared.WarmupFromRedis(ctx)
-	}
-	if session, ok := o.sessionParamsCache.(*sessionParamsCache); ok {
-		_ = session.WarmupFromRedis(ctx)
 	}
 	if proof, ok := o.proofParamsCache.(*proofParamsCache); ok {
 		_ = proof.WarmupFromRedis(ctx)
@@ -790,16 +712,6 @@ func (o *CacheOrchestrator) getKnownServicesFromRedis(ctx context.Context) []str
 	return members
 }
 
-// getKnownSuppliersFromRedis retrieves the list of known supplier addresses from Redis.
-func (o *CacheOrchestrator) getKnownSuppliersFromRedis(ctx context.Context) []string {
-	members, err := o.redisClient.SMembers(ctx, o.redisClient.KB().CacheKnownKey("suppliers")).Result()
-	if err != nil {
-		o.logger.Warn().Err(err).Msg("failed to get known suppliers from Redis")
-		return nil
-	}
-	return members
-}
-
 // updateKnownAppsSet updates the Redis set with known apps (for warmup on restart).
 func (o *CacheOrchestrator) updateKnownAppsSet(ctx context.Context, knownApps []string) error {
 	key := o.redisClient.KB().CacheKnownKey("applications")
@@ -818,76 +730,4 @@ func (o *CacheOrchestrator) updateKnownServicesSet(ctx context.Context, knownSer
 		return o.redisClient.SAdd(ctx, key, knownServices).Err()
 	}
 	return nil
-}
-
-// updateKnownSuppliersSet updates the Redis set with known suppliers (for warmup on restart).
-func (o *CacheOrchestrator) updateKnownSuppliersSet(ctx context.Context, knownSuppliers []string) error {
-	key := o.redisClient.KB().CacheKnownKey("suppliers")
-	o.redisClient.Del(ctx, key)
-	if len(knownSuppliers) > 0 {
-		return o.redisClient.SAdd(ctx, key, knownSuppliers).Err()
-	}
-	return nil
-}
-
-// RecordDiscoveredApp records an app discovered from relay traffic.
-// This is called by the RelayProcessor when it sees a new app address.
-func (o *CacheOrchestrator) RecordDiscoveredApp(appAddress string) {
-	o.knownApps.Store(appAddress, struct{}{})
-}
-
-// RecordDiscoveredService records a service discovered from relay traffic.
-// This is called by the RelayProcessor when it sees a new service ID.
-func (o *CacheOrchestrator) RecordDiscoveredService(serviceID string) {
-	o.knownServices.Store(serviceID, struct{}{})
-}
-
-// RegisterSupplier registers a supplier from KeyManager when keyring/keyfile is loaded.
-// This is called by the KeyManager when supplier keys are loaded from keyring/keyfile.
-func (o *CacheOrchestrator) RegisterSupplier(supplierAddress string) {
-	o.knownSuppliers.Store(supplierAddress, struct{}{})
-
-	o.logger.Debug().
-		Str(logging.FieldSupplier, supplierAddress).
-		Msg("registered supplier from KeyManager")
-
-	// Update Redis set immediately
-	ctx, cancel := context.WithTimeout(context.Background(), RedisOperationTimeout)
-	defer cancel()
-
-	// Collect all known suppliers
-	var knownSuppliers []string
-	o.knownSuppliers.Range(func(addr string, _ struct{}) bool {
-		knownSuppliers = append(knownSuppliers, addr)
-		return true
-	})
-
-	if err := o.updateKnownSuppliersSet(ctx, knownSuppliers); err != nil {
-		o.logger.Warn().Err(err).Msg("failed to update known suppliers set")
-	}
-}
-
-// UnregisterSupplier removes a supplier from the known suppliers set.
-// This is called by the KeyManager when supplier keys are removed.
-func (o *CacheOrchestrator) UnregisterSupplier(supplierAddress string) {
-	o.knownSuppliers.Delete(supplierAddress)
-
-	o.logger.Debug().
-		Str(logging.FieldSupplier, supplierAddress).
-		Msg("unregistered supplier from KeyManager")
-
-	// Update Redis set immediately
-	ctx, cancel := context.WithTimeout(context.Background(), RedisOperationTimeout)
-	defer cancel()
-
-	// Collect all known suppliers
-	var knownSuppliers []string
-	o.knownSuppliers.Range(func(addr string, _ struct{}) bool {
-		knownSuppliers = append(knownSuppliers, addr)
-		return true
-	})
-
-	if err := o.updateKnownSuppliersSet(ctx, knownSuppliers); err != nil {
-		o.logger.Warn().Err(err).Msg("failed to update known suppliers set")
-	}
 }

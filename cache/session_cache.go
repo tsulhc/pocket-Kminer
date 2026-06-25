@@ -20,6 +20,47 @@ import (
 
 var _ SessionCache = (*RedisSessionCache)(nil)
 
+// sessionCacheL1TTL bounds how long an L1 (in-process) session entry is served
+// before it is treated as a miss and re-read from L2/L3. A session is
+// height-keyed and immutable once observed, so this is a safety floor — not a
+// correctness lever like the latest-semantics caches — but the L1 sync.Map
+// otherwise freezes the first value for the process lifetime (it is never
+// cleared by any invalidation path). Without a floor a process-lifetime entry
+// can mask an L2/L3 correction (e.g. a non-deterministic session re-fetch). The
+// floor is long (30m) because the key already pins the height/session. var (not
+// const) so tests can shrink it without sleeping.
+var sessionCacheL1TTL = 30 * time.Minute
+
+// sessionCacheL1Entry is an L1-cached session plus the height it was keyed at (for
+// window-bounded eviction) and the time it was fetched (for the TTL floor).
+type sessionCacheL1Entry struct {
+	session  *sessiontypes.Session
+	height   int64
+	cachedAt time.Time
+}
+
+// sessionCacheL1KeepHeights bounds the L1 height window. The sync.Map otherwise
+// grows one entry per distinct session served for the process lifetime; storing
+// prunes entries whose height is more than this many blocks below the newest.
+const sessionCacheL1KeepHeights = 600
+
+// storeSession caches a session in L1 and prunes entries far below the newest
+// height, keeping the sync.Map bounded.
+func (c *RedisSessionCache) storeSession(key string, height int64, session *sessiontypes.Session) {
+	c.sessionCache.Store(key, sessionCacheL1Entry{session: session, height: height, cachedAt: time.Now()})
+
+	cutoff := height - sessionCacheL1KeepHeights
+	if cutoff <= 0 {
+		return
+	}
+	c.sessionCache.Range(func(k, v any) bool {
+		if e, ok := v.(sessionCacheL1Entry); ok && e.height < cutoff {
+			c.sessionCache.Delete(k)
+		}
+		return true
+	})
+}
+
 // RedisSessionCache implements SessionCache using Redis as L2 cache.
 type RedisSessionCache struct {
 	logger        logging.Logger
@@ -29,8 +70,9 @@ type RedisSessionCache struct {
 	blockClient   client.BlockClient
 	config        CacheConfig
 
-	// L1 local cache for sessions
-	sessionCache sync.Map // map[string]*sessiontypes.Session
+	// L1 local cache for sessions, TTL-bounded by sessionCacheL1TTL so an entry
+	// is never frozen for the process lifetime.
+	sessionCache sync.Map // map[string]sessionCacheL1Entry
 
 	// L1 local cache for session rewardability (fast path)
 	rewardableCache sync.Map // map[string]bool (true = rewardable, false = non-rewardable)
@@ -146,16 +188,20 @@ func (c *RedisSessionCache) GetSession(ctx context.Context, appAddress, serviceI
 
 	key := c.keys.Session(appAddress, serviceId, height)
 
-	// L1: Check local cache
+	// L1: Check local cache. Only a fresh entry (within sessionCacheL1TTL) is a
+	// hit; a stale one falls through to L2/L3 so the entry can never be frozen
+	// for the process lifetime.
 	if cached, ok := c.sessionCache.Load(key); ok {
-		cacheHits.WithLabelValues("session", CacheLevelL1).Inc()
-		cacheGetLatency.WithLabelValues("session", CacheLevelL1).Observe(time.Since(start).Seconds())
-		c.logger.Debug().
-			Str("app_address", appAddress).
-			Str("service_id", serviceId).
-			Int64("height", height).
-			Msg("session cache hit (L1)")
-		return cached.(*sessiontypes.Session), nil
+		if entry := cached.(sessionCacheL1Entry); time.Since(entry.cachedAt) < sessionCacheL1TTL {
+			cacheHits.WithLabelValues("session", CacheLevelL1).Inc()
+			cacheGetLatency.WithLabelValues("session", CacheLevelL1).Observe(time.Since(start).Seconds())
+			c.logger.Debug().
+				Str("app_address", appAddress).
+				Str("service_id", serviceId).
+				Int64("height", height).
+				Msg("session cache hit (L1)")
+			return entry.session, nil
+		}
 	}
 	cacheMisses.WithLabelValues("session", "l1").Inc()
 
@@ -168,7 +214,7 @@ func (c *RedisSessionCache) GetSession(ctx context.Context, appAddress, serviceI
 		} else {
 			cacheHits.WithLabelValues("session", CacheLevelL2).Inc()
 			cacheGetLatency.WithLabelValues("session", CacheLevelL2).Observe(time.Since(start).Seconds())
-			c.sessionCache.Store(key, session)
+			c.storeSession(key, height, session)
 			c.logger.Debug().
 				Str("app_address", appAddress).
 				Str("service_id", serviceId).
@@ -235,7 +281,7 @@ func (c *RedisSessionCache) GetSession(ctx context.Context, appAddress, serviceI
 	}
 
 	// Cache in L1
-	c.sessionCache.Store(key, session)
+	c.storeSession(key, height, session)
 	c.logger.Info().
 		Str("app_address", appAddress).
 		Str("service_id", serviceId).

@@ -11,6 +11,7 @@ import (
 	"github.com/alitto/pond/v2"
 	"github.com/cometbft/cometbft/rpc/client/http"
 	cosmostypes "github.com/cosmos/cosmos-sdk/types"
+	"github.com/puzpuzpuz/xsync/v4"
 
 	"github.com/pokt-network/pocket-relay-miner/cache"
 	"github.com/pokt-network/pocket-relay-miner/keys"
@@ -22,9 +23,6 @@ import (
 	"github.com/pokt-network/pocket-relay-miner/tx"
 
 	"github.com/pokt-network/poktroll/pkg/crypto/protocol"
-	prooftypes "github.com/pokt-network/poktroll/x/proof/types"
-	sessiontypes "github.com/pokt-network/poktroll/x/session/types"
-	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 )
 
 // SupplierWorkerConfig contains configuration for supplier processing.
@@ -62,14 +60,10 @@ type SupplierWorker struct {
 	serviceFactorClient     *relayer.ServiceFactorClient
 	masterPool              pond.Pool
 
-	// Caches - these read from Redis L2 (populated by leader) and fall back to network
-	sharedParamsCache  cache.SingletonEntityCache[*sharedtypes.Params]
-	sessionParamsCache cache.SingletonEntityCache[*sessiontypes.Params]
-	proofParamsCache   cache.SingletonEntityCache[*prooftypes.Params]
-
-	// Cache orchestrator reference for discovered apps/services
-	// Only used when worker is running inside leader
-	cacheOrchestrator *cache.CacheOrchestrator
+	// discovered dedups app/service addresses already written to the Redis
+	// known-sets, keeping the per-relay discovery write off the hot path after
+	// first sight.
+	discovered *xsync.Map[string, struct{}]
 
 	// Lifecycle
 	ctx      context.Context
@@ -81,15 +75,38 @@ type SupplierWorker struct {
 // NewSupplierWorker creates a new supplier worker.
 func NewSupplierWorker(config SupplierWorkerConfig) *SupplierWorker {
 	return &SupplierWorker{
-		logger: logging.ForComponent(config.Logger, "supplier_worker"),
-		config: config,
+		logger:     logging.ForComponent(config.Logger, "supplier_worker"),
+		config:     config,
+		discovered: xsync.NewMap[string, struct{}](),
 	}
 }
 
-// SetCacheOrchestrator sets the cache orchestrator for tracking discovered apps/services.
-// This is only called when the worker runs inside a leader.
-func (w *SupplierWorker) SetCacheOrchestrator(orch *cache.CacheOrchestrator) {
-	w.cacheOrchestrator = orch
+// recordDiscovered persists app/service addresses seen in relay traffic to the
+// shared Redis known-sets so the leader's CacheOrchestrator refreshes them. The
+// orchestrator runs only on the leader, but any replica can own a supplier and
+// see its apps, so every replica feeds the sets. A local dedup map keeps this
+// off the hot path after each entity's first sighting. Best-effort.
+func (w *SupplierWorker) recordDiscovered(ctx context.Context, appAddr, serviceID string) {
+	rc := w.config.RedisClient
+	if rc == nil || w.discovered == nil {
+		return
+	}
+	if appAddr != "" {
+		if _, seen := w.discovered.LoadOrStore("app:"+appAddr, struct{}{}); !seen {
+			if err := rc.SAdd(ctx, rc.KB().CacheKnownKey("applications"), appAddr).Err(); err != nil {
+				w.discovered.Delete("app:" + appAddr) // allow retry on next sighting
+				w.logger.Debug().Err(err).Str("app", appAddr).Msg("failed to record discovered application")
+			}
+		}
+	}
+	if serviceID != "" {
+		if _, seen := w.discovered.LoadOrStore("svc:"+serviceID, struct{}{}); !seen {
+			if err := rc.SAdd(ctx, rc.KB().CacheKnownKey("services"), serviceID).Err(); err != nil {
+				w.discovered.Delete("svc:" + serviceID) // allow retry on next sighting
+				w.logger.Debug().Err(err).Str(logging.FieldServiceID, serviceID).Msg("failed to record discovered service")
+			}
+		}
+	}
 }
 
 // Start initializes and starts the supplier worker.
@@ -201,43 +218,11 @@ func (w *SupplierWorker) Start(ctx context.Context) error {
 	}
 	w.logger.Info().Msg("redis block client adapter started")
 
-	// Create caches (read from Redis L2 populated by leader, fall back to network query)
-	blockTimeSeconds := w.config.Config.GetBlockTimeSeconds()
-
-	w.sharedParamsCache = cache.NewSharedParamsCache(
-		w.logger,
-		w.config.RedisClient,
-		w.queryClients.Shared(),
-		blockTimeSeconds,
-	)
-	if err = w.sharedParamsCache.Start(ctx); err != nil {
-		w.cleanup()
-		return fmt.Errorf("failed to start shared params cache: %w", err)
-	}
-
-	w.sessionParamsCache = cache.NewSessionParamsCache(
-		w.logger,
-		w.config.RedisClient,
-		cache.NewSessionQueryClientAdapter(w.queryClients.Session()),
-		w.queryClients.Shared(),
-		blockTimeSeconds,
-	)
-	if err = w.sessionParamsCache.Start(ctx); err != nil {
-		w.cleanup()
-		return fmt.Errorf("failed to start session params cache: %w", err)
-	}
-
-	w.proofParamsCache = cache.NewProofParamsCache(
-		w.logger,
-		w.config.RedisClient,
-		cache.NewProofQueryClientAdapter(w.queryClients.Proof()),
-		w.queryClients.Shared(),
-		blockTimeSeconds,
-	)
-	if err = w.proofParamsCache.Start(ctx); err != nil {
-		w.cleanup()
-		return fmt.Errorf("failed to start proof params cache: %w", err)
-	}
+	// NOTE: The worker does NOT build its own shared/session/proof param caches.
+	// The economic paths read the raw query clients (GetParamsAtHeight for
+	// session-bound reads; live GetParams for proof requirement), and the only
+	// orchestrator-refreshed param caches that need to exist live on the leader
+	// controller. Worker-local copies were dead duplicates.
 
 	// Create supplier cache (for publishing supplier state)
 	w.supplierCache = cache.NewSupplierCache(
@@ -326,9 +311,6 @@ func (w *SupplierWorker) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to start service factor client: %w", err)
 	}
 
-	// Create cached shared client wrapper
-	cachedSharedClient := cache.NewCachedSharedQueryClient(w.sharedParamsCache, w.queryClients.Shared())
-
 	// Create supplier manager with distributed claiming enabled
 	w.supplierManager = NewSupplierManager(
 		w.logger,
@@ -349,13 +331,14 @@ func (w *SupplierWorker) Start(ctx context.Context) error {
 			WorkerPool:                     w.masterPool,
 			TxClient:                       w.txClient,
 			BlockClient:                    w.redisBlockClientAdapter, // Use Redis pub/sub for block events
-			SharedClient:                   cachedSharedClient,
+			SharedClient:                   w.queryClients.Shared(),
 			SessionClient:                  w.queryClients.Session(),
 			ProofChecker:                   w.proofChecker,
 			ProofQueryClient:               w.queryClients.Proof(),
 			InclusionReconcilerConfig:      w.config.Config.Transaction.InclusionReconcilerConfig(),
 			ServiceFactorProvider:          newServiceFactorClientAdapter(ctx, w.serviceFactorClient),
 			AppClient:                      cache.NewApplicationQueryClientAdapter(w.queryClients.Application()),
+			ServiceClient:                  w.queryClients.Service(),
 			SessionLifecycleConfig: SessionLifecycleConfig{
 				CheckInterval:            0, // Event-driven via Redis pub/sub
 				MaxConcurrentTransitions: w.config.Config.GetSessionLifecycleMaxConcurrentTransitions(),
@@ -407,15 +390,10 @@ func (w *SupplierWorker) handleRelay(ctx context.Context, supplierAddr string, m
 		return nil // ACK and discard
 	}
 
-	// Track discovered apps and services (if cache orchestrator is available)
-	if w.cacheOrchestrator != nil {
-		if msg.Message.ApplicationAddress != "" {
-			w.cacheOrchestrator.RecordDiscoveredApp(msg.Message.ApplicationAddress)
-		}
-		if msg.Message.ServiceId != "" {
-			w.cacheOrchestrator.RecordDiscoveredService(msg.Message.ServiceId)
-		}
-	}
+	// Persist apps/services seen in relay traffic to the shared Redis known-sets
+	// so the leader's CacheOrchestrator refreshes them (dedup'd; off the hot path
+	// after first sight).
+	w.recordDiscovered(ctx, msg.Message.ApplicationAddress, msg.Message.ServiceId)
 
 	// Check session state BEFORE updating SMST
 	if state.SessionStore != nil {
@@ -635,27 +613,6 @@ func (w *SupplierWorker) cleanup() {
 			w.logger.Error().Err(err).Msg("failed to close supplier cache")
 		}
 		w.supplierCache = nil
-	}
-
-	if w.proofParamsCache != nil {
-		if err := w.proofParamsCache.Close(); err != nil {
-			w.logger.Error().Err(err).Msg("failed to close proof params cache")
-		}
-		w.proofParamsCache = nil
-	}
-
-	if w.sessionParamsCache != nil {
-		if err := w.sessionParamsCache.Close(); err != nil {
-			w.logger.Error().Err(err).Msg("failed to close session params cache")
-		}
-		w.sessionParamsCache = nil
-	}
-
-	if w.sharedParamsCache != nil {
-		if err := w.sharedParamsCache.Close(); err != nil {
-			w.logger.Error().Err(err).Msg("failed to close shared params cache")
-		}
-		w.sharedParamsCache = nil
 	}
 
 	if w.redisBlockClientAdapter != nil {

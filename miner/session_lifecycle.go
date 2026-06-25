@@ -46,8 +46,9 @@ type SessionLifecycleCallback interface {
 	OnSessionsNeedClaim(ctx context.Context, snapshots []*SessionSnapshot) (rootHashes [][]byte, err error)
 
 	// OnSessionsNeedProof is called when sessions need proofs submitted (batched).
-	// All sessions in the batch are submitted in a single transaction for efficiency.
-	OnSessionsNeedProof(ctx context.Context, snapshots []*SessionSnapshot) error
+	// It returns only the sessions whose proof transaction was actually accepted
+	// for submission; callers must not assume every input session was submitted.
+	OnSessionsNeedProof(ctx context.Context, snapshots []*SessionSnapshot) (submitted []*SessionSnapshot, err error)
 
 	// OnSessionProved is called when a session proof is successfully submitted.
 	OnSessionProved(ctx context.Context, snapshot *SessionSnapshot) error
@@ -1072,15 +1073,21 @@ func (m *SessionLifecycleManager) executeBatchedProofTransition(ctx context.Cont
 		Int("batch_size", len(sessions)).
 		Msg("executing batched proof transition — submitting proofs")
 
-	// Call the batched proof callback
-	if proofErr := m.callback.OnSessionsNeedProof(ctx, sessions); proofErr != nil {
+	// Call the batched proof callback. It may submit only a subset: proof builds
+	// can fail per-session, proof requirement can flip to probabilistic, or the
+	// pre-proof guard can terminalize individual sessions. Only mark sessions the
+	// callback explicitly reports as submitted.
+	submittedSessions, proofErr := m.callback.OnSessionsNeedProof(ctx, sessions)
+	if proofErr != nil {
 		m.logger.Error().Err(proofErr).Int("batch_size", len(sessions)).Msg("batched proof callback failed")
 		proofErrors.WithLabelValues(m.config.SupplierAddress, "callback_failed").Inc()
+	}
+	if len(submittedSessions) == 0 {
 		return
 	}
 
-	// Update all sessions and transition to proved
-	for _, session := range sessions {
+	// Update only sessions whose proof was actually submitted and transition to proved.
+	for _, session := range submittedSessions {
 		// Update session state (pointer update, safe without mutex)
 		session.State = SessionStateProved
 		session.LastUpdatedAt = time.Now()
@@ -1265,52 +1272,4 @@ func (m *SessionLifecycleManager) Close() error {
 
 	m.logger.Info().Msg("session lifecycle manager closed")
 	return nil
-}
-
-// SessionWindow represents the timing windows for a session.
-type SessionWindow struct {
-	SessionEndHeight int64
-	GracePeriodEnd   int64
-	ClaimWindowOpen  int64
-	ClaimWindowClose int64
-	ProofWindowOpen  int64
-	ProofWindowClose int64
-}
-
-// CalculateSessionWindow calculates all timing windows for a session.
-func CalculateSessionWindow(params *sharedtypes.Params, sessionEndHeight int64) SessionWindow {
-	return SessionWindow{
-		SessionEndHeight: sessionEndHeight,
-		GracePeriodEnd:   sessionEndHeight + int64(params.GetGracePeriodEndOffsetBlocks()),
-		ClaimWindowOpen:  sharedtypes.GetClaimWindowOpenHeight(params, sessionEndHeight),
-		ClaimWindowClose: sharedtypes.GetClaimWindowCloseHeight(params, sessionEndHeight),
-		ProofWindowOpen:  sharedtypes.GetProofWindowOpenHeight(params, sessionEndHeight),
-		ProofWindowClose: sharedtypes.GetProofWindowCloseHeight(params, sessionEndHeight),
-	}
-}
-
-// IsInClaimWindow returns true if the current height is within the claim window.
-func (w SessionWindow) IsInClaimWindow(currentHeight int64) bool {
-	return currentHeight >= w.ClaimWindowOpen && currentHeight < w.ClaimWindowClose
-}
-
-// IsInProofWindow returns true if the current height is within the proof window.
-func (w SessionWindow) IsInProofWindow(currentHeight int64) bool {
-	return currentHeight >= w.ProofWindowOpen && currentHeight < w.ProofWindowClose
-}
-
-// BlocksUntilClaimWindowClose returns blocks remaining until claim window closes.
-func (w SessionWindow) BlocksUntilClaimWindowClose(currentHeight int64) int64 {
-	if currentHeight >= w.ClaimWindowClose {
-		return 0
-	}
-	return w.ClaimWindowClose - currentHeight
-}
-
-// BlocksUntilProofWindowClose returns blocks remaining until proof window closes.
-func (w SessionWindow) BlocksUntilProofWindowClose(currentHeight int64) int64 {
-	if currentHeight >= w.ProofWindowClose {
-		return 0
-	}
-	return w.ProofWindowClose - currentHeight
 }

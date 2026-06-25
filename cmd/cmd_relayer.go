@@ -236,18 +236,9 @@ func runHARelayer(cmd *cobra.Command, _ []string) error {
 	// Relayer uses default 30s block time (production default for mainnet/testnet)
 	blockTimeSeconds := int64(30)
 
-	// Create session params cache with dynamic session-duration TTL
-	sessionParamsCache := cache.NewSessionParamsCache(
-		logger,
-		redisClient,
-		cache.NewSessionQueryClientAdapter(queryClients.Session()),
-		queryClients.Shared(), // For TTL calculation
-		blockTimeSeconds,
-	)
-	if err := sessionParamsCache.Start(ctx); err != nil {
-		return fmt.Errorf("failed to start session params cache: %w", err)
-	}
-	defer func() { _ = sessionParamsCache.Close() }()
+	// NOTE: session params are read live via the session query client (90s TTL) in
+	// RelayMeter.getSessionParams — the relayer does NOT use a session-params
+	// singleton (it ran no orchestrator to refresh it and never read it).
 
 	// Create shared params cache with dynamic 2-session TTL
 	sharedParamsCache := cache.NewSharedParamsCache(
@@ -260,19 +251,6 @@ func runHARelayer(cmd *cobra.Command, _ []string) error {
 		return fmt.Errorf("failed to start shared params cache: %w", err)
 	}
 	defer func() { _ = sharedParamsCache.Close() }()
-
-	// Create proof params cache with dynamic session-duration TTL
-	proofParamsCache := cache.NewProofParamsCache(
-		logger,
-		redisClient,
-		cache.NewProofQueryClientAdapter(queryClients.Proof()),
-		queryClients.Shared(), // For TTL calculation
-		blockTimeSeconds,
-	)
-	if err := proofParamsCache.Start(ctx); err != nil {
-		return fmt.Errorf("failed to start proof params cache: %w", err)
-	}
-	defer func() { _ = proofParamsCache.Close() }()
 
 	// Create application cache
 	applicationCache := cache.NewApplicationCache(
@@ -315,32 +293,20 @@ func runHARelayer(cmd *cobra.Command, _ []string) error {
 	if config.CacheWarmup.Enabled {
 		logger.Info().
 			Int("known_apps", len(config.CacheWarmup.KnownApplications)).
-			Bool("persist_discovered", config.CacheWarmup.PersistDiscoveredApps).
 			Int("concurrency", config.CacheWarmup.WarmupConcurrency).
 			Msg("starting cache warmup for faster cold starts")
-
-		// Create ring client first (needed by cache warmer)
-		ringClientForWarmup := rings.NewRingClient(
-			logger,
-			cache.NewCachedApplicationQueryClient(applicationCache),
-			cache.NewCachedAccountQueryClient(accountCache),
-			cache.NewCachedSharedQueryClient(sharedParamsCache, queryClients.Shared()),
-		)
 
 		// Create cache warmer
 		cacheWarmer := cache.NewCacheWarmer(
 			logger,
 			cache.CacheWarmerConfig{
-				KnownApplications:     config.CacheWarmup.KnownApplications,
-				PersistDiscoveredApps: config.CacheWarmup.PersistDiscoveredApps,
-				WarmupConcurrency:     config.CacheWarmup.WarmupConcurrency,
-				WarmupTimeout:         time.Duration(config.CacheWarmup.WarmupTimeoutSeconds) * time.Second,
+				KnownApplications: config.CacheWarmup.KnownApplications,
+				WarmupConcurrency: config.CacheWarmup.WarmupConcurrency,
+				WarmupTimeout:     time.Duration(config.CacheWarmup.WarmupTimeoutSeconds) * time.Second,
 			},
-			redisClient,
 			queryClients.Application(),
 			queryClients.Account(),
 			queryClients.Shared(),
-			ringClientForWarmup,
 		)
 		// Ensure worker pool cleanup
 		defer cacheWarmer.Stop()
@@ -656,19 +622,18 @@ func runHARelayer(cmd *cobra.Command, _ []string) error {
 			difficultyProvider := relayer.NewQueryDifficultyProvider(logger, difficultyProviderAdapter)
 			relayProcessor.SetDifficultyProvider(difficultyProvider)
 
-			// Wire up the service compute units provider using on-chain service data
-			computeUnitsProvider := relayer.NewCachedServiceComputeUnitsProvider(logger, queryClients.Service())
-			// Preload compute units for configured services
-			serviceIDs := make([]string, 0, len(config.Services))
-			for serviceID := range config.Services {
-				serviceIDs = append(serviceIDs, serviceID)
-			}
-			computeUnitsProvider.PreloadServiceComputeUnits(ctx, serviceIDs)
-			relayProcessor.SetServiceComputeUnitsProvider(computeUnitsProvider)
+			// Wire the service compute units provider to the SAME orchestrator-refreshed
+			// serviceCache the RelayMeter uses (L1->L2->L3 + pub/sub invalidation). The
+			// mined ComputeUnitsPerRelay becomes the SMST leaf weight, so it MUST track
+			// on-chain CUPR changes; the previous sync.Map provider froze it at startup.
+			relayProcessor.SetServiceComputeUnitsProvider(
+				relayer.NewServiceCacheComputeUnitsProvider(logger, serviceCache),
+			)
 
 			// NOTE: App discovery callbacks are no longer needed on the relayer.
-			// Discovery now happens on the miner side via CacheOrchestrator.RecordDiscoveredApp()
-			// when processing relays from Redis streams. Relayers only consume from shared caches.
+			// Discovery happens on the miner side: the supplier worker SAdds apps/
+			// services seen in Redis-stream relays to the shared known-sets, which the
+			// leader's CacheOrchestrator refreshes. Relayers only consume shared caches.
 
 			proxy.SetRelayProcessor(relayProcessor)
 			logger.Info().Msg("relay processor initialized")
@@ -701,11 +666,15 @@ func runHARelayer(cmd *cobra.Command, _ []string) error {
 				// Use the cached application client so app stake changes
 				// land within RefreshIntervalBlocks via the orchestrator's
 				// invalidation pub/sub, and the hot path avoids chain
-				// round-trips on every relay.
+				// round-trips on every relay. GetApplication resolves through
+				// the entity cache; GetParams is routed to the query-layer app
+				// client (90s TTL) so the meter's app_min_stake_upokt reflects
+				// the on-chain application MinStake instead of a frozen 0 — the
+				// plain cached client stubs GetParams to (nil, nil).
 				relayMeter := relayer.NewRelayMeter(
 					logger,
 					redisClient,
-					cache.NewCachedApplicationQueryClient(applicationCache),
+					cache.NewCachedApplicationQueryClientWithParams(applicationCache, queryClients.Application()),
 					queryClients.Shared(),
 					queryClients.Session(),
 					blockSubscriber,

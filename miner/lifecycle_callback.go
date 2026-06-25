@@ -198,6 +198,10 @@ type LifecycleCallback struct {
 	// If nil, ceiling warnings are skipped.
 	appClient ApplicationQueryClient
 
+	// serviceClient queries the current service CUPR for the claim-build
+	// CUPR-mismatch guard. If nil, the guard is skipped.
+	serviceClient pocktclient.ServiceQueryClient
+
 	// streamDeleter deletes session streams after settlement.
 	// If nil, streams are not deleted (will rely on TTL expiration).
 	streamDeleter StreamDeleter
@@ -282,6 +286,12 @@ func (lc *LifecycleCallback) SetServiceFactorProvider(provider ServiceFactorProv
 // This is optional - if not set, ceiling warnings are skipped.
 func (lc *LifecycleCallback) SetAppClient(client ApplicationQueryClient) {
 	lc.appClient = client
+}
+
+// SetServiceClient sets the service query client used by the claim-build
+// CUPR-mismatch guard. Optional — if not set, the guard is skipped.
+func (lc *LifecycleCallback) SetServiceClient(client pocktclient.ServiceQueryClient) {
+	lc.serviceClient = client
 }
 
 // SetStreamDeleter sets the stream deleter for cleanup after session settlement.
@@ -603,7 +613,10 @@ func (lc *LifecycleCallback) OnSessionsNeedClaim(ctx context.Context, snapshots 
 
 	// Process each group (same claim window) separately
 	allRootHashes := make([][]byte, len(snapshots))
-	sessionIndex := 0
+	snapshotIndexBySessionID := make(map[string]int, len(snapshots))
+	for i, snapshot := range snapshots {
+		snapshotIndexBySessionID[snapshot.SessionID] = i
+	}
 
 	for _, groupSnapshots := range sessionsByEndHeight {
 		// Get the actual session end height from the first snapshot in the group
@@ -840,6 +853,42 @@ func (lc *LifecycleCallback) OnSessionsNeedClaim(ctx context.Context, snapshots 
 					return
 				}
 
+				// Phase 3.5: CUPR consistency guard. poktroll validates
+				// num_claimed_compute_units == num_relays * service.ComputeUnitsPerRelay
+				// using the LATEST CUPR (claim-create and settlement). If the service's
+				// CUPR changed while/after this session was mined, the SMST sum no longer
+				// matches and the claim is rejected (and retried every block). Skip it
+				// terminally. Fail OPEN on query error — never drop a claim we cannot
+				// prove is doomed.
+				if lc.serviceClient != nil {
+					// Force a fresh read: claim-build is low-frequency and the chain
+					// validates against the LATEST CUPR, so the guard must never trust a
+					// cached value. InvalidateService drops the query layer's entry so the
+					// GetService below hits the chain.
+					if inv, ok := lc.serviceClient.(interface{ InvalidateService(string) }); ok {
+						inv.InvalidateService(snap.ServiceID)
+					}
+					if svc, svcErr := lc.serviceClient.GetService(ctx, snap.ServiceID); svcErr != nil {
+						logger.Debug().Err(svcErr).
+							Str(logging.FieldSessionID, snap.SessionID).
+							Msg("CUPR guard: failed to query current service CUPR, allowing claim")
+					} else if cupr := svc.GetComputeUnitsPerRelay(); !isClaimCUPRConsistent(smstSum, smstCount, cupr) {
+						logger.Warn().
+							Str(logging.FieldSessionID, snap.SessionID).
+							Str(logging.FieldServiceID, snap.ServiceID).
+							Str(logging.FieldSupplier, snap.SupplierOperatorAddress).
+							Uint64("smst_compute_units", smstSum).
+							Uint64("smst_relay_count", smstCount).
+							Uint64("current_compute_units_per_relay", cupr).
+							Uint64("expected_compute_units", smstCount*cupr).
+							Msg("SKIP CUPR MISMATCH: SMST sum != relays * current CUPR (service CUPR changed); claim would be rejected on-chain")
+						result.skipped = true
+						result.skipReason = "cupr_mismatch"
+						results <- result
+						return
+					}
+				}
+
 				// Phase 4: Economic viability using the SMST root hash.
 				// Build a temporary Claim (like poktroll does) to call GetClaimeduPOKT.
 				if claimAndProofCostUpokt > 0 {
@@ -929,8 +978,8 @@ func (lc *LifecycleCallback) OnSessionsNeedClaim(ctx context.Context, snapshots 
 		for _, r := range partitioned.skipped {
 			snap := r.snapshot
 			switch r.skipReason {
-			case "unprofitable":
-				RecordClaimSkipped(snap.SupplierOperatorAddress, snap.ServiceID, "unprofitable")
+			case "unprofitable", "cupr_mismatch":
+				RecordClaimSkipped(snap.SupplierOperatorAddress, snap.ServiceID, r.skipReason)
 				if skipErr := lc.OnClaimSkipped(ctx, snap); skipErr != nil {
 					logger.Warn().Err(skipErr).
 						Str(logging.FieldSessionID, snap.SessionID).
@@ -977,6 +1026,14 @@ func (lc *LifecycleCallback) OnSessionsNeedClaim(ctx context.Context, snapshots 
 			claimMsgs = append(claimMsgs, r.claimMsg)
 			groupRootHashes = append(groupRootHashes, r.rootHash)
 			validSnapshots = append(validSnapshots, r.snapshot)
+		}
+		if len(claimMsgs) == 0 {
+			logger.Info().
+				Int64("session_end_height", sessionEndHeight).
+				Int("skipped", len(partitioned.skipped)).
+				Int("failed", len(partitioned.failed)).
+				Msg("no valid claims to submit for group")
+			continue
 		}
 
 		// Convert to interface types for variadic call
@@ -1125,9 +1182,12 @@ func (lc *LifecycleCallback) OnSessionsNeedClaim(ctx context.Context, snapshots 
 					RecordClaimSubmissionLatency(snapshot.SupplierOperatorAddress, blocksAfterWindowOpen)
 					RecordRevenueClaimed(snapshot.SupplierOperatorAddress, snapshot.ServiceID, snapshot.TotalComputeUnits, snapshot.RelayCount)
 
-					// Copy root hash to result (maintain order)
-					allRootHashes[sessionIndex] = groupRootHashes[i]
-					sessionIndex++
+					// Copy root hash to the original input position. Groups may contain skipped
+					// sessions, so a compact sequential write would assign a valid root to the
+					// wrong session and incorrectly transition skipped sessions to claimed.
+					if originalIndex, ok := snapshotIndexBySessionID[snapshot.SessionID]; ok {
+						allRootHashes[originalIndex] = groupRootHashes[i]
+					}
 				}
 
 				// Track claim submissions to Redis for debugging
@@ -1253,10 +1313,11 @@ func (lc *LifecycleCallback) OnSessionsNeedClaim(ctx context.Context, snapshots 
 
 // OnSessionsNeedProof is called when sessions need proofs submitted (batched).
 // It waits for the proper timing spread, generates proofs, and submits all proofs in a single transaction.
-func (lc *LifecycleCallback) OnSessionsNeedProof(ctx context.Context, snapshots []*SessionSnapshot) error {
+func (lc *LifecycleCallback) OnSessionsNeedProof(ctx context.Context, snapshots []*SessionSnapshot) ([]*SessionSnapshot, error) {
 	if len(snapshots) == 0 {
-		return nil
+		return nil, nil
 	}
+	submittedProofSnapshots := make([]*SessionSnapshot, 0, len(snapshots))
 
 	// All sessions for a single supplier, so we can batch them
 	firstSnapshot := snapshots[0]
@@ -1321,7 +1382,7 @@ func (lc *LifecycleCallback) OnSessionsNeedProof(ctx context.Context, snapshots 
 		// computed with new-epoch params would resolve the wrong proof window.
 		sharedParams, err := lc.sharedClient.GetParamsAtHeight(ctx, sessionEndHeight)
 		if err != nil {
-			return fmt.Errorf("failed to get shared params at height %d: %w", sessionEndHeight, err)
+			return submittedProofSnapshots, fmt.Errorf("failed to get shared params at height %d: %w", sessionEndHeight, err)
 		}
 
 		// Wait for proof window to open
@@ -1350,7 +1411,7 @@ func (lc *LifecycleCallback) OnSessionsNeedProof(ctx context.Context, snapshots 
 		// Wait for proof window to open (we'll use the seed block, not this one)
 		_, blockErr := lc.waitForBlock(ctx, proofWindowOpenHeight)
 		if blockErr != nil {
-			return fmt.Errorf("failed to wait for proof window open: %w", blockErr)
+			return submittedProofSnapshots, fmt.Errorf("failed to wait for proof window open: %w", blockErr)
 		}
 
 		// Calculate proof requirement seed block height
@@ -1368,7 +1429,7 @@ func (lc *LifecycleCallback) OnSessionsNeedProof(ctx context.Context, snapshots 
 				Int64("seed_height", proofRequirementSeedHeight).
 				Int64("proof_window_open_height", proofWindowOpenHeight).
 				Msg("failed to wait for proof requirement seed block")
-			return fmt.Errorf("failed to wait for proof requirement seed block: %w", seedErr)
+			return submittedProofSnapshots, fmt.Errorf("failed to wait for proof requirement seed block: %w", seedErr)
 		}
 
 		logger.Debug().
@@ -1525,7 +1586,7 @@ func (lc *LifecycleCallback) OnSessionsNeedProof(ctx context.Context, snapshots 
 			var seedErr error
 			proofPathSeedBlock, seedErr = lc.waitForBlock(ctx, proofPathSeedBlockHeight)
 			if seedErr != nil {
-				return fmt.Errorf("failed to wait for proof path seed block: %w", seedErr)
+				return submittedProofSnapshots, fmt.Errorf("failed to wait for proof path seed block: %w", seedErr)
 			}
 
 			logger.Debug().
@@ -1562,7 +1623,7 @@ func (lc *LifecycleCallback) OnSessionsNeedProof(ctx context.Context, snapshots 
 				}
 			}
 
-			return fmt.Errorf("proof window already closed at height %d (current: %d)", proofWindowClose, currentBlock.Height())
+			return submittedProofSnapshots, fmt.Errorf("proof window already closed at height %d (current: %d)", proofWindowClose, currentBlock.Height())
 		}
 
 		// CRITICAL: Re-check proof requirement RIGHT before building proofs
@@ -1785,11 +1846,11 @@ func (lc *LifecycleCallback) OnSessionsNeedProof(ctx context.Context, snapshots 
 		// individually) so the caller can meter / retry on the next cycle.
 		if len(partitionedProofs.built) == 0 {
 			if len(partitionedProofs.failed) > 0 {
-				return fmt.Errorf("all proofs in batch failed to build (batch_size=%d): %w",
+				return submittedProofSnapshots, fmt.Errorf("all proofs in batch failed to build (batch_size=%d): %w",
 					numProofTasks, partitionedProofs.failed[0].err)
 			}
 			// numProofTasks was zero — nothing to do.
-			return nil
+			return submittedProofSnapshots, nil
 		}
 
 		// Preserve input ordering so later metric/state iterations and the
@@ -1842,7 +1903,7 @@ func (lc *LifecycleCallback) OnSessionsNeedProof(ctx context.Context, snapshots 
 				}
 			}
 
-			return fmt.Errorf("proof window closed while building proofs at height %d (current: %d)", proofWindowClose, currentBlock.Height())
+			return submittedProofSnapshots, fmt.Errorf("proof window closed while building proofs at height %d (current: %d)", proofWindowClose, currentBlock.Height())
 		}
 
 		proofBlocksRemaining := proofWindowClose - currentBlock.Height()
@@ -1909,7 +1970,7 @@ func (lc *LifecycleCallback) OnSessionsNeedProof(ctx context.Context, snapshots 
 				if attempt < lc.config.ProofRetryAttempts {
 					select {
 					case <-ctx.Done():
-						return ctx.Err()
+						return submittedProofSnapshots, ctx.Err()
 					case <-time.After(lc.config.ProofRetryDelay):
 						continue
 					}
@@ -2000,6 +2061,8 @@ func (lc *LifecycleCallback) OnSessionsNeedProof(ctx context.Context, snapshots 
 					Int64("blocks_after_window", int64(blocksAfterWindowOpen)).
 					Msg("batched proofs submitted successfully")
 
+				submittedProofSnapshots = append(submittedProofSnapshots, validProofSnapshots...)
+
 				break // Success, exit retry loop
 			}
 		}
@@ -2065,11 +2128,11 @@ func (lc *LifecycleCallback) OnSessionsNeedProof(ctx context.Context, snapshots 
 				)
 			}
 
-			return fmt.Errorf("batched proof submission failed after %d attempts: %w", lc.config.ProofRetryAttempts, lastErr)
+			return submittedProofSnapshots, fmt.Errorf("batched proof submission failed after %d attempts: %w", lc.config.ProofRetryAttempts, lastErr)
 		}
 	}
 
-	return nil
+	return submittedProofSnapshots, nil
 }
 
 // OnSessionProved is called when a session proof is successfully submitted.
