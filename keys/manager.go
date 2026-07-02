@@ -61,6 +61,12 @@ func (m *MultiProviderKeyManager) Start(ctx context.Context) error {
 
 	// Initial key load
 	if err := m.Reload(ctx); err != nil {
+		m.mu.Lock()
+		if m.cancelFn != nil {
+			m.cancelFn()
+			m.cancelFn = nil
+		}
+		m.mu.Unlock()
 		return fmt.Errorf("failed to load initial keys: %w", err)
 	}
 
@@ -194,8 +200,9 @@ func (m *MultiProviderKeyManager) Reload(ctx context.Context) error {
 			m.logger.Warn().
 				Err(err).
 				Str("provider", provider.Name()).
-				Msg("failed to load keys from provider")
-			continue
+				Msg("failed to load keys from provider; keeping previous key set")
+			keyLoadErrors.WithLabelValues(provider.Name()).Inc()
+			return fmt.Errorf("failed to load keys from provider %s: %w", provider.Name(), err)
 		}
 
 		for addr, key := range keys {
@@ -217,6 +224,16 @@ func (m *MultiProviderKeyManager) Reload(ctx context.Context) error {
 	// Determine added and removed keys
 	m.keysMu.Lock()
 	oldKeys := m.keys
+	if len(oldKeys) > 0 && len(newKeys) == 0 {
+		activeKeys := len(oldKeys)
+		m.keysMu.Unlock()
+
+		m.logger.Warn().
+			Int("active_keys", activeKeys).
+			Msg("key reload produced empty snapshot; keeping previous key set")
+		keyLoadErrors.WithLabelValues("manager_empty_snapshot").Inc()
+		return fmt.Errorf("key reload produced empty snapshot while %d keys are active", activeKeys)
+	}
 
 	added := make([]string, 0)
 	removed := make([]string, 0)
