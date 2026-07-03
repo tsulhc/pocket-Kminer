@@ -704,6 +704,7 @@ func (lc *LifecycleCallback) OnSessionsNeedClaim(ctx context.Context, snapshots 
 							Msg("failed to mark session as claim_window_closed in Redis")
 					}
 				}
+				lc.cleanupSessionResources(ctx, snapshot, "claim_window_closed")
 			}
 
 			return nil, fmt.Errorf("insufficient time to build claims: %d blocks remaining, %d required (window closes at %d, current: %d)",
@@ -1120,6 +1121,7 @@ func (lc *LifecycleCallback) OnSessionsNeedClaim(ctx context.Context, snapshots 
 									Msg("failed to mark session as claim_window_closed in Redis")
 							}
 						}
+						lc.cleanupSessionResources(ctx, snapshot, "claim_window_closed")
 					}
 
 					break // Don't retry - this is a permanent failure
@@ -1905,6 +1907,7 @@ func (lc *LifecycleCallback) OnSessionsNeedProof(ctx context.Context, snapshots 
 							Msg("failed to mark session as proof_window_closed in Redis")
 					}
 				}
+				lc.cleanupSessionResources(ctx, snapshot, "proof_window_closed")
 			}
 
 			return submittedProofSnapshots, fmt.Errorf("proof window closed while building proofs at height %d (current: %d)", proofWindowClose, currentBlock.Height())
@@ -1959,6 +1962,7 @@ func (lc *LifecycleCallback) OnSessionsNeedProof(ctx context.Context, snapshots 
 									Msg("failed to mark session as proof_window_closed in Redis")
 							}
 						}
+						lc.cleanupSessionResources(ctx, snapshot, "proof_window_closed")
 					}
 
 					break // Don't retry - this is a permanent failure
