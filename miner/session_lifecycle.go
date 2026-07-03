@@ -406,7 +406,11 @@ func (m *SessionLifecycleManager) lifecycleCheckerEventDriven(ctx context.Contex
 	var lastEventTimeNano atomic.Int64
 	lastEventTimeNano.Store(time.Now().UnixNano())
 
+	var transitionMu sync.Mutex
 	onHeightFn := func(height int64) {
+		transitionMu.Lock()
+		defer transitionMu.Unlock()
+
 		if prev := lastHeight.Load(); prev > 0 {
 			sessionBlockProcessingLag.WithLabelValues(m.config.SupplierAddress).Set(float64(height - prev))
 		}

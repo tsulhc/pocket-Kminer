@@ -2,6 +2,7 @@ package miner
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"runtime/debug"
 	"sync"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/alitto/pond/v2"
+	"github.com/redis/go-redis/v9"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -1746,21 +1748,29 @@ func (m *SupplierManager) checkLeaderOwnerConsistency(ctx context.Context) {
 
 	leaderKey := m.config.RedisClient.KB().GlobalLeaderKey()
 	leaderID, err := m.config.RedisClient.Get(ctx, leaderKey).Result()
-	if err != nil && err.Error() != "redis: nil" {
+	if err != nil && !errors.Is(err, redis.Nil) {
 		leaderOwnerMismatch.WithLabelValues("redis_error").Set(1)
 		return
 	}
 
-	if leaderID != "" && leaderID != m.config.MinerID {
+	if leaderID == "" {
+		leaderOwnerMismatch.WithLabelValues("no_leader").Set(1)
+		m.logger.Error().
+			Str("our_id", m.config.MinerID).
+			Int("suppliers_owned", owned).
+			Msg("NO GLOBAL LEADER but we own supplier leases — block publisher stopped, claim/proof stalled")
+	} else if leaderID != m.config.MinerID {
 		m.logger.Error().
 			Str("global_leader", leaderID).
 			Str("our_id", m.config.MinerID).
 			Int("suppliers_owned", owned).
 			Msg("LEADER/OWNER MISMATCH: we own supplier leases but are NOT the global leader — claim/proof stalled, memory accumulates")
 		leaderOwnerMismatch.WithLabelValues("mismatch").Set(1)
-	} else if leaderID == m.config.MinerID {
+	} else {
 		leaderOwnerMismatch.WithLabelValues("ok").Set(0)
-		currentBlockHeight.Set(float64(m.config.BlockClient.LastBlock(ctx).Height()))
+		if m.config.BlockClient != nil {
+			currentBlockHeight.Set(float64(m.config.BlockClient.LastBlock(ctx).Height()))
+		}
 	}
 }
 

@@ -84,9 +84,10 @@ type GlobalLeaderElector struct {
 	callbackMu         sync.RWMutex
 
 	// Lifecycle
-	ctx      context.Context
-	cancelFn context.CancelFunc
-	wg       sync.WaitGroup
+	ctx       context.Context
+	cancelFn  context.CancelFunc
+	wg        sync.WaitGroup
+	closeOnce sync.Once
 }
 
 // NewGlobalLeaderElectorWithConfig creates a new global leader elector with custom configuration.
@@ -342,11 +343,13 @@ func (e *GlobalLeaderElector) IsLeader() bool {
 // Close stops the leader election loop and releases leadership if held.
 // Leadership release is handled in leaderLoop's ctx.Done handler (which runs
 // before wg.Done), so Close() only needs to cancel and wait.
+// Idempotent via sync.Once — safe to call multiple times (explicit + deferred).
 func (e *GlobalLeaderElector) Close() {
-	if e.cancelFn != nil {
-		e.cancelFn()
-	}
-	e.wg.Wait()
-
-	e.logger.Info().Msg("global leader elector stopped")
+	e.closeOnce.Do(func() {
+		if e.cancelFn != nil {
+			e.cancelFn()
+		}
+		e.wg.Wait()
+		e.logger.Info().Msg("global leader elector stopped")
+	})
 }
