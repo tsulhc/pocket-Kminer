@@ -3,12 +3,60 @@
 package miner
 
 import (
+	"context"
 	"testing"
 
 	"github.com/pokt-network/pocket-relay-miner/logging"
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 	"github.com/stretchr/testify/require"
 )
+
+type terminalCleanupCallback struct {
+	proved              int
+	probabilisticProved int
+	claimWindowClosed   int
+	claimTxError        int
+	proofWindowClosed   int
+	proofTxError        int
+	resourceCleanups    int
+}
+
+func (c *terminalCleanupCallback) OnSessionActive(context.Context, *SessionSnapshot) error {
+	return nil
+}
+func (c *terminalCleanupCallback) OnSessionsNeedClaim(context.Context, []*SessionSnapshot) ([][]byte, error) {
+	return nil, nil
+}
+func (c *terminalCleanupCallback) OnSessionsNeedProof(context.Context, []*SessionSnapshot) ([]*SessionSnapshot, error) {
+	return nil, nil
+}
+func (c *terminalCleanupCallback) OnSessionProved(context.Context, *SessionSnapshot) error {
+	c.proved++
+	return nil
+}
+func (c *terminalCleanupCallback) OnProbabilisticProved(context.Context, *SessionSnapshot) error {
+	c.probabilisticProved++
+	return nil
+}
+func (c *terminalCleanupCallback) OnClaimWindowClosed(context.Context, *SessionSnapshot) error {
+	c.claimWindowClosed++
+	return nil
+}
+func (c *terminalCleanupCallback) OnClaimTxError(context.Context, *SessionSnapshot) error {
+	c.claimTxError++
+	return nil
+}
+func (c *terminalCleanupCallback) OnProofWindowClosed(context.Context, *SessionSnapshot) error {
+	c.proofWindowClosed++
+	return nil
+}
+func (c *terminalCleanupCallback) OnProofTxError(context.Context, *SessionSnapshot) error {
+	c.proofTxError++
+	return nil
+}
+func (c *terminalCleanupCallback) CleanupTerminalResources(context.Context, *SessionSnapshot, string) {
+	c.resourceCleanups++
+}
 
 // newTransitionTestManager builds a minimal manager sufficient for exercising the
 // pure transition-decision helpers (they only use the logger plus their params arg).
@@ -88,4 +136,34 @@ func TestDetermineTransition_DecisionDependsOnEpochParams(t *testing.T) {
 	// Under NEW-epoch params, at the same height, the window is not open yet -> no transition.
 	gotNew, _ := m.determineTransition(s, currentHeight, newParams)
 	require.Equal(t, SessionState(""), gotNew, "new-epoch params: window not open -> no transition")
+}
+
+func TestCleanupTerminalSession_InvokesTerminalCleanupCallback(t *testing.T) {
+	callback := &terminalCleanupCallback{}
+	m := &SessionLifecycleManager{
+		logger:   logging.NewLoggerFromConfig(logging.DefaultConfig()),
+		callback: callback,
+	}
+
+	for _, state := range []SessionState{
+		SessionStateProved,
+		SessionStateProbabilisticProved,
+		SessionStateClaimWindowClosed,
+		SessionStateClaimTxError,
+		SessionStateProofWindowClosed,
+		SessionStateProofTxError,
+	} {
+		m.cleanupTerminalSession(context.Background(), &SessionSnapshot{
+			SessionID: "session-" + string(state),
+			State:     state,
+		})
+	}
+
+	require.Equal(t, 6, callback.resourceCleanups)
+	require.Equal(t, 0, callback.proved)
+	require.Equal(t, 0, callback.probabilisticProved)
+	require.Equal(t, 0, callback.claimWindowClosed)
+	require.Equal(t, 0, callback.claimTxError)
+	require.Equal(t, 0, callback.proofWindowClosed)
+	require.Equal(t, 0, callback.proofTxError)
 }

@@ -1530,6 +1530,7 @@ func (lc *LifecycleCallback) OnSessionsNeedProof(ctx context.Context, snapshots 
 								Msg("failed to mark session as probabilistic_proved")
 						}
 					}
+					lc.cleanupSessionResources(ctx, snapshot, "probabilistic_proved")
 				} else {
 					logger.Info().
 						Str(logging.FieldSessionID, snapshot.SessionID).
@@ -1621,6 +1622,7 @@ func (lc *LifecycleCallback) OnSessionsNeedProof(ctx context.Context, snapshots 
 							Msg("failed to mark session as proof_window_closed in Redis")
 					}
 				}
+				lc.cleanupSessionResources(ctx, snapshot, "proof_window_closed")
 			}
 
 			return submittedProofSnapshots, fmt.Errorf("proof window already closed at height %d (current: %d)", proofWindowClose, currentBlock.Height())
@@ -1653,6 +1655,7 @@ func (lc *LifecycleCallback) OnSessionsNeedProof(ctx context.Context, snapshots 
 									Msg("failed to mark session as proof_tx_error after unavailable claimed root")
 							}
 						}
+						lc.cleanupSessionResources(ctx, snapshot, "proof_tx_error")
 						continue
 					}
 					// Other errors - err on side of caution and submit anyway
@@ -1677,6 +1680,7 @@ func (lc *LifecycleCallback) OnSessionsNeedProof(ctx context.Context, snapshots 
 								Msg("failed to mark session as probabilistic_proved")
 						}
 					}
+					lc.cleanupSessionResources(ctx, snapshot, "probabilistic_proved")
 				} else {
 					// Still required - proceed with proof
 					stillNeedingProof = append(stillNeedingProof, snapshot)
@@ -2133,6 +2137,34 @@ func (lc *LifecycleCallback) OnSessionsNeedProof(ctx context.Context, snapshots 
 	}
 
 	return submittedProofSnapshots, nil
+}
+
+func (lc *LifecycleCallback) cleanupSessionResources(ctx context.Context, snapshot *SessionSnapshot, reason string) {
+	logger := lc.logger.With().Str(logging.FieldSessionID, snapshot.SessionID).Str("cleanup_reason", reason).Logger()
+
+	ClearSessionMetrics(snapshot.SupplierOperatorAddress, snapshot.SessionID, snapshot.ServiceID)
+
+	if err := lc.smstManager.DeleteTree(ctx, snapshot.SessionID); err != nil {
+		logger.Warn().Err(err).Msg("failed to delete SMST tree during terminal cleanup")
+	}
+
+	if lc.streamDeleter != nil {
+		if err := lc.streamDeleter.DeleteStream(ctx, snapshot.SessionID); err != nil {
+			logger.Warn().Err(err).Msg("failed to delete session stream during terminal cleanup")
+		}
+	}
+
+	if lc.deduplicator != nil {
+		if err := lc.deduplicator.CleanupSession(ctx, snapshot.SessionID); err != nil {
+			logger.Warn().Err(err).Msg("failed to cleanup deduplication during terminal cleanup")
+		}
+	}
+
+	lc.removeSessionLock(snapshot.SessionID)
+}
+
+func (lc *LifecycleCallback) CleanupTerminalResources(ctx context.Context, snapshot *SessionSnapshot, reason string) {
+	lc.cleanupSessionResources(ctx, snapshot, reason)
 }
 
 // OnSessionProved is called when a session proof is successfully submitted.

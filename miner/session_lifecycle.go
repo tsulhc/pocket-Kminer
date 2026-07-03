@@ -735,6 +735,7 @@ func (m *SessionLifecycleManager) checkSessionTransitions(ctx context.Context, c
 		// Terminal states (proved, probabilistic_proved, claim_tx_error, proof_tx_error, etc.)
 		// represent final outcomes and must not be overwritten by window timeout logic
 		if session.State.IsTerminal() {
+			m.cleanupTerminalSession(ctx, session)
 			m.activeSessions.Delete(session.SessionID)
 			terminalCleaned++
 
@@ -1212,6 +1213,43 @@ func (m *SessionLifecycleManager) executeBatchedProofTransition(ctx context.Cont
 			Str(logging.FieldServiceID, session.ServiceID).
 			Int64("relay_count", session.RelayCount).
 			Msg("session lifecycle complete (batched)")
+	}
+}
+
+func (m *SessionLifecycleManager) cleanupTerminalSession(ctx context.Context, session *SessionSnapshot) {
+	sessionLogger := logging.WithSession(m.logger, session.SessionID)
+	if cleaner, ok := m.callback.(interface {
+		CleanupTerminalResources(context.Context, *SessionSnapshot, string)
+	}); ok {
+		cleaner.CleanupTerminalResources(ctx, session, string(session.State))
+		return
+	}
+
+	switch session.State {
+	case SessionStateProved:
+		if err := m.callback.OnSessionProved(ctx, session); err != nil {
+			sessionLogger.Warn().Err(err).Msg("stale proved session cleanup failed")
+		}
+	case SessionStateProbabilisticProved:
+		if err := m.callback.OnProbabilisticProved(ctx, session); err != nil {
+			sessionLogger.Warn().Err(err).Msg("stale probabilistic_proved session cleanup failed")
+		}
+	case SessionStateClaimWindowClosed:
+		if err := m.callback.OnClaimWindowClosed(ctx, session); err != nil {
+			sessionLogger.Warn().Err(err).Msg("stale claim_window_closed session cleanup failed")
+		}
+	case SessionStateClaimTxError:
+		if err := m.callback.OnClaimTxError(ctx, session); err != nil {
+			sessionLogger.Warn().Err(err).Msg("stale claim_tx_error session cleanup failed")
+		}
+	case SessionStateProofWindowClosed:
+		if err := m.callback.OnProofWindowClosed(ctx, session); err != nil {
+			sessionLogger.Warn().Err(err).Msg("stale proof_window_closed session cleanup failed")
+		}
+	case SessionStateProofTxError:
+		if err := m.callback.OnProofTxError(ctx, session); err != nil {
+			sessionLogger.Warn().Err(err).Msg("stale proof_tx_error session cleanup failed")
+		}
 	}
 }
 
