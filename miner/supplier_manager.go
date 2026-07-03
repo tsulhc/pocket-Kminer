@@ -227,6 +227,15 @@ type SupplierManagerConfig struct {
 	// BlockTimeSeconds is forwarded to LifecycleCallbackConfig so the TX
 	// deadline can be computed from remaining window blocks. Default: 30.
 	BlockTimeSeconds int64
+
+	// LeaderOwnerMismatchMaxConsecutive controls how many consecutive watchdog
+	// failures are tolerated before invoking LeaderOwnerMismatchHandler. Default: 2.
+	LeaderOwnerMismatchMaxConsecutive int
+
+	// LeaderOwnerMismatchHandler is called when this miner owns supplier leases
+	// while another/no instance is global leader for too long. Production wires
+	// this to fail-fast so process supervision restarts into a coherent HA state.
+	LeaderOwnerMismatchHandler func(reason string)
 }
 
 // DefaultSupplierReconcileInterval is the default polling cadence for the
@@ -293,6 +302,8 @@ type SupplierManager struct {
 	cancelFn context.CancelFunc
 	closed   bool
 	mu       sync.RWMutex
+
+	leaderOwnerMismatchConsecutive atomic.Int32
 }
 
 // NewSupplierManager creates a new supplier manager.
@@ -1724,6 +1735,7 @@ func (m *SupplierManager) ListSuppliers() []string {
 }
 
 const defaultLeaderOwnerWatchdogInterval = 30 * time.Second
+const defaultLeaderOwnerMismatchMaxConsecutive = 2
 
 func (m *SupplierManager) runLeaderOwnerWatchdog(ctx context.Context) {
 	ticker := time.NewTicker(defaultLeaderOwnerWatchdogInterval)
@@ -1742,35 +1754,70 @@ func (m *SupplierManager) runLeaderOwnerWatchdog(ctx context.Context) {
 func (m *SupplierManager) checkLeaderOwnerConsistency(ctx context.Context) {
 	owned := len(m.ListSuppliers())
 	if owned == 0 {
-		leaderOwnerMismatch.WithLabelValues("no_suppliers").Set(0)
+		setLeaderOwnerMismatchState("")
+		m.leaderOwnerMismatchConsecutive.Store(0)
 		return
 	}
 
 	leaderKey := m.config.RedisClient.KB().GlobalLeaderKey()
 	leaderID, err := m.config.RedisClient.Get(ctx, leaderKey).Result()
 	if err != nil && !errors.Is(err, redis.Nil) {
-		leaderOwnerMismatch.WithLabelValues("redis_error").Set(1)
+		setLeaderOwnerMismatchState("redis_error")
 		return
 	}
 
 	if leaderID == "" {
-		leaderOwnerMismatch.WithLabelValues("no_leader").Set(1)
+		setLeaderOwnerMismatchState("no_leader")
 		m.logger.Error().
 			Str("our_id", m.config.MinerID).
 			Int("suppliers_owned", owned).
 			Msg("NO GLOBAL LEADER but we own supplier leases — block publisher stopped, claim/proof stalled")
+		m.handleLeaderOwnerMismatch("no_leader")
 	} else if leaderID != m.config.MinerID {
 		m.logger.Error().
 			Str("global_leader", leaderID).
 			Str("our_id", m.config.MinerID).
 			Int("suppliers_owned", owned).
 			Msg("LEADER/OWNER MISMATCH: we own supplier leases but are NOT the global leader — claim/proof stalled, memory accumulates")
-		leaderOwnerMismatch.WithLabelValues("mismatch").Set(1)
+		setLeaderOwnerMismatchState("mismatch")
+		m.handleLeaderOwnerMismatch("mismatch")
 	} else {
-		leaderOwnerMismatch.WithLabelValues("ok").Set(0)
+		setLeaderOwnerMismatchState("")
+		m.leaderOwnerMismatchConsecutive.Store(0)
 		if m.config.BlockClient != nil {
 			currentBlockHeight.Set(float64(m.config.BlockClient.LastBlock(ctx).Height()))
 		}
+	}
+}
+
+func setLeaderOwnerMismatchState(active string) {
+	for _, state := range []string{"redis_error", "no_leader", "mismatch"} {
+		value := 0.0
+		if state == active {
+			value = 1
+		}
+		leaderOwnerMismatch.WithLabelValues(state).Set(value)
+	}
+}
+
+func (m *SupplierManager) handleLeaderOwnerMismatch(reason string) {
+	count := int(m.leaderOwnerMismatchConsecutive.Add(1))
+	threshold := m.config.LeaderOwnerMismatchMaxConsecutive
+	if threshold <= 0 {
+		threshold = defaultLeaderOwnerMismatchMaxConsecutive
+	}
+	if count < threshold {
+		return
+	}
+
+	m.logger.Error().
+		Str("reason", reason).
+		Int("consecutive_failures", count).
+		Int("threshold", threshold).
+		Msg("leader/owner mismatch persisted — triggering fail-fast handler")
+
+	if m.config.LeaderOwnerMismatchHandler != nil {
+		m.config.LeaderOwnerMismatchHandler(reason)
 	}
 }
 

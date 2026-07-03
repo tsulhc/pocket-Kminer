@@ -78,6 +78,10 @@ type MeterCleanupPublisher interface {
 	PublishMeterCleanup(ctx context.Context, sessionID, supplierAddress string) error
 }
 
+type currentHeightProvider interface {
+	CurrentHeight(ctx context.Context) (int64, error)
+}
+
 // RedisMeterCleanupPublisher implements MeterCleanupPublisher using Redis pub/sub.
 // The payload format is "sessionID|supplierAddress"; relayer subscribers
 // parse on the '|' separator and call ClearSessionMeter for that exact
@@ -423,7 +427,7 @@ func (m *SessionLifecycleManager) lifecycleCheckerEventDriven(ctx context.Contex
 	}
 
 	// Safety-net: if block events stop arriving (block publisher dead,
-	// leader lost, etc.), use a fallback ticker to poll LastBlock() so
+	// leader lost, etc.), use a fallback ticker to poll chain height via RPC so
 	// sessions still transition through claim/proof windows and reach
 	// terminal cleanup. Runs concurrently with the coalescing loop.
 	go m.runBlockEventFallback(ctx, &lastHeight, &lastEventTimeNano, onHeightFn)
@@ -435,7 +439,7 @@ func (m *SessionLifecycleManager) lifecycleCheckerEventDriven(ctx context.Contex
 	}
 }
 
-// runBlockEventFallback polls LastBlock() every defaultEventFallbackInterval.
+// runBlockEventFallback polls chain height every defaultEventFallbackInterval.
 // When no block event has been processed for >2 intervals, it triggers a
 // transition check at the current chain height so sessions do not stall.
 func (m *SessionLifecycleManager) runBlockEventFallback(
@@ -462,14 +466,33 @@ func (m *SessionLifecycleManager) runBlockEventFallback(
 				m.logger.Warn().
 					Float64("seconds_since_last_event", age).
 					Int64("last_height", lh).
-					Msg("block event stalled — running fallback transition check")
-				currentBlock := m.blockClient.LastBlock(ctx)
-				if ch := currentBlock.Height(); ch > lh {
+					Msg("block event stalled — running RPC fallback transition check")
+				ch, err := m.currentChainHeight(ctx)
+				if err != nil {
+					m.logger.Error().
+						Err(err).
+						Str(logging.FieldSupplier, m.config.SupplierAddress).
+						Msg("failed to query current chain height for block event fallback")
+					continue
+				}
+				if ch > lh {
 					onHeightFn(ch)
 				}
 			}
 		}
 	}
+}
+
+func (m *SessionLifecycleManager) currentChainHeight(ctx context.Context) (int64, error) {
+	if provider, ok := m.blockClient.(currentHeightProvider); ok {
+		return provider.CurrentHeight(ctx)
+	}
+
+	block := m.blockClient.LastBlock(ctx)
+	if block == nil {
+		return 0, fmt.Errorf("block client returned nil LastBlock and does not implement CurrentHeight")
+	}
+	return block.Height(), nil
 }
 
 const defaultEventFallbackInterval = 30 * time.Second

@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	stdhttp "net/http"
+	"os"
 	"runtime"
 	"sync"
 
@@ -343,14 +344,21 @@ func (w *SupplierWorker) Start(ctx context.Context) error {
 				CheckInterval:            0, // Event-driven via Redis pub/sub
 				MaxConcurrentTransitions: w.config.Config.GetSessionLifecycleMaxConcurrentTransitions(),
 			},
-			ClaimerConfig:                    w.config.Config.GetSupplierClaimingConfig(),
-			DisableClaimBatching:             w.config.Config.Transaction.DisableClaimBatching,
-			DisableProofBatching:             w.config.Config.Transaction.DisableProofBatching,
-			DisablePreProofClaimVerification: w.config.Config.Transaction.DisablePreProofClaimVerification,
-			SubmissionTrackingTTL:            w.config.Config.GetSubmissionTrackingTTL(),
-			QueryWorkers:                     w.config.Config.GetQueryWorkers(),
-			SupplierReconcileInterval:        w.config.Config.GetSupplierReconcileInterval(),
-			BlockTimeSeconds:                 w.config.Config.GetBlockTimeSeconds(),
+			ClaimerConfig:                     w.config.Config.GetSupplierClaimingConfig(),
+			DisableClaimBatching:              w.config.Config.Transaction.DisableClaimBatching,
+			DisableProofBatching:              w.config.Config.Transaction.DisableProofBatching,
+			DisablePreProofClaimVerification:  w.config.Config.Transaction.DisablePreProofClaimVerification,
+			SubmissionTrackingTTL:             w.config.Config.GetSubmissionTrackingTTL(),
+			QueryWorkers:                      w.config.Config.GetQueryWorkers(),
+			SupplierReconcileInterval:         w.config.Config.GetSupplierReconcileInterval(),
+			BlockTimeSeconds:                  w.config.Config.GetBlockTimeSeconds(),
+			LeaderOwnerMismatchMaxConsecutive: 2,
+			LeaderOwnerMismatchHandler: func(reason string) {
+				w.logger.Error().
+					Str("reason", reason).
+					Msg("leader/owner mismatch persisted; exiting so supervisor can restart into coherent HA state")
+				os.Exit(1)
+			},
 		},
 	)
 

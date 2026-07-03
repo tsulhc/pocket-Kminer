@@ -139,6 +139,21 @@ func (a *RedisBlockClientAdapter) LastBlock(ctx context.Context) client.Block {
 	return block
 }
 
+// CurrentHeight queries the backing CometBFT RPC directly for the latest block
+// height. Unlike LastBlock(), this does not depend on Redis block events and is
+// used as a safety net when the Redis block publisher stalls.
+func (a *RedisBlockClientAdapter) CurrentHeight(ctx context.Context) (int64, error) {
+	if a.cometClient == nil {
+		return 0, fmt.Errorf("CurrentHeight not supported: cometClient is nil")
+	}
+
+	result, err := a.cometClient.Status(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("failed to query current block height: %w", err)
+	}
+	return result.SyncInfo.LatestBlockHeight, nil
+}
+
 // GetBlockAtHeight queries the blockchain for a specific block by height.
 // This is CRITICAL for proof generation - the validator uses the exact block at a specific
 // height, so we must query that exact block to get the correct BlockID.Hash.
