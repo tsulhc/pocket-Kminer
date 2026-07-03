@@ -72,3 +72,16 @@ func TestCheckLeaderOwnerConsistency_OKDoesNotTriggerHandler(t *testing.T) {
 	require.False(t, called)
 	require.Equal(t, int32(0), m.leaderOwnerMismatchConsecutive.Load())
 }
+
+func TestCheckLeaderOwnerConsistency_ProductionMinerPrefixMatchesGlobalLeader(t *testing.T) {
+	called := false
+	m, redisClient := newWatchdogTestManager(t, func(string) { called = true })
+	m.config.MinerID = "miner-pocket-relayminer-pg-1-343031"
+	m.leaderOwnerMismatchConsecutive.Store(3)
+	require.NoError(t, redisClient.Set(context.Background(), redisClient.KB().GlobalLeaderKey(), "pocket-relayminer-pg-1-343031", 0).Err())
+
+	m.checkLeaderOwnerConsistency(context.Background())
+
+	require.False(t, called)
+	require.Equal(t, int32(0), m.leaderOwnerMismatchConsecutive.Load())
+}

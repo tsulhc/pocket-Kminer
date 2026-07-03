@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime/debug"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -1773,7 +1774,7 @@ func (m *SupplierManager) checkLeaderOwnerConsistency(ctx context.Context) {
 			Int("suppliers_owned", owned).
 			Msg("NO GLOBAL LEADER but we own supplier leases — block publisher stopped, claim/proof stalled")
 		m.handleLeaderOwnerMismatch("no_leader")
-	} else if leaderID != m.config.MinerID {
+	} else if !m.matchesGlobalLeaderID(leaderID) {
 		m.logger.Error().
 			Str("global_leader", leaderID).
 			Str("our_id", m.config.MinerID).
@@ -1788,6 +1789,19 @@ func (m *SupplierManager) checkLeaderOwnerConsistency(ctx context.Context) {
 			currentBlockHeight.Set(float64(m.config.BlockClient.LastBlock(ctx).Height()))
 		}
 	}
+}
+
+func (m *SupplierManager) matchesGlobalLeaderID(leaderID string) bool {
+	if leaderID == m.config.MinerID {
+		return true
+	}
+
+	// Supplier leases use the Redis consumer name, which is prefixed with
+	// "miner-" in production (e.g. miner-pocket-relayminer-pg-1-123). The
+	// global leader lock uses the bare instance ID (pocket-relayminer-pg-1-123).
+	// Treat them as the same instance or the watchdog will false-positive and
+	// crash-loop the active miner immediately after deploy.
+	return leaderID == strings.TrimPrefix(m.config.MinerID, "miner-")
 }
 
 func setLeaderOwnerMismatchState(active string) {
