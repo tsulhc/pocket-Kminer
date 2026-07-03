@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/alicebob/miniredis/v2"
 	"github.com/stretchr/testify/require"
@@ -43,22 +44,32 @@ func newWatchdogTestManager(t *testing.T, handler func(string)) (*SupplierManage
 }
 
 func TestCheckLeaderOwnerConsistency_NoLeaderTriggersHandler(t *testing.T) {
-	var gotReason string
-	m, _ := newWatchdogTestManager(t, func(reason string) { gotReason = reason })
+	reasons := make(chan string, 1)
+	m, _ := newWatchdogTestManager(t, func(reason string) { reasons <- reason })
 
 	m.checkLeaderOwnerConsistency(context.Background())
 
-	require.Equal(t, "no_leader", gotReason)
+	select {
+	case gotReason := <-reasons:
+		require.Equal(t, "no_leader", gotReason)
+	case <-time.After(time.Second):
+		t.Fatal("handler was not called")
+	}
 }
 
 func TestCheckLeaderOwnerConsistency_MismatchTriggersHandler(t *testing.T) {
-	var gotReason string
-	m, redisClient := newWatchdogTestManager(t, func(reason string) { gotReason = reason })
+	reasons := make(chan string, 1)
+	m, redisClient := newWatchdogTestManager(t, func(reason string) { reasons <- reason })
 	require.NoError(t, redisClient.Set(context.Background(), redisClient.KB().GlobalLeaderKey(), "miner-b", 0).Err())
 
 	m.checkLeaderOwnerConsistency(context.Background())
 
-	require.Equal(t, "mismatch", gotReason)
+	select {
+	case gotReason := <-reasons:
+		require.Equal(t, "mismatch", gotReason)
+	case <-time.After(time.Second):
+		t.Fatal("handler was not called")
+	}
 }
 
 func TestCheckLeaderOwnerConsistency_OKDoesNotTriggerHandler(t *testing.T) {

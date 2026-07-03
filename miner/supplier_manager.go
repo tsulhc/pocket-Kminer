@@ -305,6 +305,7 @@ type SupplierManager struct {
 	mu       sync.RWMutex
 
 	leaderOwnerMismatchConsecutive atomic.Int32
+	leaderOwnerMismatchHandling    atomic.Bool
 }
 
 // NewSupplierManager creates a new supplier manager.
@@ -1828,11 +1829,22 @@ func (m *SupplierManager) handleLeaderOwnerMismatch(reason string) {
 		Str("reason", reason).
 		Int("consecutive_failures", count).
 		Int("threshold", threshold).
-		Msg("leader/owner mismatch persisted — triggering fail-fast handler")
+		Msg("leader/owner mismatch persisted — releasing supplier leases before fail-fast")
 
-	if m.config.LeaderOwnerMismatchHandler != nil {
-		m.config.LeaderOwnerMismatchHandler(reason)
+	if !m.leaderOwnerMismatchHandling.CompareAndSwap(false, true) {
+		return
 	}
+
+	go func() {
+		if m.claimer != nil {
+			if err := m.claimer.Stop(context.Background()); err != nil {
+				m.logger.Error().Err(err).Msg("failed to release supplier leases during leader/owner mismatch handling")
+			}
+		}
+		if m.config.LeaderOwnerMismatchHandler != nil {
+			m.config.LeaderOwnerMismatchHandler(reason)
+		}
+	}()
 }
 
 // Close gracefully shuts down the supplier manager.
