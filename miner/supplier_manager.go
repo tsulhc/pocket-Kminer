@@ -372,6 +372,11 @@ func (m *SupplierManager) Start(ctx context.Context) error {
 			Msg("supplier stake reconcile loop started")
 	}
 
+	// Leader/supplier-owner mismatch watchdog: detects the split-brain state
+	// where this instance owns supplier leases but is NOT the global leader
+	// (block publisher stopped, claim/proof stalled, memory growth).
+	go m.runLeaderOwnerWatchdog(m.ctx)
+
 	return nil
 }
 
@@ -1714,6 +1719,49 @@ func (m *SupplierManager) ListSuppliers() []string {
 		suppliers = append(suppliers, addr)
 	}
 	return suppliers
+}
+
+const defaultLeaderOwnerWatchdogInterval = 30 * time.Second
+
+func (m *SupplierManager) runLeaderOwnerWatchdog(ctx context.Context) {
+	ticker := time.NewTicker(defaultLeaderOwnerWatchdogInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			m.checkLeaderOwnerConsistency(ctx)
+		}
+	}
+}
+
+func (m *SupplierManager) checkLeaderOwnerConsistency(ctx context.Context) {
+	owned := len(m.ListSuppliers())
+	if owned == 0 {
+		leaderOwnerMismatch.WithLabelValues("no_suppliers").Set(0)
+		return
+	}
+
+	leaderKey := m.config.RedisClient.KB().GlobalLeaderKey()
+	leaderID, err := m.config.RedisClient.Get(ctx, leaderKey).Result()
+	if err != nil && err.Error() != "redis: nil" {
+		leaderOwnerMismatch.WithLabelValues("redis_error").Set(1)
+		return
+	}
+
+	if leaderID != "" && leaderID != m.config.MinerID {
+		m.logger.Error().
+			Str("global_leader", leaderID).
+			Str("our_id", m.config.MinerID).
+			Int("suppliers_owned", owned).
+			Msg("LEADER/OWNER MISMATCH: we own supplier leases but are NOT the global leader — claim/proof stalled, memory accumulates")
+		leaderOwnerMismatch.WithLabelValues("mismatch").Set(1)
+	} else if leaderID == m.config.MinerID {
+		leaderOwnerMismatch.WithLabelValues("ok").Set(0)
+		currentBlockHeight.Set(float64(m.config.BlockClient.LastBlock(ctx).Height()))
+	}
 }
 
 // Close gracefully shuts down the supplier manager.

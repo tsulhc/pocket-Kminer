@@ -814,6 +814,36 @@ var (
 		[]string{"supplier"},
 	)
 
+	leaderOwnerMismatch = observability.MinerFactory.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      "leader_owner_mismatch",
+			Help:      "1 when this instance owns supplier leases but is NOT the global leader (claim/proof stalled, memory accumulates). 0 otherwise.",
+		},
+		[]string{"state"},
+	)
+
+	blockEventAgeSeconds = observability.MinerFactory.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      "block_event_age_seconds",
+			Help:      "Seconds since the last block event was processed by the lifecycle. Sustained >60 = block source stalled.",
+		},
+		[]string{"supplier"},
+	)
+
+	activeSessionsGauge = observability.MinerFactory.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      "active_sessions",
+			Help:      "Number of active sessions currently tracked by this lifecycle manager. Sustained growth = sessions not reaching terminal state.",
+		},
+		[]string{"supplier"},
+	)
+
 	// Block health metrics
 	configuredBlockTimeSeconds = observability.MinerFactory.NewGauge(
 		prometheus.GaugeOpts{

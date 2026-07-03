@@ -402,21 +402,73 @@ func (m *SessionLifecycleManager) lifecycleCheckerEventDriven(ctx context.Contex
 	blockCh := subscriber.Subscribe(ctx, blockEventSubscriberBuffer)
 	m.logger.Debug().Msg("using Subscribe() for block events (coalesced reader/processor)")
 
-	lastHeight := int64(0)
-	runCoalescingBlockLoop(ctx, blockCh, func(height int64) {
-		if lastHeight > 0 {
-			sessionBlockProcessingLag.WithLabelValues(m.config.SupplierAddress).Set(float64(height - lastHeight))
+	var lastHeight atomic.Int64
+	var lastEventTimeNano atomic.Int64
+	lastEventTimeNano.Store(time.Now().UnixNano())
+
+	onHeightFn := func(height int64) {
+		if prev := lastHeight.Load(); prev > 0 {
+			sessionBlockProcessingLag.WithLabelValues(m.config.SupplierAddress).Set(float64(height - prev))
 		}
-		lastHeight = height
+		lastHeight.Store(height)
+		lastEventTimeNano.Store(time.Now().UnixNano())
 		currentBlockHeight.Set(float64(height))
+		blockEventAgeSeconds.WithLabelValues(m.config.SupplierAddress).Set(0)
 		m.recordTransitionQueueDepth()
 		m.checkSessionTransitions(ctx, height)
-	})
+	}
+
+	// Safety-net: if block events stop arriving (block publisher dead,
+	// leader lost, etc.), use a fallback ticker to poll LastBlock() so
+	// sessions still transition through claim/proof windows and reach
+	// terminal cleanup. Runs concurrently with the coalescing loop.
+	go m.runBlockEventFallback(ctx, &lastHeight, &lastEventTimeNano, onHeightFn)
+
+	runCoalescingBlockLoop(ctx, blockCh, onHeightFn)
 
 	if ctx.Err() == nil {
 		m.logger.Warn().Msg("block events channel closed unexpectedly; session lifecycle block loop stopped")
 	}
 }
+
+// runBlockEventFallback polls LastBlock() every defaultEventFallbackInterval.
+// When no block event has been processed for >2 intervals, it triggers a
+// transition check at the current chain height so sessions do not stall.
+func (m *SessionLifecycleManager) runBlockEventFallback(
+	ctx context.Context,
+	lastHeight *atomic.Int64,
+	lastEventTimeNano *atomic.Int64,
+	onHeightFn func(int64),
+) {
+	ticker := time.NewTicker(defaultEventFallbackInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			lh := lastHeight.Load()
+			if lh == 0 {
+				continue
+			}
+			age := time.Since(time.Unix(0, lastEventTimeNano.Load())).Seconds()
+			blockEventAgeSeconds.WithLabelValues(m.config.SupplierAddress).Set(age)
+			if age > defaultEventFallbackInterval.Seconds()*2 {
+				m.logger.Warn().
+					Float64("seconds_since_last_event", age).
+					Int64("last_height", lh).
+					Msg("block event stalled — running fallback transition check")
+				currentBlock := m.blockClient.LastBlock(ctx)
+				if ch := currentBlock.Height(); ch > lh {
+					onHeightFn(ch)
+				}
+			}
+		}
+	}
+}
+
+const defaultEventFallbackInterval = 30 * time.Second
 
 // recordTransitionQueueDepth samples the transition subpool queue depth into
 // the per-supplier gauge. The subpool queue is intentionally unbounded, so a
@@ -610,6 +662,8 @@ func (m *SessionLifecycleManager) checkSessionTransitions(ctx context.Context, c
 		}
 		return true // continue iteration
 	})
+
+	activeSessionsGauge.WithLabelValues(m.config.SupplierAddress).Set(float64(totalSessions))
 
 	// Log filtering stats for observability
 	filteredOut := totalSessions - len(candidateSessionIDs)

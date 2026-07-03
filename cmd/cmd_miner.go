@@ -357,7 +357,16 @@ func runHAMiner(cmd *cobra.Command, _ []string) (err error) {
 	<-sigCh
 	logger.Info().Msg("shutdown signal received, stopping HA Miner...")
 
-	// Deferring handles graceful shutdown
+	// Release global leader lock BEFORE draining supplier claims.
+	// The leaderLoop's ctx.Done handler atomically releases the lock
+	// and wg.Wait() ensures the goroutine has exited. Closing first
+	// prevents a split-brain window where supplier claims are released
+	// (another instance claims them) while this instance still holds
+	// the global leader lock (block publisher, stalling claim/proof).
+	logger.Info().Msg("releasing global leadership before supplier drain")
+	globalLeader.Close()
+
+	// Deferring handles graceful shutdown of remaining resources
 	logger.Info().Msg("HA Miner stopped")
 	return nil
 }

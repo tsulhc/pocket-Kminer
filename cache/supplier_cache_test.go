@@ -504,3 +504,58 @@ func TestSupplierCache_L1RefreshesAfterTTL(t *testing.T) {
 	require.Equal(t, []string{"svcA", "svcB"}, state.Services,
 		"after supplierCacheL1TTL elapses, L1 must refresh and follow the L2 supplier state")
 }
+
+func TestSetSupplierState_RejectsActiveWithoutServices(t *testing.T) {
+	sc, _, _ := newTestSupplierCache(t)
+	ctx := context.Background()
+
+	err := sc.SetSupplierState(ctx, &SupplierState{
+		OperatorAddress: "pokt1contaminated",
+		Status:          SupplierStatusActive,
+		Staked:          true,
+		Services:        nil,
+	})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "empty services")
+
+	err = sc.SetSupplierState(ctx, &SupplierState{
+		OperatorAddress: "pokt1contaminated2",
+		Status:          SupplierStatusActive,
+		Staked:          true,
+		Services:        []string{},
+	})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "empty services")
+}
+
+func TestSetSupplierState_AllowsActiveWithServices(t *testing.T) {
+	sc, _, _ := newTestSupplierCache(t)
+	ctx := context.Background()
+
+	err := sc.SetSupplierState(ctx, &SupplierState{
+		OperatorAddress: "pokt1valid",
+		Status:          SupplierStatusActive,
+		Staked:          true,
+		Services:        []string{"eth-mainnet"},
+	})
+	require.NoError(t, err)
+
+	got, err := sc.GetSupplierState(ctx, "pokt1valid")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	require.Equal(t, "active", got.Status)
+}
+
+func TestSetSupplierState_AllowsUnstakingWithoutServices(t *testing.T) {
+	sc, _, _ := newTestSupplierCache(t)
+	ctx := context.Background()
+
+	err := sc.SetSupplierState(ctx, &SupplierState{
+		OperatorAddress:         "pokt1unstaking_no_svcs",
+		Status:                  SupplierStatusUnstaking,
+		Staked:                  true,
+		Services:                []string{},
+		UnstakeSessionEndHeight: 300,
+	})
+	require.NoError(t, err, "unstaking+empty-services must be allowed (legitimate in-flight deactivation)")
+}
