@@ -129,6 +129,31 @@ func TestPublishToSubscribers_DropIsLoud(t *testing.T) {
 	assert.Equal(t, float64(1), after-before)
 }
 
+func TestSubscribe_ContextCancelRemovesSubscriber(t *testing.T) {
+	a := newBareAdapter(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	ch := a.Subscribe(ctx, 1)
+	require.NotNil(t, ch)
+	require.Len(t, a.subscribers, 1)
+
+	cancel()
+
+	require.Eventually(t, func() bool {
+		a.subscribersMu.RLock()
+		defer a.subscribersMu.RUnlock()
+		return len(a.subscribers) == 0
+	}, time.Second, 10*time.Millisecond)
+
+	_, open := <-ch
+	require.False(t, open, "subscriber channel must be closed after context cancellation")
+
+	before := testutil.ToFloat64(blockEventsDropped.WithLabelValues("fanout"))
+	a.publishToSubscribers(&BlockEvent{Height: 10, Hash: []byte{0x01}, Timestamp: time.Unix(0, 0)})
+	after := testutil.ToFloat64(blockEventsDropped.WithLabelValues("fanout"))
+	assert.Equal(t, before, after, "removed subscribers must not count as dropped fan-out events")
+}
+
 func TestBlockEvents_GuardGatesForwarding(t *testing.T) {
 	a := newBareAdapter(t)
 

@@ -2430,8 +2430,12 @@ func (lc *LifecycleCallback) waitForBlock(ctx context.Context, targetHeight int6
 		return lc.waitForBlockPolling(ctx, targetHeight)
 	}
 
-	// Subscribe to block events - use small buffer since we only need to detect one block
-	blockCh := subscriber.Subscribe(ctx, 10)
+	// Subscribe to block events with a child context so the temporary
+	// subscription is removed as soon as this wait returns. Without this, the
+	// fan-out list retains an unread channel and logs dropped block events forever.
+	subCtx, cancelSub := context.WithCancel(ctx)
+	defer cancelSub()
+	blockCh := subscriber.Subscribe(subCtx, 10)
 
 	for {
 		select {
