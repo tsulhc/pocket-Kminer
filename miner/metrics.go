@@ -995,9 +995,23 @@ var (
 			Namespace: metricsNamespace,
 			Subsystem: metricsSubsystem,
 			Name:      "supplier_cache_write_skipped_total",
-			Help:      "Number of times a supplier cache write was skipped to preserve existing state (e.g. chain query error)",
+			Help:      "Number of times a supplier cache write was skipped to preserve existing state (e.g. chain query error, unreliable boot snapshot)",
 		},
-		[]string{"reason"}, // reason: chain_query_error
+		[]string{"reason"}, // reason: chain_query_error, unreliable_boot_snapshot
+	)
+
+	// supplierBootServicesFallbackTotal counts how many times a boot-time
+	// supplier service list was derived from the denormalized supplier.Services
+	// field because no BlockClient/currentHeight was available to evaluate
+	// active ServiceConfigHistory entries.
+	supplierBootServicesFallbackTotal = observability.MinerFactory.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      "supplier_boot_services_fallback_total",
+			Help:      "Number of times supplier services fell back to the denormalized Services field at boot",
+		},
+		[]string{"source"}, // source: denormalized_services
 	)
 
 	// Supplier registry metrics

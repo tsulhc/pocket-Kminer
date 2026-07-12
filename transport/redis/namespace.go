@@ -13,7 +13,38 @@ type KeyBuilder struct {
 }
 
 // NewKeyBuilder creates a new KeyBuilder with the given namespace configuration.
+// Every field is individually normalized: if a field is empty, the default value
+// is used. This prevents malformed keys like "prod::application:x" when only
+// BasePrefix is configured.
 func NewKeyBuilder(ns config.RedisNamespaceConfig) *KeyBuilder {
+	def := config.DefaultRedisNamespaceConfig()
+	if ns.BasePrefix == "" {
+		ns.BasePrefix = def.BasePrefix
+	}
+	if ns.CachePrefix == "" {
+		ns.CachePrefix = def.CachePrefix
+	}
+	if ns.EventsPrefix == "" {
+		ns.EventsPrefix = def.EventsPrefix
+	}
+	if ns.StreamsPrefix == "" {
+		ns.StreamsPrefix = def.StreamsPrefix
+	}
+	if ns.MinerPrefix == "" {
+		ns.MinerPrefix = def.MinerPrefix
+	}
+	if ns.SupplierPrefix == "" {
+		ns.SupplierPrefix = def.SupplierPrefix
+	}
+	if ns.MeterPrefix == "" {
+		ns.MeterPrefix = def.MeterPrefix
+	}
+	if ns.ParamsPrefix == "" {
+		ns.ParamsPrefix = def.ParamsPrefix
+	}
+	if ns.ConsumerGroupPrefix == "" {
+		ns.ConsumerGroupPrefix = def.ConsumerGroupPrefix
+	}
 	return &KeyBuilder{ns: ns}
 }
 
@@ -267,4 +298,132 @@ func (kb *KeyBuilder) MinerActiveSetKey() string {
 // This key has a TTL and acts as a heartbeat for the instance.
 func (kb *KeyBuilder) MinerInstanceKey(instanceID string) string {
 	return fmt.Sprintf("%s:%s:instance:%s", kb.ns.BasePrefix, kb.ns.MinerPrefix, instanceID)
+}
+
+// CachePatternInfo holds the scan pattern and optional known-set key for a cache type.
+type CachePatternInfo struct {
+	Type     string // e.g. "application", "supplier"
+	Pattern  string // SCAN pattern, e.g. "ha:cache:application:*"
+	KnownSet string // known-set key, empty for singletons
+}
+
+// CachePattern returns the SCAN pattern and known-set key for a cache type.
+func (kb *KeyBuilder) CachePattern(cacheType string) (CachePatternInfo, error) {
+	switch cacheType {
+	case "application":
+		return CachePatternInfo{
+			Type:     "application",
+			Pattern:  kb.CacheKey("application", "*"),
+			KnownSet: kb.CacheKnownKey("applications"),
+		}, nil
+	case "service":
+		return CachePatternInfo{
+			Type:     "service",
+			Pattern:  kb.CacheKey("service", "*"),
+			KnownSet: kb.CacheKnownKey("services"),
+		}, nil
+	case "supplier":
+		return CachePatternInfo{
+			Type:     "supplier",
+			Pattern:  kb.SupplierKeyPrefix() + ":*",
+			KnownSet: kb.CacheKnownKey("suppliers"),
+		}, nil
+	case "shared_params":
+		return CachePatternInfo{
+			Type:     "shared_params",
+			Pattern:  kb.ParamsSharedCacheKey(),
+			KnownSet: "",
+		}, nil
+	case "session_params":
+		return CachePatternInfo{
+			Type:     "session_params",
+			Pattern:  kb.ParamsSessionCacheKey(),
+			KnownSet: "",
+		}, nil
+	case "proof_params":
+		return CachePatternInfo{
+			Type:     "proof_params",
+			Pattern:  kb.ParamsProofKey(),
+			KnownSet: "",
+		}, nil
+	case "account":
+		return CachePatternInfo{
+			Type:     "account",
+			Pattern:  kb.CacheKey("account", "*"),
+			KnownSet: kb.CacheKnownKey("accounts"),
+		}, nil
+	case "supplier_params":
+		return CachePatternInfo{
+			Type:     "supplier_params",
+			Pattern:  kb.ParamsSupplierCacheKey(),
+			KnownSet: "",
+		}, nil
+	default:
+		return CachePatternInfo{}, fmt.Errorf("unknown cache type: %s", cacheType)
+	}
+}
+
+// AllCacheTypes returns the set of cache types applicable to --type all
+// cleanup. Protected key families (SMST, sessions, streams, leader,
+// submissions, meter, WAL) are NOT cache types and therefore excluded.
+func AllCacheTypes() []string {
+	return []string{
+		"application",
+		"service",
+		"supplier",
+		"shared_params",
+		"session_params",
+		"proof_params",
+		"account",
+		"supplier_params",
+	}
+}
+
+// CacheKeyForType builds the exact Redis key for a cache-type + logical-key.
+func (kb *KeyBuilder) CacheKeyForType(cacheType, key string) string {
+	switch cacheType {
+	case "supplier":
+		return fmt.Sprintf("%s:%s", kb.SupplierKeyPrefix(), key)
+	case "shared_params":
+		return kb.ParamsSharedCacheKey()
+	case "session_params":
+		return kb.ParamsSessionCacheKey()
+	case "proof_params":
+		return kb.ParamsProofKey()
+	case "supplier_params":
+		return kb.ParamsSupplierCacheKey()
+	default:
+		return kb.CacheKey(cacheType, key)
+	}
+}
+
+// EventClearAllChannel builds the all-clear invalidation channel for L1 caches.
+// Format: {base}:{events}:cache:{cacheType}:invalidate
+// The payload "clear_all" signals L1 caches to drop every entry for this type.
+func (kb *KeyBuilder) EventClearAllChannel(cacheType string) string {
+	return kb.EventChannel(cacheType, "invalidate")
+}
+
+// ParamsSessionCacheKey builds the session params cache key.
+// Format: {base}:{cache}:session_params
+// Example: "ha:cache:session_params"
+func (kb *KeyBuilder) ParamsSessionCacheKey() string {
+	return fmt.Sprintf("%s:%s:session_params", kb.ns.BasePrefix, kb.ns.CachePrefix)
+}
+
+// ParamsSupplierCacheKey builds the supplier params cache key.
+// Matches the key generated by CacheKeys.SupplierParams().
+// Format: {base}:{cache}:params:supplier
+// Example: "ha:cache:params:supplier"
+func (kb *KeyBuilder) ParamsSupplierCacheKey() string {
+	return fmt.Sprintf("%s:%s:params:supplier", kb.ns.BasePrefix, kb.ns.CachePrefix)
+}
+
+// SupplierParamInvalidateChannel builds the invalidation channel for supplier
+// params. Uses the miner's EventsCachePrefix() concatenated with the synthetic
+// invalidation suffix the cache subscribes to.
+// Format: {base}:{events}:cache:invalidate:supplier_params
+// Example: "ha:events:cache:invalidate:supplier_params"
+func (kb *KeyBuilder) SupplierParamInvalidateChannel() string {
+	return fmt.Sprintf("%s:invalidate:supplier_params", kb.EventsCachePrefix())
 }

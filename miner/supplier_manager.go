@@ -566,22 +566,17 @@ func (m *SupplierManager) filterStakedSuppliers(ctx context.Context, supplierAdd
 			continue
 		}
 
-		// Supplier is staked. Resolve services using the ServiceConfigHistory-
-		// aware helper so we respect activation_height / deactivation_height
-		// scheduled by MsgStakeSupplier updates and MsgUnstakeSupplier. The
-		// denormalized supplier.Services field cuts too fast: poktroll
-		// schedules deactivations at the next session_end, not immediately,
-		// so a service removed mid-session must keep serving relays until
-		// its deactivation_height is reached. Same logic in reverse for
-		// services with a future activation_height.
-		var currentHeight int64
-		if m.config.BlockClient != nil {
-			if block := m.config.BlockClient.LastBlock(ctx); block != nil {
-				currentHeight = block.Height()
-			}
+		// Supplier is staked. Resolve services only when we can determine a
+		// reliable list; otherwise skip the cache write to avoid persisting
+		// Staked:true with an empty service list (contaminated cache).
+		// The supplier is still kept in the claimer list because it is staked
+		// on-chain.
+		services, reliable := m.resolveSupplierServices(ctx, &supplier, addr)
+		if reliable {
+			m.writeSupplierStatusToCache(ctx, addr, true, services, supplier.GetUnstakeSessionEndHeight())
+		} else {
+			supplierCacheWriteSkipped.WithLabelValues("unreliable_boot_snapshot").Inc()
 		}
-		services := activeSupplierServiceIDs(&supplier, currentHeight)
-		m.writeSupplierStatusToCache(ctx, addr, true, services, supplier.GetUnstakeSessionEndHeight())
 		stakedSuppliers = append(stakedSuppliers, addr)
 	}
 
@@ -594,27 +589,57 @@ func (m *SupplierManager) filterStakedSuppliers(ctx context.Context, supplierAdd
 	return stakedSuppliers
 }
 
-// activeSupplierServiceIDs returns the supplier services active at currentHeight.
-// Modern poktroll responses carry ServiceConfigHistory, whose activation and
-// deactivation heights must be respected. Some tests/legacy payloads still only
-// populate Supplier.Services; fallback to that denormalized field only when no
-// history exists, preserving backward compatibility without routing future or
-// deactivated services when height-aware data is available.
-func activeSupplierServiceIDs(supplier *sharedtypes.Supplier, currentHeight int64) []string {
-	if supplier == nil {
-		return nil
-	}
-	configs := supplier.GetActiveServiceConfigs(currentHeight)
-	if len(configs) == 0 && len(supplier.ServiceConfigHistory) == 0 {
-		configs = supplier.Services
-	}
-	services := make([]string, 0, len(configs))
+// serviceIDs extracts service IDs from a slice of SupplierServiceConfig,
+// skipping nil entries.
+func serviceIDs(configs []*sharedtypes.SupplierServiceConfig) []string {
+	ids := make([]string, 0, len(configs))
 	for _, svc := range configs {
 		if svc != nil {
-			services = append(services, svc.ServiceId)
+			ids = append(ids, svc.ServiceId)
 		}
 	}
-	return services
+	return ids
+}
+
+// resolveSupplierServices returns the list of service IDs for a supplier and a
+// flag indicating whether that list is reliable enough to persist to the shared
+// supplier cache.
+//
+// Reliability rules:
+//   - If the BlockClient is entirely absent (nil), fall back to the denormalized
+//     Services snapshot; reliable only when non-empty.
+//   - If the BlockClient exists but height is zero, use the denormalized
+//     Services snapshot regardless of ServiceConfigHistory. Reliable only when
+//     non-empty.
+//   - If currentHeight > 0, GetActiveServiceConfigs is authoritative — even an
+//     empty list is a valid signal that the supplier has been deactivated.
+func (m *SupplierManager) resolveSupplierServices(ctx context.Context, supplier *sharedtypes.Supplier, operatorAddr string) (services []string, reliable bool) {
+	if supplier == nil {
+		return nil, false
+	}
+
+	if m.config.BlockClient == nil {
+		services := serviceIDs(supplier.Services)
+		return services, len(services) > 0
+	}
+
+	var currentHeight int64
+	if block := m.config.BlockClient.LastBlock(ctx); block != nil {
+		currentHeight = block.Height()
+	}
+
+	if currentHeight == 0 {
+		services := serviceIDs(supplier.Services)
+		supplierBootServicesFallbackTotal.WithLabelValues("denormalized_services").Inc()
+		m.logger.Debug().
+			Str("supplier", operatorAddr).
+			Int("services", len(services)).
+			Msg("no block height observed yet; using denormalized service snapshot")
+		return services, len(services) > 0
+	}
+
+	// Height known: active configs are authoritative, even if empty.
+	return serviceIDs(supplier.GetActiveServiceConfigs(currentHeight)), true
 }
 
 // hasPendingSessions returns true when the given supplier still has at least
@@ -808,20 +833,16 @@ func (m *SupplierManager) warmupSingleSupplier(ctx context.Context, supplier str
 		return nil
 	}
 
-	// Use the height-aware active set, not the denormalized supplier.Services
-	// field. poktroll schedules service additions/removals via
-	// service_config_history and only applies them at session boundaries —
-	// supplier.Services reflects the immediate view and would include
-	// services that have a deactivation_height already set, which would
-	// then be written into the cache and used for relay routing until the
-	// next warmup. filterStakedSuppliers uses this same pattern.
-	var currentHeight int64
-	if m.config.BlockClient != nil {
-		if block := m.config.BlockClient.LastBlock(ctx); block != nil {
-			currentHeight = block.Height()
-		}
+	// Resolve services only when the snapshot is reliable enough to be
+	// consumed by resolveAndPublishSupplierState. If we cannot determine a
+	// trustworthy list, returning nil forces a fresh chain query later.
+	services, reliable := m.resolveSupplierServices(ctx, &chainSupplier, supplier)
+	if !reliable {
+		m.logger.Debug().
+			Str("supplier", supplier).
+			Msg("warmup skipped: supplier service list unreliable")
+		return nil
 	}
-	services := activeSupplierServiceIDs(&chainSupplier, currentHeight)
 
 	return &SupplierWarmupData{
 		OwnerAddress: chainSupplier.OwnerAddress,
@@ -1298,6 +1319,7 @@ const (
 	supplierDataSourceChainOK
 	supplierDataSourceChainNotFound
 	supplierDataSourceChainError
+	supplierDataSourceUnreliableBoot
 )
 
 // resolveAndPublishSupplierState obtains a supplier's services + owner
@@ -1347,17 +1369,17 @@ func (m *SupplierManager) resolveAndPublishSupplierState(
 			}
 		} else {
 			ownerAddr = supplier.OwnerAddress
-			var currentHeight int64
-			if m.config.BlockClient != nil {
-				if block := m.config.BlockClient.LastBlock(ctx); block != nil {
-					currentHeight = block.Height()
-				}
+			var reliable bool
+			services, reliable = m.resolveSupplierServices(ctx, &supplier, operatorAddr)
+			if reliable {
+				source = supplierDataSourceChainOK
+			} else {
+				source = supplierDataSourceUnreliableBoot
 			}
-			services = activeSupplierServiceIDs(&supplier, currentHeight)
-			source = supplierDataSourceChainOK
 			m.logger.Debug().
 				Str(logging.FieldSupplier, operatorAddr).
 				Str("services", fmt.Sprintf("%v", services)).
+				Bool("reliable", reliable).
 				Msg("queried supplier services from blockchain")
 		}
 	}
@@ -1368,25 +1390,8 @@ func (m *SupplierManager) resolveAndPublishSupplierState(
 
 	switch source {
 	case supplierDataSourcePrewarmed, supplierDataSourceChainOK:
-		supplierState := &cache.SupplierState{
-			Status:          cache.SupplierStatusActive,
-			Staked:          true,
-			OperatorAddress: operatorAddr,
-			OwnerAddress:    ownerAddr,
-			Services:        services,
-			UpdatedBy:       m.config.MinerID,
-		}
-		if cacheErr := m.config.SupplierCache.SetSupplierState(ctx, supplierState); cacheErr != nil {
-			m.logger.Warn().
-				Err(cacheErr).
-				Str(logging.FieldSupplier, operatorAddr).
-				Msg("failed to publish supplier state to cache")
-		} else {
-			m.logger.Debug().
-				Str(logging.FieldSupplier, operatorAddr).
-				Str("services", fmt.Sprintf("%v", services)).
-				Msg("published supplier state to cache")
-		}
+		// Data source is trusted: write the active, staked supplier state.
+		m.publishSupplierStateToCache(ctx, operatorAddr, ownerAddr, services)
 
 	case supplierDataSourceChainNotFound:
 		// Supplier legitimately unstaked — mark as such so any stale
@@ -1410,19 +1415,54 @@ func (m *SupplierManager) resolveAndPublishSupplierState(
 				Msg("published not-staked supplier state to cache")
 		}
 
+	case supplierDataSourceUnreliableBoot:
+		// The chain query succeeded but the services cannot be resolved
+		// reliably (e.g. nil BlockClient + empty denormalized snapshot,
+		// or zero height + empty Services). Do NOT overwrite an existing
+		// cache entry; let the next refresh on a healthy height repopulate.
+		supplierCacheWriteSkipped.WithLabelValues("unreliable_boot_snapshot").Inc()
+		m.logger.Debug().
+			Str(logging.FieldSupplier, operatorAddr).
+			Msg("skipping cache update: boot snapshot unreliable, preserving previous state")
+
 	case supplierDataSourceChainError:
 		// Do NOT overwrite an existing cache entry with empty services.
 		// Let the next refresh on a healthy fullnode repopulate it.
 		supplierCacheWriteSkipped.WithLabelValues("chain_query_error").Inc()
 		m.logger.Warn().
 			Str(logging.FieldSupplier, operatorAddr).
-			Msg("skipping cache update: chain query failed, preserving previous state")
+			Msg("skipping cache update: chain query error, preserving previous state")
 
 	case supplierDataSourceNoQueryClient:
 		// No query client and no prewarmed data — nothing to publish.
 	}
 
 	return ownerAddr, services
+}
+
+// publishSupplierStateToCache writes an active, staked supplier state to the
+// shared cache. It is a small helper to keep resolveAndPublishSupplierState
+// readable.
+func (m *SupplierManager) publishSupplierStateToCache(ctx context.Context, operatorAddr, ownerAddr string, services []string) {
+	supplierState := &cache.SupplierState{
+		Status:          cache.SupplierStatusActive,
+		Staked:          true,
+		OperatorAddress: operatorAddr,
+		OwnerAddress:    ownerAddr,
+		Services:        services,
+		UpdatedBy:       m.config.MinerID,
+	}
+	if cacheErr := m.config.SupplierCache.SetSupplierState(ctx, supplierState); cacheErr != nil {
+		m.logger.Warn().
+			Err(cacheErr).
+			Str(logging.FieldSupplier, operatorAddr).
+			Msg("failed to publish supplier state to cache")
+	} else {
+		m.logger.Debug().
+			Str(logging.FieldSupplier, operatorAddr).
+			Str("services", fmt.Sprintf("%v", services)).
+			Msg("published supplier state to cache")
+	}
 }
 
 // consumeForSupplier runs the consume loop for a single supplier with immediate ACK.

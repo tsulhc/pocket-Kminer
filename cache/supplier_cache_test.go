@@ -505,27 +505,33 @@ func TestSupplierCache_L1RefreshesAfterTTL(t *testing.T) {
 		"after supplierCacheL1TTL elapses, L1 must refresh and follow the L2 supplier state")
 }
 
-func TestSetSupplierState_RejectsActiveWithoutServices(t *testing.T) {
+func TestSetSupplierState_AllowsActiveWithoutServices(t *testing.T) {
 	sc, _, _ := newTestSupplierCache(t)
 	ctx := context.Background()
 
 	err := sc.SetSupplierState(ctx, &SupplierState{
-		OperatorAddress: "pokt1contaminated",
+		OperatorAddress: "pokt1no_svcs_nil",
 		Status:          SupplierStatusActive,
 		Staked:          true,
 		Services:        nil,
 	})
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "empty services")
+	require.NoError(t, err, "active+staked+nil services must be allowed (authoritative empty list at known height)")
 
 	err = sc.SetSupplierState(ctx, &SupplierState{
-		OperatorAddress: "pokt1contaminated2",
+		OperatorAddress: "pokt1no_svcs_empty",
 		Status:          SupplierStatusActive,
 		Staked:          true,
 		Services:        []string{},
 	})
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "empty services")
+	require.NoError(t, err, "active+staked+empty services must be allowed (authoritative empty list at known height)")
+
+	// The read guard (isContaminated) treats staked+active+empty as
+	// contaminated and reports a miss. The write succeeds at L2; the read
+	// guard is the safety net that prevents boot contamination from
+	// affecting relayers.
+	got, err := sc.GetSupplierState(ctx, "pokt1no_svcs_empty")
+	require.NoError(t, err)
+	require.Nil(t, got, "reader must report miss for contaminated entry")
 }
 
 func TestSetSupplierState_AllowsActiveWithServices(t *testing.T) {

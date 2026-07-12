@@ -116,6 +116,12 @@ func (s *SupplierState) isContaminated() bool {
 	return s.Staked && s.Status == SupplierStatusActive && len(s.Services) == 0
 }
 
+// IsContaminated is the exported version of isContaminated for use by
+// external packages (e.g. the cleanup CLI).
+func (s *SupplierState) IsContaminated() bool {
+	return s.isContaminated()
+}
+
 // IsActive returns true if the supplier is active and should accept relays.
 //
 // An unstaking supplier (Status == SupplierStatusUnstaking) is still considered
@@ -315,10 +321,6 @@ func (c *SupplierCache) GetSupplierState(ctx context.Context, operatorAddress st
 func (c *SupplierCache) SetSupplierState(ctx context.Context, state *SupplierState) error {
 	if state.OperatorAddress == "" {
 		return fmt.Errorf("operator_address is required")
-	}
-
-	if state.Staked && state.Status == SupplierStatusActive && len(state.Services) == 0 {
-		return fmt.Errorf("refusing to cache supplier %s as staked+active with empty services (contaminated state)", state.OperatorAddress)
 	}
 
 	// Update timestamp
