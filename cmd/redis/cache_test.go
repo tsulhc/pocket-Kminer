@@ -76,7 +76,7 @@ func TestInvalidateAll_RemovesEveryEntry(t *testing.T) {
 	assert.False(t, mr.Exists("ha:supplier:pokt1b"))
 	assert.False(t, mr.Exists("ha:supplier:pokt1c"))
 
-	// Known-set drained via SREM.
+	// miniredis auto-deletes empty sets after SRem removes the last member.
 	assert.False(t, mr.Exists("ha:cache:known:suppliers"))
 }
 
@@ -107,6 +107,7 @@ func TestInvalidateFromFile_ProcessesAllLines(t *testing.T) {
 	assert.False(t, mr.Exists("ha:supplier:pokt1b"))
 	assert.False(t, mr.Exists("ha:supplier:pokt1c"))
 
+	// miniredis auto-deletes empty sets after SRem.
 	assert.False(t, mr.Exists("ha:cache:known:suppliers"))
 }
 
