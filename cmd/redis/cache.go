@@ -3,6 +3,7 @@ package redis
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/spf13/cobra"
 
+	"github.com/pokt-network/pocket-relay-miner/cache"
 	"github.com/pokt-network/pocket-relay-miner/config"
 	transportredis "github.com/pokt-network/pocket-relay-miner/transport/redis"
 )
@@ -323,43 +325,64 @@ func invalidateCache(ctx context.Context, client *DebugRedisClient, cacheType, k
 func invalidateOneQuiet(ctx context.Context, client *DebugRedisClient, cacheType, key string) error {
 	redisKey := client.KB().CacheKeyForType(cacheType, key)
 
-	// Supplier deletion: use atomic WATCH to avoid deleting a key that was
-	// re-written by a running miner between our SCAN and DEL.
+	var deleted bool
 	if cacheType == "supplier" {
-		if err := atomicSupplierDel(ctx, client, redisKey); err != nil {
+		var err error
+		deleted, err = atomicSupplierDel(ctx, client, redisKey)
+		if err != nil {
 			return fmt.Errorf("failed atomic supplier delete for %q: %w", redisKey, err)
 		}
 	} else {
 		if err := client.Del(ctx, redisKey).Err(); err != nil {
 			return fmt.Errorf("failed to delete cache key %q: %w", redisKey, err)
 		}
+		deleted = true
 	}
 
 	channel := client.KB().EventClearAllChannel(cacheType)
-	payload := fmt.Sprintf(`{"key": "%s"}`, key)
+	payload := `{}`
 	_ = client.Publish(ctx, channel, payload).Err()
 
-	if info, err := client.KB().CachePattern(cacheType); err == nil && info.KnownSet != "" {
-		_ = client.SRem(ctx, info.KnownSet, key).Err()
+	if deleted {
+		if info, err := client.KB().CachePattern(cacheType); err == nil && info.KnownSet != "" {
+			_ = client.SRem(ctx, info.KnownSet, key).Err()
+		}
 	}
 
 	return nil
 }
 
-// atomicSupplierDel deletes a supplier key only if its value hasn't changed
-// since deletion was requested (WATCH-based optimistic lock). This prevents a
-// race where a running miner rewrites the key between the SCAN and DEL.
-func atomicSupplierDel(ctx context.Context, client *DebugRedisClient, redisKey string) error {
+// atomicSupplierDel deletes a supplier cache entry only if it is genuinely
+// contaminated (staked+active with empty services). Inside WATCH:
+//  1. Read and JSON-deserialize the value.
+//  2. If unreadable (corrupt JSON), preserve the entry — don't guess.
+//  3. If readable but not contaminated, preserve the entry.
+//  4. Only delete when IsContaminated() returns true inside the transaction.
+//
+// Returns (deleted=true, nil) when the entry was deleted, (deleted=false, nil)
+// when it was preserved (healthy, illegible, or already gone).
+func atomicSupplierDel(ctx context.Context, client *DebugRedisClient, redisKey string) (deleted bool, retErr error) {
 	const maxRetries = 3
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		err := client.Watch(ctx, func(tx *redis.Tx) error {
-			_, getErr := tx.Get(ctx, redisKey).Result()
+			raw, getErr := tx.Get(ctx, redisKey).Result()
 			if getErr == redis.Nil {
 				return nil
 			}
 			if getErr != nil {
 				return getErr
 			}
+
+			var state cache.SupplierState
+			if jsonErr := json.Unmarshal([]byte(raw), &state); jsonErr != nil {
+				return nil
+			}
+
+			if !state.IsContaminated() {
+				return nil
+			}
+
+			deleted = true
 			_, err := tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
 				pipe.Del(ctx, redisKey)
 				return nil
@@ -370,12 +393,12 @@ func atomicSupplierDel(ctx context.Context, client *DebugRedisClient, redisKey s
 		if err == redis.TxFailedErr {
 			continue
 		}
-		if err == nil {
-			return nil
+		if err != nil {
+			return false, err
 		}
-		return err
+		return deleted, nil
 	}
-	return fmt.Errorf("atomic supplier deletion failed after %d retries for %q", maxRetries, redisKey)
+	return false, fmt.Errorf("atomic supplier deletion failed after %d retries for %q", maxRetries, redisKey)
 }
 
 func invalidateAll(ctx context.Context, client *DebugRedisClient, cacheType string, dryRun, yes bool) error {
@@ -391,7 +414,7 @@ func invalidateAll(ctx context.Context, client *DebugRedisClient, cacheType stri
 			return err
 		}
 
-		redisKeys, err := scanAllKeys(ctx, client, info.Pattern)
+		redisKeys, err := scanAllKeysCluster(ctx, client, info.Pattern)
 		if err != nil {
 			return err
 		}
@@ -442,20 +465,68 @@ func invalidateAll(ctx context.Context, client *DebugRedisClient, cacheType stri
 	if dryRun {
 		fmt.Printf("[dry-run] would invalidate %d entries total across %d cache types\n", grandTotal, len(types))
 	}
-	if !dryRun && grandTotal > 0 {
-		fmt.Printf("cleared %d entries total across %d cache types\n", grandTotal, len(types))
 
-		// Publish all-clear signal for L1 caches.
-		for _, ct := range types {
-			channel := client.KB().EventClearAllChannel(ct)
-			payload := fmt.Sprintf(`{"%s": "clear_all"}`, ct)
-			if err := client.Publish(ctx, channel, payload).Err(); err != nil {
-				fmt.Printf("Warning: failed to publish all-clear for %s: %v\n", ct, err)
-			}
+	// Publish all-clear to every type — even when zero keys were found,
+	// because orphaned L1 entries may exist. Uses the empty-object payload
+	// {} that existing L1 caches interpret as "clear all".
+	for _, ct := range types {
+		channel := channelForClearAll(client, ct)
+		if channel == "" {
+			continue
+		}
+		payload := "{}"
+		if err := client.Publish(ctx, channel, payload).Err(); err != nil {
+			fmt.Printf("Warning: failed to publish all-clear for %s (%s): %v\n", ct, channel, err)
+		} else if !dryRun {
+			fmt.Printf("published all-clear to %s\n", channel)
 		}
 	}
 
 	return nil
+}
+
+// channelForClearAll returns the invalidation channel for a cache type.
+// supplier_params uses a non-standard channel pattern.
+func channelForClearAll(client *DebugRedisClient, cacheType string) string {
+	if cacheType == "supplier_params" {
+		return client.KB().SupplierParamInvalidateChannel()
+	}
+	return client.KB().EventClearAllChannel(cacheType)
+}
+
+// scanAllKeysCluster uses SCAN, but when the underlying client is a
+// redis.ClusterClient it iterates over every master node to ensure no
+// keys are missed on other shards.
+func scanAllKeysCluster(ctx context.Context, client *DebugRedisClient, pattern string) ([]string, error) {
+	if cluster, ok := client.Client.UniversalClient.(*redis.ClusterClient); ok {
+		return scanAllKeysClusterNodes(ctx, cluster, pattern)
+	}
+	return scanAllKeys(ctx, client, pattern)
+}
+
+// scanAllKeysClusterNodes enumerates every master node in the cluster and
+// runs SCAN on each one, aggregating results.
+func scanAllKeysClusterNodes(ctx context.Context, cluster *redis.ClusterClient, pattern string) ([]string, error) {
+	var all []string
+	err := cluster.ForEachMaster(ctx, func(ctx context.Context, shard *redis.Client) error {
+		var cursor uint64
+		for {
+			keys, next, err := shard.Scan(ctx, cursor, pattern, 100).Result()
+			if err != nil {
+				return fmt.Errorf("cluster shard SCAN failed with pattern %q: %w", pattern, err)
+			}
+			all = append(all, keys...)
+			cursor = next
+			if cursor == 0 {
+				break
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return all, nil
 }
 
 func invalidateFromFile(ctx context.Context, client *DebugRedisClient, cacheType, path string, dryRun bool) error {

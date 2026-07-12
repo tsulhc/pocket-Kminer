@@ -13,7 +13,38 @@ type KeyBuilder struct {
 }
 
 // NewKeyBuilder creates a new KeyBuilder with the given namespace configuration.
+// Every field is individually normalized: if a field is empty, the default value
+// is used. This prevents malformed keys like "prod::application:x" when only
+// BasePrefix is configured.
 func NewKeyBuilder(ns config.RedisNamespaceConfig) *KeyBuilder {
+	def := config.DefaultRedisNamespaceConfig()
+	if ns.BasePrefix == "" {
+		ns.BasePrefix = def.BasePrefix
+	}
+	if ns.CachePrefix == "" {
+		ns.CachePrefix = def.CachePrefix
+	}
+	if ns.EventsPrefix == "" {
+		ns.EventsPrefix = def.EventsPrefix
+	}
+	if ns.StreamsPrefix == "" {
+		ns.StreamsPrefix = def.StreamsPrefix
+	}
+	if ns.MinerPrefix == "" {
+		ns.MinerPrefix = def.MinerPrefix
+	}
+	if ns.SupplierPrefix == "" {
+		ns.SupplierPrefix = def.SupplierPrefix
+	}
+	if ns.MeterPrefix == "" {
+		ns.MeterPrefix = def.MeterPrefix
+	}
+	if ns.ParamsPrefix == "" {
+		ns.ParamsPrefix = def.ParamsPrefix
+	}
+	if ns.ConsumerGroupPrefix == "" {
+		ns.ConsumerGroupPrefix = def.ConsumerGroupPrefix
+	}
 	return &KeyBuilder{ns: ns}
 }
 
@@ -321,6 +352,12 @@ func (kb *KeyBuilder) CachePattern(cacheType string) (CachePatternInfo, error) {
 			Pattern:  kb.CacheKey("account", "*"),
 			KnownSet: kb.CacheKnownKey("accounts"),
 		}, nil
+	case "supplier_params":
+		return CachePatternInfo{
+			Type:     "supplier_params",
+			Pattern:  kb.ParamsSupplierCacheKey(),
+			KnownSet: "",
+		}, nil
 	default:
 		return CachePatternInfo{}, fmt.Errorf("unknown cache type: %s", cacheType)
 	}
@@ -338,6 +375,7 @@ func AllCacheTypes() []string {
 		"session_params",
 		"proof_params",
 		"account",
+		"supplier_params",
 	}
 }
 
@@ -352,6 +390,8 @@ func (kb *KeyBuilder) CacheKeyForType(cacheType, key string) string {
 		return kb.ParamsSessionCacheKey()
 	case "proof_params":
 		return kb.ParamsProofKey()
+	case "supplier_params":
+		return kb.ParamsSupplierCacheKey()
 	default:
 		return kb.CacheKey(cacheType, key)
 	}
@@ -369,4 +409,20 @@ func (kb *KeyBuilder) EventClearAllChannel(cacheType string) string {
 // Example: "ha:cache:session_params"
 func (kb *KeyBuilder) ParamsSessionCacheKey() string {
 	return fmt.Sprintf("%s:%s:session_params", kb.ns.BasePrefix, kb.ns.CachePrefix)
+}
+
+// ParamsSupplierCacheKey builds the supplier params cache key.
+// Format: {base}:{cache}:supplier_params
+// Example: "ha:cache:supplier_params"
+func (kb *KeyBuilder) ParamsSupplierCacheKey() string {
+	return fmt.Sprintf("%s:%s:supplier_params", kb.ns.BasePrefix, kb.ns.CachePrefix)
+}
+
+// SupplierParamInvalidateChannel builds the invalidation channel for supplier
+// params. Supplier params use a non-standard channel pattern (does not follow
+// the {base}:{events}:cache:{type}:invalidate convention).
+// Format: {base}:{events}:invalidate:supplier_params
+// Example: "ha:events:invalidate:supplier_params"
+func (kb *KeyBuilder) SupplierParamInvalidateChannel() string {
+	return fmt.Sprintf("%s:%s:invalidate:supplier_params", kb.ns.BasePrefix, kb.ns.EventsPrefix)
 }

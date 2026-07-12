@@ -116,6 +116,12 @@ func (s *SupplierState) isContaminated() bool {
 	return s.Staked && s.Status == SupplierStatusActive && len(s.Services) == 0
 }
 
+// IsContaminated is the exported version of isContaminated for use by
+// external packages (e.g. the cleanup CLI).
+func (s *SupplierState) IsContaminated() bool {
+	return s.isContaminated()
+}
+
 // IsActive returns true if the supplier is active and should accept relays.
 //
 // An unstaking supplier (Status == SupplierStatusUnstaking) is still considered
