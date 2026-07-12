@@ -630,9 +630,7 @@ func (m *SupplierManager) resolveSupplierServices(ctx context.Context, supplier 
 
 	if currentHeight == 0 {
 		services := serviceIDs(supplier.Services)
-		if len(services) > 0 {
-			supplierBootServicesFallbackTotal.WithLabelValues("denormalized_services").Inc()
-		}
+		supplierBootServicesFallbackTotal.WithLabelValues("denormalized_services").Inc()
 		m.logger.Debug().
 			Str("supplier", operatorAddr).
 			Int("services", len(services)).
