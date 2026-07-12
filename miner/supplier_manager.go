@@ -589,27 +589,16 @@ func (m *SupplierManager) filterStakedSuppliers(ctx context.Context, supplierAdd
 	return stakedSuppliers
 }
 
-// activeSupplierServiceIDs returns the supplier services active at currentHeight.
-// Modern poktroll responses carry ServiceConfigHistory, whose activation and
-// deactivation heights must be respected. Some tests/legacy payloads still only
-// populate Supplier.Services; fallback to that denormalized field only when no
-// history exists, preserving backward compatibility without routing future or
-// deactivated services when height-aware data is available.
-func activeSupplierServiceIDs(supplier *sharedtypes.Supplier, currentHeight int64) []string {
-	if supplier == nil {
-		return nil
-	}
-	configs := supplier.GetActiveServiceConfigs(currentHeight)
-	if len(configs) == 0 && len(supplier.ServiceConfigHistory) == 0 {
-		configs = supplier.Services
-	}
-	services := make([]string, 0, len(configs))
+// serviceIDs extracts service IDs from a slice of SupplierServiceConfig,
+// skipping nil entries.
+func serviceIDs(configs []*sharedtypes.SupplierServiceConfig) []string {
+	ids := make([]string, 0, len(configs))
 	for _, svc := range configs {
 		if svc != nil {
-			services = append(services, svc.ServiceId)
+			ids = append(ids, svc.ServiceId)
 		}
 	}
-	return services
+	return ids
 }
 
 // resolveSupplierServices returns the list of service IDs for a supplier and a
@@ -617,66 +606,42 @@ func activeSupplierServiceIDs(supplier *sharedtypes.Supplier, currentHeight int6
 // supplier cache.
 //
 // Reliability rules:
-//   - If we cannot determine the current chain height (nil BlockClient, no
-//     block, or height == 0), we can only trust the denormalized Services field
-//     when ServiceConfigHistory is empty. If Services is non-empty we fall back
-//     to it; otherwise the result is unreliable.
-//   - If currentHeight > 0 and active configs exist, they are authoritative.
-//   - If currentHeight > 0 but active configs are empty, a non-empty
-//     ServiceConfigHistory means the supplier may have been deactivated and we
-//     must not persist Staked:true with an empty service list. Only when
-//     history is empty can we fall back to the denormalized Services field.
+//   - If the BlockClient is entirely absent (nil), fall back to the denormalized
+//     Services snapshot; reliable only when non-empty.
+//   - If the BlockClient exists but height is zero, use the denormalized
+//     Services snapshot regardless of ServiceConfigHistory. Reliable only when
+//     non-empty.
+//   - If currentHeight > 0, GetActiveServiceConfigs is authoritative — even an
+//     empty list is a valid signal that the supplier has been deactivated.
 func (m *SupplierManager) resolveSupplierServices(ctx context.Context, supplier *sharedtypes.Supplier, operatorAddr string) (services []string, reliable bool) {
 	if supplier == nil {
 		return nil, false
 	}
 
+	if m.config.BlockClient == nil {
+		services := serviceIDs(supplier.Services)
+		return services, len(services) > 0
+	}
+
 	var currentHeight int64
-	if m.config.BlockClient != nil {
-		if block := m.config.BlockClient.LastBlock(ctx); block != nil {
-			currentHeight = block.Height()
-		}
+	if block := m.config.BlockClient.LastBlock(ctx); block != nil {
+		currentHeight = block.Height()
 	}
 
-	configs := supplier.GetActiveServiceConfigs(currentHeight)
-	if len(configs) > 0 {
-		services := make([]string, 0, len(configs))
-		for _, svc := range configs {
-			if svc != nil {
-				services = append(services, svc.ServiceId)
-			}
-		}
-		return services, true
-	}
-
-	// No active configs at current height. Determine whether we can safely fall
-	// back to the denormalized Services field.
-	if len(supplier.ServiceConfigHistory) == 0 && len(supplier.Services) > 0 {
-		services := make([]string, 0, len(supplier.Services))
-		for _, svc := range supplier.Services {
-			if svc != nil {
-				services = append(services, svc.ServiceId)
-			}
-		}
+	if currentHeight == 0 {
+		services := serviceIDs(supplier.Services)
 		if len(services) > 0 {
 			supplierBootServicesFallbackTotal.WithLabelValues("denormalized_services").Inc()
-			m.logger.Debug().
-				Str("supplier", operatorAddr).
-				Int64("current_height", currentHeight).
-				Strs("services", services).
-				Msg("supplier services fell back to denormalized Services field")
-			return services, true
 		}
+		m.logger.Debug().
+			Str("supplier", operatorAddr).
+			Int("services", len(services)).
+			Msg("no block height observed yet; using denormalized service snapshot")
+		return services, len(services) > 0
 	}
 
-	m.logger.Warn().
-		Str("supplier", operatorAddr).
-		Int64("current_height", currentHeight).
-		Int("active_configs", len(configs)).
-		Int("service_config_history", len(supplier.ServiceConfigHistory)).
-		Int("denormalized_services", len(supplier.Services)).
-		Msg("supplier service list unreliable; skipping cache write to avoid contamination")
-	return nil, false
+	// Height known: active configs are authoritative, even if empty.
+	return serviceIDs(supplier.GetActiveServiceConfigs(currentHeight)), true
 }
 
 // hasPendingSessions returns true when the given supplier still has at least
@@ -875,8 +840,7 @@ func (m *SupplierManager) warmupSingleSupplier(ctx context.Context, supplier str
 	// trustworthy list, returning nil forces a fresh chain query later.
 	services, reliable := m.resolveSupplierServices(ctx, &chainSupplier, supplier)
 	if !reliable {
-		supplierCacheWriteSkipped.WithLabelValues("unreliable_boot_snapshot").Inc()
-		m.logger.Warn().
+		m.logger.Debug().
 			Str("supplier", supplier).
 			Msg("warmup skipped: supplier service list unreliable")
 		return nil
@@ -1357,6 +1321,7 @@ const (
 	supplierDataSourceChainOK
 	supplierDataSourceChainNotFound
 	supplierDataSourceChainError
+	supplierDataSourceUnreliableBoot
 )
 
 // resolveAndPublishSupplierState obtains a supplier's services + owner
@@ -1411,7 +1376,7 @@ func (m *SupplierManager) resolveAndPublishSupplierState(
 			if reliable {
 				source = supplierDataSourceChainOK
 			} else {
-				source = supplierDataSourceChainError
+				source = supplierDataSourceUnreliableBoot
 			}
 			m.logger.Debug().
 				Str(logging.FieldSupplier, operatorAddr).
@@ -1452,23 +1417,23 @@ func (m *SupplierManager) resolveAndPublishSupplierState(
 				Msg("published not-staked supplier state to cache")
 		}
 
+	case supplierDataSourceUnreliableBoot:
+		// The chain query succeeded but the services cannot be resolved
+		// reliably (e.g. nil BlockClient + empty denormalized snapshot,
+		// or zero height + empty Services). Do NOT overwrite an existing
+		// cache entry; let the next refresh on a healthy height repopulate.
+		supplierCacheWriteSkipped.WithLabelValues("unreliable_boot_snapshot").Inc()
+		m.logger.Debug().
+			Str(logging.FieldSupplier, operatorAddr).
+			Msg("skipping cache update: boot snapshot unreliable, preserving previous state")
+
 	case supplierDataSourceChainError:
 		// Do NOT overwrite an existing cache entry with empty services.
 		// Let the next refresh on a healthy fullnode repopulate it.
-		//
-		// If the source was an unreliable boot snapshot (e.g. nil BlockClient
-		// and a denormalized supplier with empty Services), we still end up
-		// here so we preserve any existing cache entry rather than writing
-		// Staked:true with an empty service list.
-		reason := "chain_query_error"
-		if prewarmedData != nil {
-			reason = "unreliable_boot_snapshot"
-		}
-		supplierCacheWriteSkipped.WithLabelValues(reason).Inc()
+		supplierCacheWriteSkipped.WithLabelValues("chain_query_error").Inc()
 		m.logger.Warn().
 			Str(logging.FieldSupplier, operatorAddr).
-			Str("reason", reason).
-			Msg("skipping cache update: source data unreliable, preserving previous state")
+			Msg("skipping cache update: chain query error, preserving previous state")
 
 	case supplierDataSourceNoQueryClient:
 		// No query client and no prewarmed data — nothing to publish.

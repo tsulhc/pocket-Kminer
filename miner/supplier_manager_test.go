@@ -11,6 +11,7 @@ import (
 	sdkmath "cosmossdk.io/math"
 	"github.com/alicebob/miniredis/v2"
 	cosmostypes "github.com/cosmos/cosmos-sdk/types"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -266,8 +267,8 @@ func TestResolveSupplierServices_ActiveConfigsAtHeight(t *testing.T) {
 
 func TestResolveSupplierServices_FallbackDenormalized(t *testing.T) {
 	const addr = "pokt1test_rsvc_fallback"
-	bc := &mockBlockClient{currentHeight: 831048}
-	mgr, _, _ := newCacheTestSupplierManagerWithBlock(t, nil, bc)
+	// No BlockClient: fall back to denormalized Services regardless of history.
+	mgr, _, _ := newCacheTestSupplierManager(t, nil)
 
 	supplier := &sharedtypes.Supplier{
 		OperatorAddress: addr,
@@ -277,7 +278,7 @@ func TestResolveSupplierServices_FallbackDenormalized(t *testing.T) {
 	}
 
 	services, reliable := mgr.resolveSupplierServices(context.Background(), supplier, addr)
-	require.True(t, reliable, "denormalized Services with empty history at known height must be reliable (fallback)")
+	require.True(t, reliable, "denormalized non-empty Services without BlockClient must be reliable (fallback)")
 	require.ElementsMatch(t, []string{"legacy-svc"}, services)
 }
 
@@ -299,7 +300,7 @@ func TestResolveSupplierServices_NoBlockClient_EmptyBoth(t *testing.T) {
 	// no Services means nothing reliable to return.
 	services, reliable := mgr.resolveSupplierServices(context.Background(), supplier, addr)
 	require.False(t, reliable)
-	require.Nil(t, services)
+	require.Empty(t, services)
 }
 
 func TestResolveSupplierServices_NoBlockClient_HasDenormalized(t *testing.T) {
@@ -326,12 +327,14 @@ func TestResolveSupplierServices_NoBlockClient_HasHistory(t *testing.T) {
 		ServiceConfigHistory: []*sharedtypes.ServiceConfigUpdate{
 			{Service: &sharedtypes.SupplierServiceConfig{ServiceId: "svc-a"}, ActivationHeight: 100, DeactivationHeight: 0},
 		},
+		Services: []*sharedtypes.SupplierServiceConfig{
+			{ServiceId: "snapshot-svc"},
+		},
 	}
-	// No BlockClient means we cannot evaluate activation heights.
-	// With ServiceConfigHistory present, we must not guess.
+	// No BlockClient: fall back to denormalized Services regardless of history.
 	services, reliable := mgr.resolveSupplierServices(context.Background(), supplier, addr)
-	require.False(t, reliable, "non-empty ServiceConfigHistory without BlockClient must be unreliable")
-	require.Nil(t, services)
+	require.True(t, reliable, "without BlockClient, denormalized non-empty Services must be reliable even with history present")
+	require.ElementsMatch(t, []string{"snapshot-svc"}, services)
 }
 
 func TestResolveSupplierServices_ActiveConfigsEmpty_HistoryNonEmpty(t *testing.T) {
@@ -346,11 +349,12 @@ func TestResolveSupplierServices_ActiveConfigsEmpty_HistoryNonEmpty(t *testing.T
 		},
 	}
 	// At height 831048, active configs are empty (svc-a was deactivated).
-	// Non-empty ServiceConfigHistory means we cannot fall back to
-	// denormalized Services — the supplier may be genuinely deactivated.
+	// At known height, an empty list is authoritative — the supplier may be
+	// genuinely deactivated.
 	services, reliable := mgr.resolveSupplierServices(context.Background(), supplier, addr)
-	require.False(t, reliable, "empty active configs with non-empty history must be unreliable")
-	require.Nil(t, services)
+	require.True(t, reliable, "empty active configs at known height must be reliable (authoritative deactivation)")
+	require.NotNil(t, services, "services must be non-nil (empty slice is valid)")
+	require.Empty(t, services, "active configs at known height are empty → empty services authoritative")
 }
 
 // =============================================================================
@@ -359,27 +363,26 @@ func TestResolveSupplierServices_ActiveConfigsEmpty_HistoryNonEmpty(t *testing.T
 
 func TestResolveAndPublish_ChainOK_UnreliableServices_SkipsWrite(t *testing.T) {
 	const addr = "pokt1test_chain_unreliable"
-	bc := &mockBlockClient{currentHeight: 831048}
+	// Supplier with no BlockClient + empty denormalized Services →
+	// resolveSupplierServices returns unreliable. This is the true
+	// unreliable-boot case: we can't trust the empty snapshot.
 	qc := &fakeSupplierQueryClient{
 		supplier: sharedtypes.Supplier{
 			OperatorAddress: addr,
 			OwnerAddress:    "pokt1owner",
 			Stake:           &cosmostypes.Coin{Denom: "upokt", Amount: sdkmath.NewInt(1000)},
-			ServiceConfigHistory: []*sharedtypes.ServiceConfigUpdate{
-				{Service: &sharedtypes.SupplierServiceConfig{ServiceId: "svc-a"}, ActivationHeight: 1, DeactivationHeight: 831000},
-			},
-			Services: nil,
 		},
 	}
-	mgr, supplierCache, _ := newCacheTestSupplierManagerWithBlock(t, qc, bc)
+	mgr, supplierCache, _ := newCacheTestSupplierManager(t, qc)
 
 	owner, services := mgr.resolveAndPublishSupplierState(context.Background(), addr, nil)
 	require.Equal(t, "pokt1owner", owner, "owner must be returned even when services are unreliable")
-	require.Nil(t, services, "unreliable services must return nil")
+	require.NotNil(t, services)
+	require.Empty(t, services, "empty services returned from unreliable boot snapshot")
 
 	state, err := supplierCache.GetSupplierState(context.Background(), addr)
 	require.NoError(t, err)
-	require.Nil(t, state, "unreliable chain-OK must NOT write Staked:true with empty services to cache")
+	require.Nil(t, state, "unreliable boot snapshot must NOT write a cache entry")
 }
 
 func TestResolveAndPublish_Prewarmed_ServicesPassthrough(t *testing.T) {
@@ -411,9 +414,9 @@ func TestFilterStakedSuppliers_ReliableServices_WritesCache(t *testing.T) {
 	qc := &fakeSupplierQueryClient{
 		supplier: sharedtypes.Supplier{
 			OperatorAddress: addr,
-			Services: []*sharedtypes.SupplierServiceConfig{
-				{ServiceId: "svc-a"},
-				{ServiceId: "svc-b"},
+			ServiceConfigHistory: []*sharedtypes.ServiceConfigUpdate{
+				{Service: &sharedtypes.SupplierServiceConfig{ServiceId: "svc-a"}, ActivationHeight: 1, DeactivationHeight: 0},
+				{Service: &sharedtypes.SupplierServiceConfig{ServiceId: "svc-b"}, ActivationHeight: 1, DeactivationHeight: 0},
 			},
 		},
 	}
@@ -431,8 +434,8 @@ func TestFilterStakedSuppliers_ReliableServices_WritesCache(t *testing.T) {
 	require.ElementsMatch(t, []string{"svc-a", "svc-b"}, state.Services)
 }
 
-func TestFilterStakedSuppliers_UnreliableServices_SkipsWrite_KeepsSupplier(t *testing.T) {
-	const addr = "pokt1test_filter_unreliable"
+func TestFilterStakedSuppliers_AuthoritativeEmptyServices_WritesCache(t *testing.T) {
+	const addr = "pokt1test_filter_empty_authoritative"
 	qc := &fakeSupplierQueryClient{
 		supplier: sharedtypes.Supplier{
 			OperatorAddress: addr,
@@ -444,12 +447,22 @@ func TestFilterStakedSuppliers_UnreliableServices_SkipsWrite_KeepsSupplier(t *te
 	bc := &mockBlockClient{currentHeight: 831048}
 	mgr, supplierCache, _ := newSupplierManagerForFilter(t, qc, bc)
 
-	result := mgr.filterStakedSuppliers(context.Background(), []string{addr})
-	require.Equal(t, []string{addr}, result, "unreliable supplier must still stay in staked list (fail-open)")
+	beforeSkip := testutil.ToFloat64(supplierCacheWriteSkipped.WithLabelValues("unreliable_boot_snapshot"))
 
+	result := mgr.filterStakedSuppliers(context.Background(), []string{addr})
+	require.Equal(t, []string{addr}, result, "supplier must stay in staked list")
+
+	afterSkip := testutil.ToFloat64(supplierCacheWriteSkipped.WithLabelValues("unreliable_boot_snapshot"))
+	require.Equal(t, float64(0), afterSkip-beforeSkip,
+		"authoritative empty services at known height must NOT increment write-skipped")
+
+	// The write succeeds at L2 (SetSupplierState no longer rejects empty
+	// services), but the read guard (isContaminated) treats staked+active+
+	// empty as a miss — this is the safety net that prevents true boot
+	// contamination from harming relayers.
 	state, err := supplierCache.GetSupplierState(context.Background(), addr)
 	require.NoError(t, err)
-	require.Nil(t, state, "unreliable services must NOT write Staked:true+[] to cache")
+	require.Nil(t, state, "reader must report miss for contaminated entry (read guard)")
 }
 
 func TestFilterStakedSuppliers_FailOpenOnNetworkError(t *testing.T) {
@@ -475,8 +488,8 @@ func TestWarmupSingleSupplier_Reliable_ReturnsData(t *testing.T) {
 		supplier: sharedtypes.Supplier{
 			OperatorAddress: addr,
 			OwnerAddress:    "pokt1owner_w",
-			Services: []*sharedtypes.SupplierServiceConfig{
-				{ServiceId: "svc-x"},
+			ServiceConfigHistory: []*sharedtypes.ServiceConfigUpdate{
+				{Service: &sharedtypes.SupplierServiceConfig{ServiceId: "svc-x"}, ActivationHeight: 1, DeactivationHeight: 0},
 			},
 		},
 	}
@@ -489,11 +502,12 @@ func TestWarmupSingleSupplier_Reliable_ReturnsData(t *testing.T) {
 	require.Equal(t, []string{"svc-x"}, result.Services)
 }
 
-func TestWarmupSingleSupplier_Unreliable_ReturnsNil(t *testing.T) {
-	const addr = "pokt1test_warmup_unreliable"
+func TestWarmupSingleSupplier_AuthoritativeEmptyServices_ReturnsData(t *testing.T) {
+	const addr = "pokt1test_warmup_empty_auth"
 	qc := &fakeSupplierQueryClient{
 		supplier: sharedtypes.Supplier{
 			OperatorAddress: addr,
+			OwnerAddress:    "pokt1owner_w",
 			ServiceConfigHistory: []*sharedtypes.ServiceConfigUpdate{
 				{Service: &sharedtypes.SupplierServiceConfig{ServiceId: "svc-a"}, ActivationHeight: 1, DeactivationHeight: 831000},
 			},
@@ -503,7 +517,9 @@ func TestWarmupSingleSupplier_Unreliable_ReturnsNil(t *testing.T) {
 	mgr, _, _ := newSupplierManagerForFilter(t, qc, bc)
 
 	result := mgr.warmupSingleSupplier(context.Background(), addr)
-	require.Nil(t, result, "unreliable warmup must return nil to force chain re-query")
+	require.NotNil(t, result, "authoritative empty services at known height must return warmup data")
+	require.Equal(t, "pokt1owner_w", result.OwnerAddress)
+	require.Empty(t, result.Services, "deactivated supplier must have empty service list")
 }
 
 func TestWarmupSingleSupplier_GetSupplierError(t *testing.T) {
@@ -513,4 +529,51 @@ func TestWarmupSingleSupplier_GetSupplierError(t *testing.T) {
 
 	result := mgr.warmupSingleSupplier(context.Background(), addr)
 	require.Nil(t, result, "GetSupplier error must return nil warmup data")
+}
+
+func TestWarmupSingleSupplier_UnreliableBoot_ReturnsNil(t *testing.T) {
+	const addr = "pokt1test_warmup_boot_unreliable"
+	qc := &fakeSupplierQueryClient{
+		supplier: sharedtypes.Supplier{
+			OperatorAddress: addr,
+		},
+	}
+	// No BlockClient + empty Services → resolveSupplierServices returns unreliable.
+	// warmupSingleSupplier must return nil WITHOUT incrementing write-skipped
+	// (the metric belongs to resolveAndPublishSupplierState).
+	mgr, _, _ := newCacheTestSupplierManager(t, qc)
+
+	result := mgr.warmupSingleSupplier(context.Background(), addr)
+	require.Nil(t, result, "boot-unreliable warmup must return nil")
+}
+
+func TestResolveAndPublish_ChainOK_UnreliableBoot_ReasonMetric(t *testing.T) {
+	const addr = "pokt1test_boot_reason_metric"
+	qc := &fakeSupplierQueryClient{
+		supplier: sharedtypes.Supplier{
+			OperatorAddress: addr,
+			OwnerAddress:    "pokt1owner_boot",
+			Stake:           &cosmostypes.Coin{Denom: "upokt", Amount: sdkmath.NewInt(1000)},
+		},
+	}
+	mgr, supplierCache, _ := newCacheTestSupplierManager(t, qc)
+
+	before := testutil.ToFloat64(supplierCacheWriteSkipped.WithLabelValues("unreliable_boot_snapshot"))
+	beforeChainErr := testutil.ToFloat64(supplierCacheWriteSkipped.WithLabelValues("chain_query_error"))
+
+	owner, services := mgr.resolveAndPublishSupplierState(context.Background(), addr, nil)
+	require.Equal(t, "pokt1owner_boot", owner)
+	require.Empty(t, services)
+
+	after := testutil.ToFloat64(supplierCacheWriteSkipped.WithLabelValues("unreliable_boot_snapshot"))
+	afterChainErr := testutil.ToFloat64(supplierCacheWriteSkipped.WithLabelValues("chain_query_error"))
+
+	require.Equal(t, float64(1), after-before,
+		"unreliable boot snapshot must increment unreliable_boot_snapshot reason exactly once")
+	require.Equal(t, float64(0), afterChainErr-beforeChainErr,
+		"unreliable boot snapshot must NOT use chain_query_error reason")
+
+	state, err := supplierCache.GetSupplierState(context.Background(), addr)
+	require.NoError(t, err)
+	require.Nil(t, state, "unreliable boot must not write cache entry")
 }

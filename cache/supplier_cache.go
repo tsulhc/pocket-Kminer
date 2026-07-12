@@ -317,10 +317,6 @@ func (c *SupplierCache) SetSupplierState(ctx context.Context, state *SupplierSta
 		return fmt.Errorf("operator_address is required")
 	}
 
-	if state.Staked && state.Status == SupplierStatusActive && len(state.Services) == 0 {
-		return fmt.Errorf("refusing to cache supplier %s as staked+active with empty services (contaminated state)", state.OperatorAddress)
-	}
-
 	// Update timestamp
 	state.LastUpdated = time.Now().Unix()
 
