@@ -217,3 +217,300 @@ func TestResolveAndPublish_Prewarmed(t *testing.T) {
 	require.Equal(t, []string{"svc-x", "svc-y"}, state.Services)
 	require.Equal(t, "pokt1owner_pre", state.OwnerAddress)
 }
+
+// newCacheTestSupplierManagerWithBlock wraps newCacheTestSupplierManager and
+// optionally sets a mock BlockClient so resolveSupplierServices can inspect
+// the current height.
+func newCacheTestSupplierManagerWithBlock(t *testing.T, qc *fakeSupplierQueryClient, bc *mockBlockClient) (*SupplierManager, *cache.SupplierCache, *miniredis.Miniredis) {
+	t.Helper()
+	mgr, supplierCache, mr := newCacheTestSupplierManager(t, qc)
+	if bc != nil {
+		mgr.config.BlockClient = bc
+	}
+	return mgr, supplierCache, mr
+}
+
+// newSupplierManagerForFilter builds a SupplierManager that has both a
+// SupplierQueryClient and a SupplierCache plus optional BlockClient so
+// filterStakedSuppliers can be exercised end-to-end.
+func newSupplierManagerForFilter(t *testing.T, qc *fakeSupplierQueryClient, bc *mockBlockClient) (*SupplierManager, *cache.SupplierCache, *miniredis.Miniredis) {
+	t.Helper()
+	mgr, supplierCache, mr := newCacheTestSupplierManager(t, qc)
+	if bc != nil {
+		mgr.config.BlockClient = bc
+	}
+	return mgr, supplierCache, mr
+}
+
+// =============================================================================
+// resolveSupplierServices tests
+// =============================================================================
+
+func TestResolveSupplierServices_ActiveConfigsAtHeight(t *testing.T) {
+	const addr = "pokt1test_rsvc_active"
+	bc := &mockBlockClient{currentHeight: 831048}
+	mgr, _, _ := newCacheTestSupplierManagerWithBlock(t, nil, bc)
+
+	supplier := &sharedtypes.Supplier{
+		OperatorAddress: addr,
+		ServiceConfigHistory: []*sharedtypes.ServiceConfigUpdate{
+			{Service: &sharedtypes.SupplierServiceConfig{ServiceId: "svc-a"}, ActivationHeight: 1, DeactivationHeight: 0},
+			{Service: &sharedtypes.SupplierServiceConfig{ServiceId: "svc-b"}, ActivationHeight: 1, DeactivationHeight: 0},
+		},
+	}
+
+	services, reliable := mgr.resolveSupplierServices(context.Background(), supplier, addr)
+	require.True(t, reliable, "active configs at known height must be reliable")
+	require.ElementsMatch(t, []string{"svc-a", "svc-b"}, services)
+}
+
+func TestResolveSupplierServices_FallbackDenormalized(t *testing.T) {
+	const addr = "pokt1test_rsvc_fallback"
+	bc := &mockBlockClient{currentHeight: 831048}
+	mgr, _, _ := newCacheTestSupplierManagerWithBlock(t, nil, bc)
+
+	supplier := &sharedtypes.Supplier{
+		OperatorAddress: addr,
+		Services: []*sharedtypes.SupplierServiceConfig{
+			{ServiceId: "legacy-svc"},
+		},
+	}
+
+	services, reliable := mgr.resolveSupplierServices(context.Background(), supplier, addr)
+	require.True(t, reliable, "denormalized Services with empty history at known height must be reliable (fallback)")
+	require.ElementsMatch(t, []string{"legacy-svc"}, services)
+}
+
+func TestResolveSupplierServices_NilSupplier(t *testing.T) {
+	mgr, _, _ := newCacheTestSupplierManager(t, nil)
+	services, reliable := mgr.resolveSupplierServices(context.Background(), nil, "addr")
+	require.False(t, reliable)
+	require.Nil(t, services)
+}
+
+func TestResolveSupplierServices_NoBlockClient_EmptyBoth(t *testing.T) {
+	const addr = "pokt1test_rsvc_no_block_empty"
+	mgr, _, _ := newCacheTestSupplierManager(t, nil)
+
+	supplier := &sharedtypes.Supplier{
+		OperatorAddress: addr,
+	}
+	// No BlockClient means currentHeight==0; no ServiceConfigHistory and
+	// no Services means nothing reliable to return.
+	services, reliable := mgr.resolveSupplierServices(context.Background(), supplier, addr)
+	require.False(t, reliable)
+	require.Nil(t, services)
+}
+
+func TestResolveSupplierServices_NoBlockClient_HasDenormalized(t *testing.T) {
+	const addr = "pokt1test_rsvc_noblock_denorm"
+	mgr, _, _ := newCacheTestSupplierManager(t, nil)
+
+	supplier := &sharedtypes.Supplier{
+		OperatorAddress: addr,
+		Services: []*sharedtypes.SupplierServiceConfig{
+			{ServiceId: "boot-svc"},
+		},
+	}
+	services, reliable := mgr.resolveSupplierServices(context.Background(), supplier, addr)
+	require.True(t, reliable, "denormalized Services with empty history and no BlockClient must be reliable (fallback)")
+	require.ElementsMatch(t, []string{"boot-svc"}, services)
+}
+
+func TestResolveSupplierServices_NoBlockClient_HasHistory(t *testing.T) {
+	const addr = "pokt1test_rsvc_noblock_history"
+	mgr, _, _ := newCacheTestSupplierManager(t, nil)
+
+	supplier := &sharedtypes.Supplier{
+		OperatorAddress: addr,
+		ServiceConfigHistory: []*sharedtypes.ServiceConfigUpdate{
+			{Service: &sharedtypes.SupplierServiceConfig{ServiceId: "svc-a"}, ActivationHeight: 100, DeactivationHeight: 0},
+		},
+	}
+	// No BlockClient means we cannot evaluate activation heights.
+	// With ServiceConfigHistory present, we must not guess.
+	services, reliable := mgr.resolveSupplierServices(context.Background(), supplier, addr)
+	require.False(t, reliable, "non-empty ServiceConfigHistory without BlockClient must be unreliable")
+	require.Nil(t, services)
+}
+
+func TestResolveSupplierServices_ActiveConfigsEmpty_HistoryNonEmpty(t *testing.T) {
+	const addr = "pokt1test_rsvc_deactivated"
+	bc := &mockBlockClient{currentHeight: 831048}
+	mgr, _, _ := newCacheTestSupplierManagerWithBlock(t, nil, bc)
+
+	supplier := &sharedtypes.Supplier{
+		OperatorAddress: addr,
+		ServiceConfigHistory: []*sharedtypes.ServiceConfigUpdate{
+			{Service: &sharedtypes.SupplierServiceConfig{ServiceId: "svc-a"}, ActivationHeight: 1, DeactivationHeight: 831000},
+		},
+	}
+	// At height 831048, active configs are empty (svc-a was deactivated).
+	// Non-empty ServiceConfigHistory means we cannot fall back to
+	// denormalized Services — the supplier may be genuinely deactivated.
+	services, reliable := mgr.resolveSupplierServices(context.Background(), supplier, addr)
+	require.False(t, reliable, "empty active configs with non-empty history must be unreliable")
+	require.Nil(t, services)
+}
+
+// =============================================================================
+// resolveAndPublishSupplierState reliability-contamination tests
+// =============================================================================
+
+func TestResolveAndPublish_ChainOK_UnreliableServices_SkipsWrite(t *testing.T) {
+	const addr = "pokt1test_chain_unreliable"
+	bc := &mockBlockClient{currentHeight: 831048}
+	qc := &fakeSupplierQueryClient{
+		supplier: sharedtypes.Supplier{
+			OperatorAddress: addr,
+			OwnerAddress:    "pokt1owner",
+			Stake:           &cosmostypes.Coin{Denom: "upokt", Amount: sdkmath.NewInt(1000)},
+			ServiceConfigHistory: []*sharedtypes.ServiceConfigUpdate{
+				{Service: &sharedtypes.SupplierServiceConfig{ServiceId: "svc-a"}, ActivationHeight: 1, DeactivationHeight: 831000},
+			},
+			Services: nil,
+		},
+	}
+	mgr, supplierCache, _ := newCacheTestSupplierManagerWithBlock(t, qc, bc)
+
+	owner, services := mgr.resolveAndPublishSupplierState(context.Background(), addr, nil)
+	require.Equal(t, "pokt1owner", owner, "owner must be returned even when services are unreliable")
+	require.Nil(t, services, "unreliable services must return nil")
+
+	state, err := supplierCache.GetSupplierState(context.Background(), addr)
+	require.NoError(t, err)
+	require.Nil(t, state, "unreliable chain-OK must NOT write Staked:true with empty services to cache")
+}
+
+func TestResolveAndPublish_Prewarmed_ServicesPassthrough(t *testing.T) {
+	const addr = "pokt1test_prewarmed_reliable"
+	mgr, supplierCache, _ := newCacheTestSupplierManager(t, nil)
+
+	prewarmed := &SupplierWarmupData{
+		OwnerAddress: "pokt1owner_pre",
+		Services:     []string{"a", "b"},
+	}
+	owner, services := mgr.resolveAndPublishSupplierState(context.Background(), addr, prewarmed)
+	require.Equal(t, "pokt1owner_pre", owner)
+	require.Equal(t, []string{"a", "b"}, services)
+
+	state, err := supplierCache.GetSupplierState(context.Background(), addr)
+	require.NoError(t, err)
+	require.NotNil(t, state)
+	require.True(t, state.Staked)
+	require.Equal(t, cache.SupplierStatusActive, state.Status)
+	require.Equal(t, []string{"a", "b"}, state.Services)
+}
+
+// =============================================================================
+// filterStakedSuppliers tests
+// =============================================================================
+
+func TestFilterStakedSuppliers_ReliableServices_WritesCache(t *testing.T) {
+	const addr = "pokt1test_filter_reliable"
+	qc := &fakeSupplierQueryClient{
+		supplier: sharedtypes.Supplier{
+			OperatorAddress: addr,
+			Services: []*sharedtypes.SupplierServiceConfig{
+				{ServiceId: "svc-a"},
+				{ServiceId: "svc-b"},
+			},
+		},
+	}
+	bc := &mockBlockClient{currentHeight: 831048}
+	mgr, supplierCache, _ := newSupplierManagerForFilter(t, qc, bc)
+
+	result := mgr.filterStakedSuppliers(context.Background(), []string{addr})
+	require.Equal(t, []string{addr}, result, "reliable supplier must stay in staked list")
+
+	state, err := supplierCache.GetSupplierState(context.Background(), addr)
+	require.NoError(t, err)
+	require.NotNil(t, state)
+	require.True(t, state.Staked)
+	require.Equal(t, cache.SupplierStatusActive, state.Status)
+	require.ElementsMatch(t, []string{"svc-a", "svc-b"}, state.Services)
+}
+
+func TestFilterStakedSuppliers_UnreliableServices_SkipsWrite_KeepsSupplier(t *testing.T) {
+	const addr = "pokt1test_filter_unreliable"
+	qc := &fakeSupplierQueryClient{
+		supplier: sharedtypes.Supplier{
+			OperatorAddress: addr,
+			ServiceConfigHistory: []*sharedtypes.ServiceConfigUpdate{
+				{Service: &sharedtypes.SupplierServiceConfig{ServiceId: "svc-a"}, ActivationHeight: 1, DeactivationHeight: 831000},
+			},
+		},
+	}
+	bc := &mockBlockClient{currentHeight: 831048}
+	mgr, supplierCache, _ := newSupplierManagerForFilter(t, qc, bc)
+
+	result := mgr.filterStakedSuppliers(context.Background(), []string{addr})
+	require.Equal(t, []string{addr}, result, "unreliable supplier must still stay in staked list (fail-open)")
+
+	state, err := supplierCache.GetSupplierState(context.Background(), addr)
+	require.NoError(t, err)
+	require.Nil(t, state, "unreliable services must NOT write Staked:true+[] to cache")
+}
+
+func TestFilterStakedSuppliers_FailOpenOnNetworkError(t *testing.T) {
+	const addr = "pokt1test_filter_neterror"
+	qc := &fakeSupplierQueryClient{err: status.Error(codes.Unavailable, "network down")}
+	mgr, supplierCache, _ := newSupplierManagerForFilter(t, qc, nil)
+
+	result := mgr.filterStakedSuppliers(context.Background(), []string{addr})
+	require.Equal(t, []string{addr}, result, "network error must treat supplier as staked (fail-open)")
+
+	state, err := supplierCache.GetSupplierState(context.Background(), addr)
+	require.NoError(t, err)
+	require.Nil(t, state, "network error must NOT write any cache entry")
+}
+
+// =============================================================================
+// warmupSingleSupplier tests
+// =============================================================================
+
+func TestWarmupSingleSupplier_Reliable_ReturnsData(t *testing.T) {
+	const addr = "pokt1test_warmup_reliable"
+	qc := &fakeSupplierQueryClient{
+		supplier: sharedtypes.Supplier{
+			OperatorAddress: addr,
+			OwnerAddress:    "pokt1owner_w",
+			Services: []*sharedtypes.SupplierServiceConfig{
+				{ServiceId: "svc-x"},
+			},
+		},
+	}
+	bc := &mockBlockClient{currentHeight: 831048}
+	mgr, _, _ := newSupplierManagerForFilter(t, qc, bc)
+
+	result := mgr.warmupSingleSupplier(context.Background(), addr)
+	require.NotNil(t, result, "reliable warmup must return data")
+	require.Equal(t, "pokt1owner_w", result.OwnerAddress)
+	require.Equal(t, []string{"svc-x"}, result.Services)
+}
+
+func TestWarmupSingleSupplier_Unreliable_ReturnsNil(t *testing.T) {
+	const addr = "pokt1test_warmup_unreliable"
+	qc := &fakeSupplierQueryClient{
+		supplier: sharedtypes.Supplier{
+			OperatorAddress: addr,
+			ServiceConfigHistory: []*sharedtypes.ServiceConfigUpdate{
+				{Service: &sharedtypes.SupplierServiceConfig{ServiceId: "svc-a"}, ActivationHeight: 1, DeactivationHeight: 831000},
+			},
+		},
+	}
+	bc := &mockBlockClient{currentHeight: 831048}
+	mgr, _, _ := newSupplierManagerForFilter(t, qc, bc)
+
+	result := mgr.warmupSingleSupplier(context.Background(), addr)
+	require.Nil(t, result, "unreliable warmup must return nil to force chain re-query")
+}
+
+func TestWarmupSingleSupplier_GetSupplierError(t *testing.T) {
+	const addr = "pokt1test_warmup_qcerror"
+	qc := &fakeSupplierQueryClient{err: status.Error(codes.NotFound, "not staked")}
+	mgr, _, _ := newSupplierManagerForFilter(t, qc, nil)
+
+	result := mgr.warmupSingleSupplier(context.Background(), addr)
+	require.Nil(t, result, "GetSupplier error must return nil warmup data")
+}
