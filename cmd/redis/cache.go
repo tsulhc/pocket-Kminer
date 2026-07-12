@@ -80,9 +80,12 @@ Examples:
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := context.Background()
 
-			// --type all is not valid for single-key inspect/invalidate or key-file.
 			if cacheType == "all" && (key != "" || keyFile != "") {
 				return fmt.Errorf("--type all cannot be used with --key or --key-file; use --list or --invalidate --all")
+			}
+
+			if cacheType == "all" && !dryRun && !yes {
+				return fmt.Errorf("--type all requires --yes (or --dry-run to preview). Use --type <single> for interactive confirmation.")
 			}
 
 			if invalidate {
@@ -356,52 +359,51 @@ func invalidateOneQuiet(ctx context.Context, client *DebugRedisClient, cacheType
 //  3. If readable but not contaminated, preserve the entry.
 //  4. Only delete when IsContaminated() returns true inside the transaction.
 //
+// On WATCH conflict (TxFailedErr) the entry was modified by a running miner —
+// we preserve it without retrying. A conflict means the previous classification
+// is stale and aggressive deletion could remove a freshly-repaired entry.
+//
 // Returns (deleted=true, nil) when the entry was deleted, (deleted=false, nil)
-// when it was preserved (healthy, illegible, or already gone).
+// when it was preserved (healthy, illegible, already gone, or conflicted).
 func atomicSupplierDel(ctx context.Context, client *DebugRedisClient, redisKey string) (deleted bool, retErr error) {
-	const maxRetries = 3
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		// Per-attempt scope: must NOT carry over from a failed EXEC.
-		var didDelete bool
+	var didDelete bool
 
-		err := client.Watch(ctx, func(tx *redis.Tx) error {
-			raw, getErr := tx.Get(ctx, redisKey).Result()
-			if getErr == redis.Nil {
-				return nil
-			}
-			if getErr != nil {
-				return getErr
-			}
-
-			var state cache.SupplierState
-			if jsonErr := json.Unmarshal([]byte(raw), &state); jsonErr != nil {
-				return nil
-			}
-
-			if !state.IsContaminated() {
-				return nil
-			}
-
-			_, pipeErr := tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
-				pipe.Del(ctx, redisKey)
-				return nil
-			})
-			if pipeErr != nil {
-				return pipeErr
-			}
-			didDelete = true
+	err := client.Watch(ctx, func(tx *redis.Tx) error {
+		raw, getErr := tx.Get(ctx, redisKey).Result()
+		if getErr == redis.Nil {
 			return nil
-		}, redisKey)
+		}
+		if getErr != nil {
+			return getErr
+		}
 
-		if err == redis.TxFailedErr {
-			continue
+		var state cache.SupplierState
+		if jsonErr := json.Unmarshal([]byte(raw), &state); jsonErr != nil {
+			return nil
 		}
-		if err != nil {
-			return false, err
+
+		if !state.IsContaminated() {
+			return nil
 		}
-		return didDelete, nil
+
+		_, pipeErr := tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+			pipe.Del(ctx, redisKey)
+			return nil
+		})
+		if pipeErr != nil {
+			return pipeErr
+		}
+		didDelete = true
+		return nil
+	}, redisKey)
+
+	if err == redis.TxFailedErr {
+		return false, nil
 	}
-	return false, fmt.Errorf("atomic supplier deletion failed after %d retries for %q", maxRetries, redisKey)
+	if err != nil {
+		return false, err
+	}
+	return didDelete, nil
 }
 
 func invalidateAll(ctx context.Context, client *DebugRedisClient, cacheType string, dryRun, yes bool) error {
@@ -571,6 +573,13 @@ func invalidateFromFile(ctx context.Context, client *DebugRedisClient, cacheType
 		}
 	}
 	fmt.Printf("invalidated %d entries total\n", done)
+
+	// Publish all-clear to invalidate L1 caches.
+	channel := channelForClearAll(client, cacheType)
+	if channel != "" {
+		_ = client.Publish(ctx, channel, "{}")
+	}
+
 	return nil
 }
 

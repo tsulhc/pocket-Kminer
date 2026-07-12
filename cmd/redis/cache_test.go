@@ -449,6 +449,30 @@ func TestCacheCmd_TypeAllWithKeyFileRejected(t *testing.T) {
 	assert.Contains(t, err.Error(), "--type all cannot be used")
 }
 
+func TestCacheCmd_TypeAllRequiresYes(t *testing.T) {
+	c := CacheCmd()
+	c.SetArgs([]string{"--type", "all", "--invalidate", "--all"})
+	c.SilenceUsage = true
+	c.SilenceErrors = true
+	err := c.Execute()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "--type all requires --yes")
+}
+
+func TestCacheCmd_TypeAllAllowedWithYes(t *testing.T) {
+	// Verify --type all --invalidate --all --yes is accepted.
+	c := CacheCmd()
+	c.SetArgs([]string{"--type", "all", "--invalidate", "--all", "--yes"})
+	c.SilenceUsage = true
+	c.SilenceErrors = true
+	// This will fail when trying to connect to Redis (because CreateRedisClient
+	// requires a running Redis), but it must NOT fail with a flag validation error.
+	err := c.Execute()
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), "--type all requires --yes")
+	assert.NotContains(t, err.Error(), "--type all cannot be used")
+}
+
 func TestInvalidateCache_SingleKeyPreservesBehavior(t *testing.T) {
 	client, mr := newTestCacheClient(t)
 	// Single-key invalidation doesn't check contamination — it's a direct
