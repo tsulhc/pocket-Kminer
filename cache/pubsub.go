@@ -3,10 +3,14 @@ package cache
 import (
 	"context"
 	"fmt"
+	"sync"
+	"time"
 
 	"github.com/pokt-network/pocket-relay-miner/logging"
 	redisutil "github.com/pokt-network/pocket-relay-miner/transport/redis"
 )
+
+var subscribeReadyTimeout = 10 * time.Second
 
 // SubscribeToInvalidations subscribes to cache invalidation events for a specific cache type.
 // It spawns a goroutine with automatic reconnection that listens for messages on the
@@ -37,6 +41,12 @@ func SubscribeToInvalidations(
 		Str("channel", channel).
 		Msg("starting cache invalidation subscription with reconnection")
 
+	ready := make(chan struct{})
+	var readyOnce sync.Once
+	signalReady := func() {
+		readyOnce.Do(func() { close(ready) })
+	}
+
 	// Spawn goroutine with reconnection handling
 	go func() {
 		reconnectLoop := redisutil.NewReconnectionLoop(
@@ -48,14 +58,28 @@ func SubscribeToInvalidations(
 			},
 			// runFn: Subscribe and process messages until disconnect
 			func(ctx context.Context) error {
-				return runPubSubLoop(ctx, redisClient, logger, channel, cacheType, handler)
+				return runPubSubLoop(ctx, redisClient, logger, channel, cacheType, handler, signalReady)
 			},
 		)
 
 		reconnectLoop.Run(ctx)
 	}()
 
-	return nil
+	timer := time.NewTimer(subscribeReadyTimeout)
+	defer timer.Stop()
+
+	select {
+	case <-ready:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		logger.Warn().
+			Str(logging.FieldCacheType, cacheType).
+			Dur("waited", subscribeReadyTimeout).
+			Msg("invalidation subscription not confirmed yet; reconnection loop continues in background")
+		return nil
+	}
 }
 
 // runPubSubLoop runs the pub/sub listener until disconnect or error.
@@ -67,6 +91,7 @@ func runPubSubLoop(
 	channel string,
 	cacheType string,
 	handler func(ctx context.Context, payload string) error,
+	signalReady func(),
 ) error {
 	pubsub := redisClient.Subscribe(ctx, channel)
 	defer func() { _ = pubsub.Close() }()
@@ -75,6 +100,7 @@ func runPubSubLoop(
 	if _, err := pubsub.Receive(ctx); err != nil {
 		return fmt.Errorf("failed to subscribe to %s: %w", channel, err)
 	}
+	signalReady()
 
 	logger.Info().
 		Str(logging.FieldCacheType, cacheType).
