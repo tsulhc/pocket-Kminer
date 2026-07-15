@@ -2011,6 +2011,9 @@ func (p *ProxyServer) copyHeaders(dst, src *http.Request) {
 	}
 
 	for _, header := range headersToCopy {
+		if dst.Header.Get(header) != "" {
+			continue
+		}
 		if value := src.Header.Get(header); value != "" {
 			dst.Header.Set(header, value)
 		}

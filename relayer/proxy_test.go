@@ -29,6 +29,30 @@ func TestSendServiceUnavailable(t *testing.T) {
 	assert.Contains(t, w.Body.String(), "develop-http")
 }
 
+func TestCopyHeaders_InnerRequestContentTypeWins(t *testing.T) {
+	p := &ProxyServer{logger: testLogger()}
+
+	dst := httptest.NewRequest(
+		http.MethodPost,
+		"http://backend:8545/",
+		nil,
+	)
+	dst.Header.Set("Content-Type", "application/json")
+
+	src := httptest.NewRequest(
+		http.MethodPost,
+		"http://relayer/service",
+		nil,
+	)
+	src.Header.Set("Content-Type", "application/x-protobuf")
+	src.Header.Set("Accept-Encoding", "gzip")
+
+	p.copyHeaders(dst, src)
+
+	require.Equal(t, "application/json", dst.Header.Get("Content-Type"))
+	require.Equal(t, "gzip", dst.Header.Get("Accept-Encoding"))
+}
+
 // --- HTTP Fast-Fail Pre-Check Tests ---
 
 func TestHTTPFastFail_AllUnhealthy(t *testing.T) {
