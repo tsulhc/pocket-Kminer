@@ -32,6 +32,8 @@ var errBackendMisconfigured = errors.New("backend misconfigured for relay type")
 // Clients (e.g., PATH gateway) call this method with a RelayRequest message.
 const RelayServiceMethodPath = "/pocket.service.RelayService/SendRelay"
 
+const grpcPublishTimeout = 30 * time.Second
+
 // RelayGRPCService implements a gRPC service that properly handles the relay protocol.
 // It receives RelayRequest messages, extracts metadata, forwards to backends, and
 // returns signed RelayResponse messages.
@@ -415,9 +417,12 @@ func (s *RelayGRPCService) handleSendRelay(stream grpc.ServerStream) error {
 				Err(err).
 				Msg("failed to marshal relay request for processing")
 		} else {
+			publishCtx, publishCancel := context.WithTimeout(context.WithoutCancel(ctx), grpcPublishTimeout)
+			defer publishCancel()
+
 			// Process relay (includes difficulty check, cache warming, deduplication, publishing)
 			msg, err := s.relayProcessor.ProcessRelay(
-				ctx,
+				publishCtx,
 				reqBz,
 				respBody,
 				supplierOperatorAddr,
@@ -435,7 +440,7 @@ func (s *RelayGRPCService) handleSendRelay(stream grpc.ServerStream) error {
 			} else if s.publisher == nil {
 				logging.WithSessionContext(s.logger.Warn(), sessionCtx).
 					Msg("gRPC relay processed but publisher is not configured")
-			} else if publishErr := s.publisher.Publish(ctx, msg); publishErr != nil {
+			} else if publishErr := s.publisher.Publish(publishCtx, msg); publishErr != nil {
 				logging.WithSessionContext(s.logger.Warn(), sessionCtx).
 					Err(publishErr).
 					Msg("failed to publish processed gRPC relay")

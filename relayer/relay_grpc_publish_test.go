@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/cosmos/cosmos-sdk/crypto/keys/secp256k1"
 	cryptotypes "github.com/cosmos/cosmos-sdk/crypto/types"
@@ -35,6 +36,8 @@ type recordingProcessor struct {
 	lastReqBody    []byte
 	lastRespBody   []byte
 	lastContextErr error
+	hasDeadline    bool
+	remaining      time.Duration
 	message        *transporttypes.MinedRelayMessage
 	err            error
 }
@@ -46,6 +49,10 @@ func (p *recordingProcessor) ProcessRelay(ctx context.Context, reqBody, respBody
 	p.lastReqBody = append([]byte(nil), reqBody...)
 	p.lastRespBody = append([]byte(nil), respBody...)
 	p.lastContextErr = ctx.Err()
+	if deadline, ok := ctx.Deadline(); ok {
+		p.hasDeadline = true
+		p.remaining = time.Until(deadline)
+	}
 	return p.message, p.err
 }
 
@@ -55,10 +62,10 @@ func (p *recordingProcessor) GetServiceDifficulty(context.Context, string, int64
 
 func (p *recordingProcessor) SetDifficultyProvider(DifficultyProvider) {}
 
-func (p *recordingProcessor) snapshot() (int, []byte, []byte, error) {
+func (p *recordingProcessor) snapshot() (int, []byte, []byte, error, bool, time.Duration) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.calls, append([]byte(nil), p.lastReqBody...), append([]byte(nil), p.lastRespBody...), p.lastContextErr
+	return p.calls, append([]byte(nil), p.lastReqBody...), append([]byte(nil), p.lastRespBody...), p.lastContextErr, p.hasDeadline, p.remaining
 }
 
 type recordingPublisher struct {
@@ -66,6 +73,8 @@ type recordingPublisher struct {
 	calls          int
 	lastMessage    *transporttypes.MinedRelayMessage
 	lastContextErr error
+	hasDeadline    bool
+	remaining      time.Duration
 	publishError   error
 }
 
@@ -75,6 +84,10 @@ func (p *recordingPublisher) Publish(ctx context.Context, message *transporttype
 	p.calls++
 	p.lastMessage = message
 	p.lastContextErr = ctx.Err()
+	if deadline, ok := ctx.Deadline(); ok {
+		p.hasDeadline = true
+		p.remaining = time.Until(deadline)
+	}
 	return p.publishError
 }
 
@@ -84,10 +97,10 @@ func (p *recordingPublisher) PublishBatch(context.Context, []*transporttypes.Min
 
 func (p *recordingPublisher) Close() error { return nil }
 
-func (p *recordingPublisher) snapshot() (int, *transporttypes.MinedRelayMessage, error) {
+func (p *recordingPublisher) snapshot() (int, *transporttypes.MinedRelayMessage, error, bool, time.Duration) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.calls, p.lastMessage, p.lastContextErr
+	return p.calls, p.lastMessage, p.lastContextErr, p.hasDeadline, p.remaining
 }
 
 type mockServerStream struct {
@@ -122,8 +135,15 @@ func (s *mockServerStream) RecvMsg(message interface{}) error {
 }
 
 func newGRPCTestFixture(t *testing.T, statusCode int, body string, processor *recordingProcessor, publisher *recordingPublisher) (*RelayGRPCService, *mockServerStream) {
+	return newGRPCTestFixtureWithDelay(t, statusCode, body, 0, processor, publisher)
+}
+
+func newGRPCTestFixtureWithDelay(t *testing.T, statusCode int, body string, delay time.Duration, processor *recordingProcessor, publisher *recordingPublisher) (*RelayGRPCService, *mockServerStream) {
 	t.Helper()
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if delay > 0 {
+			time.Sleep(delay)
+		}
 		w.WriteHeader(statusCode)
 		_, _ = w.Write([]byte(body))
 	}))
@@ -196,8 +216,8 @@ func TestHandleSendRelay_TransportErrorNotPublished(t *testing.T) {
 	service.getPool = func(string, string) *pool.Pool { return deadPool }
 
 	require.NoError(t, service.handleSendRelay(stream))
-	calls, _, _, _ := processor.snapshot()
-	publishCalls, _, _ := publisher.snapshot()
+	calls, _, _, _, _, _ := processor.snapshot()
+	publishCalls, _, _, _, _ := publisher.snapshot()
 	require.Zero(t, calls)
 	require.Zero(t, publishCalls)
 	require.Len(t, stream.sent, 1)
@@ -210,8 +230,8 @@ func TestHandleSendRelay_SuccessMinesRawBackendBody(t *testing.T) {
 	service, stream := newGRPCTestFixture(t, http.StatusOK, body, processor, publisher)
 
 	require.NoError(t, service.handleSendRelay(stream))
-	calls, reqBody, respBody, contextErr := processor.snapshot()
-	publishCalls, _, _ := publisher.snapshot()
+	calls, reqBody, respBody, contextErr, _, _ := processor.snapshot()
+	publishCalls, _, _, _, _ := publisher.snapshot()
 	require.Equal(t, 1, calls)
 	require.Equal(t, body, string(respBody))
 	require.NoError(t, contextErr)
@@ -228,8 +248,8 @@ func TestHandleSendRelay_Backend4xxWithBodyIsPublished(t *testing.T) {
 	service, stream := newGRPCTestFixture(t, http.StatusBadRequest, body, processor, publisher)
 
 	require.NoError(t, service.handleSendRelay(stream))
-	_, _, respBody, _ := processor.snapshot()
-	publishCalls, _, _ := publisher.snapshot()
+	_, _, respBody, _, _, _ := processor.snapshot()
+	publishCalls, _, _, _, _ := publisher.snapshot()
 	require.Equal(t, body, string(respBody))
 	require.Equal(t, 1, publishCalls)
 }
@@ -242,8 +262,8 @@ func TestHandleSendRelay_Backend5xxNotPublished(t *testing.T) {
 	err := service.handleSendRelay(stream)
 	require.Error(t, err)
 	require.Equal(t, codes.Unavailable, status.Code(err))
-	calls, _, _, _ := processor.snapshot()
-	publishCalls, _, _ := publisher.snapshot()
+	calls, _, _, _, _, _ := processor.snapshot()
+	publishCalls, _, _, _, _ := publisher.snapshot()
 	require.Zero(t, calls)
 	require.Zero(t, publishCalls)
 }
@@ -254,8 +274,8 @@ func TestHandleSendRelay_NotApplicableNotPublished(t *testing.T) {
 	service, stream := newGRPCTestFixture(t, http.StatusOK, "ok", processor, publisher)
 
 	require.NoError(t, service.handleSendRelay(stream))
-	calls, _, _, _ := processor.snapshot()
-	publishCalls, _, _ := publisher.snapshot()
+	calls, _, _, _, _, _ := processor.snapshot()
+	publishCalls, _, _, _, _ := publisher.snapshot()
 	require.Equal(t, 1, calls)
 	require.Zero(t, publishCalls)
 }
@@ -265,7 +285,7 @@ func TestHandleSendRelay_NilPublisherDoesNotPanic(t *testing.T) {
 	service, stream := newGRPCTestFixture(t, http.StatusOK, "ok", processor, nil)
 
 	require.NoError(t, service.handleSendRelay(stream))
-	calls, _, _, _ := processor.snapshot()
+	calls, _, _, _, _, _ := processor.snapshot()
 	require.Equal(t, 1, calls)
 }
 
@@ -275,9 +295,48 @@ func TestHandleSendRelay_PublishFailureDoesNotChangeServedResponse(t *testing.T)
 	service, stream := newGRPCTestFixture(t, http.StatusOK, "ok", processor, publisher)
 
 	require.NoError(t, service.handleSendRelay(stream))
-	publishCalls, _, _ := publisher.snapshot()
+	publishCalls, _, _, _, _ := publisher.snapshot()
 	require.Equal(t, 1, publishCalls)
 	require.Len(t, stream.sent, 1)
+}
+
+func TestHandleSendRelay_PublishBudgetFreshAfterSlowBackend(t *testing.T) {
+	processor := &recordingProcessor{message: &transporttypes.MinedRelayMessage{}}
+	publisher := &recordingPublisher{}
+	service, stream := newGRPCTestFixtureWithDelay(t, http.StatusOK, "ok", 300*time.Millisecond, processor, publisher)
+
+	require.NoError(t, service.handleSendRelay(stream))
+	_, _, _, _, hasDeadline, remaining := processor.snapshot()
+	require.True(t, hasDeadline)
+	require.Greater(t, remaining, grpcPublishTimeout-100*time.Millisecond)
+}
+
+func TestHandleSendRelay_ClientCancelAfterResponseStillPublishes(t *testing.T) {
+	processor := &recordingProcessor{message: &transporttypes.MinedRelayMessage{}}
+	publisher := &recordingPublisher{}
+	service, stream := newGRPCTestFixture(t, http.StatusOK, "ok", processor, publisher)
+	parentCtx, cancel := context.WithCancel(stream.ctx)
+	stream.ctx = parentCtx
+	stream.onSend = cancel
+
+	require.NoError(t, service.handleSendRelay(stream))
+	_, _, _, processorContextErr, _, _ := processor.snapshot()
+	publishCalls, _, publisherContextErr, _, _ := publisher.snapshot()
+	require.NoError(t, processorContextErr)
+	require.Equal(t, 1, publishCalls)
+	require.NoError(t, publisherContextErr)
+}
+
+func TestHandleSendRelay_PublishContextHasDeadline(t *testing.T) {
+	processor := &recordingProcessor{message: &transporttypes.MinedRelayMessage{}}
+	publisher := &recordingPublisher{}
+	service, stream := newGRPCTestFixture(t, http.StatusOK, "ok", processor, publisher)
+
+	require.NoError(t, service.handleSendRelay(stream))
+	_, _, _, _, processorHasDeadline, _ := processor.snapshot()
+	_, _, _, publisherHasDeadline, _ := publisher.snapshot()
+	require.True(t, processorHasDeadline)
+	require.True(t, publisherHasDeadline)
 }
 
 var _ grpc.ServerStream = (*mockServerStream)(nil)
