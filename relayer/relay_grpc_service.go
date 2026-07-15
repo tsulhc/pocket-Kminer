@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -16,6 +17,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	_ "google.golang.org/grpc/encoding/gzip" // Register gzip compressor for grpc-encoding: gzip
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	"github.com/pokt-network/pocket-relay-miner/logging"
@@ -23,6 +25,8 @@ import (
 	"github.com/pokt-network/pocket-relay-miner/transport"
 	servicetypes "github.com/pokt-network/poktroll/x/service/types"
 )
+
+var errBackendMisconfigured = errors.New("backend misconfigured for relay type")
 
 // RelayServiceMethodPath is the gRPC method path for the relay service.
 // Clients (e.g., PATH gateway) call this method with a RelayRequest message.
@@ -40,7 +44,8 @@ type RelayGRPCService struct {
 	relayPipeline  *RelayPipeline // Unified relay processing pipeline
 
 	// Function to get HTTP client for a service (supports per-service timeout profiles)
-	getHTTPClient func(serviceID string) *http.Client
+	getHTTPClient  func(serviceID string) *http.Client
+	grpcHTTPClient *http.Client
 
 	// Function to get service timeout (from timeout profile)
 	getServiceTimeout func(serviceID string) time.Duration
@@ -124,6 +129,17 @@ func NewRelayGRPCService(logger logging.Logger, config RelayGRPCServiceConfig) *
 		bufferPool = NewBufferPool(maxBodySize)
 	}
 
+	grpcTransport := &http.Transport{}
+	grpcTransport.Protocols = new(http.Protocols)
+	grpcTransport.Protocols.SetUnencryptedHTTP2(true)
+	grpcTransport.Protocols.SetHTTP1(false)
+	grpcHTTPClient := &http.Client{
+		Transport: grpcTransport,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
 	return &RelayGRPCService{
 		logger:             logger.With().Str(logging.FieldComponent, "grpc_relay_service").Logger(),
 		serviceConfigs:     config.ServiceConfigs,
@@ -135,6 +151,7 @@ func NewRelayGRPCService(logger logging.Logger, config RelayGRPCServiceConfig) *
 		maxBodySize:        maxBodySize,
 		bufferPool:         bufferPool,
 		getHTTPClient:      getHTTPClient,
+		grpcHTTPClient:     grpcHTTPClient,
 		getServiceTimeout:  getServiceTimeout,
 		getPool:            config.GetPool,
 		getBackendConfig:   config.GetBackendConfig,
@@ -147,6 +164,26 @@ func (s *RelayGRPCService) RegisterWithServer(server *grpc.Server) {
 	// Note: We use UnknownServiceHandler in the server options instead of registering here.
 	// This is because we're handling a dynamically defined service.
 	s.logger.Info().Msg("relay gRPC service registered")
+}
+
+func resolveGRPCRelayRPCType(md metadata.MD, poktReq *sdktypes.POKTHTTPRequest, svcConfig *ServiceConfig) string {
+	for _, value := range md.Get("rpc-type") {
+		if value != "" {
+			return RPCTypeToBackendType(value)
+		}
+	}
+
+	if poktReq != nil && poktReq.Header != nil {
+		if contentType, ok := poktReq.Header["Content-Type"]; ok && len(contentType.Values) > 0 && strings.HasPrefix(contentType.Values[0], "application/grpc") {
+			return BackendTypeGRPC
+		}
+	}
+
+	if svcConfig != nil && svcConfig.DefaultBackend != "" {
+		return RPCTypeToBackendType(svcConfig.DefaultBackend)
+	}
+
+	return DefaultBackendType
 }
 
 // HandleUnknownService is a gRPC stream handler that processes relay requests.
@@ -283,15 +320,8 @@ func (s *RelayGRPCService) handleSendRelay(stream grpc.ServerStream) error {
 		Msg("deserialized POKTHTTPRequest from relay payload")
 
 	// Resolve backend via pool-based API for circuit breaker integration.
-	// Determine RPC type for pool lookup (same logic as forwardToBackend).
-	grpcRPCType := "rest"
-	if poktHTTPRequest.Header != nil {
-		if ctHeader, ok := poktHTTPRequest.Header["Content-Type"]; ok && len(ctHeader.Values) > 0 {
-			if strings.HasPrefix(ctHeader.Values[0], "application/grpc") {
-				grpcRPCType = "grpc"
-			}
-		}
-	}
+	md, _ := metadata.FromIncomingContext(ctx)
+	grpcRPCType := resolveGRPCRelayRPCType(md, poktHTTPRequest, &svcConfig)
 
 	var grpcEndpoint *pool.BackendEndpoint
 	var grpcPool *pool.Pool
@@ -310,10 +340,10 @@ func (s *RelayGRPCService) handleSendRelay(stream grpc.ServerStream) error {
 	grpcEndpoint = grpcPool.Next()
 
 	// Forward request to backend and get response
-	respBody, respHeaders, respStatus, err := s.forwardToBackend(ctx, serviceID, &svcConfig, poktHTTPRequest, grpcEndpoint)
+	respBody, respHeaders, respStatus, err := s.forwardToBackend(ctx, serviceID, &svcConfig, poktHTTPRequest, grpcEndpoint, grpcRPCType)
 
 	// Record result for circuit breaker (covers both success and error paths)
-	if grpcEndpoint != nil && grpcPool != nil {
+	if grpcEndpoint != nil && grpcPool != nil && !errors.Is(err, errBackendMisconfigured) {
 		threshold := s.getCircuitBreakerThreshold(serviceID, grpcRPCType)
 		transition := grpcPool.RecordResult(grpcEndpoint, respStatus, err, threshold)
 		if transition != nil {
@@ -452,24 +482,44 @@ func (s *RelayGRPCService) handleSendRelay(stream grpc.ServerStream) error {
 // forwardToBackend forwards the request to the appropriate backend service.
 // If endpoint is non-nil, its URL is used for backend selection (pool-based).
 // Otherwise, falls back to config-based URL lookup (legacy path).
+func normalizeBackendURLForRPCType(backendURL, rpcType string) (string, error) {
+	if backendURL == "" {
+		return "", fmt.Errorf("%w: no backend configured for rpc type %q", errBackendMisconfigured, rpcType)
+	}
+	if rpcType == BackendTypeGRPC && !strings.Contains(backendURL, "://") {
+		backendURL = "http://" + backendURL
+	}
+	parsed, err := url.Parse(backendURL)
+	if err != nil {
+		return "", fmt.Errorf("%w: failed to parse backend URL: %w", errBackendMisconfigured, err)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return "", fmt.Errorf("%w: backend scheme %q is not dialable for rpc type %q", errBackendMisconfigured, parsed.Scheme, rpcType)
+	}
+	return backendURL, nil
+}
+
+func mergeTrailersIntoHeader(header, trailer http.Header) http.Header {
+	if len(trailer) == 0 {
+		return header
+	}
+	merged := header.Clone()
+	for key, values := range trailer {
+		for _, value := range values {
+			merged.Add(key, value)
+		}
+	}
+	return merged
+}
+
 func (s *RelayGRPCService) forwardToBackend(
 	ctx context.Context,
 	serviceID string,
 	svcConfig *ServiceConfig,
 	poktHTTPRequest *sdktypes.POKTHTTPRequest,
 	endpoint *pool.BackendEndpoint,
+	rpcType string,
 ) ([]byte, http.Header, int, error) {
-	// Determine RPC type from content-type or use default
-	rpcType := "rest"
-	if poktHTTPRequest.Header != nil {
-		if ctHeader, ok := poktHTTPRequest.Header["Content-Type"]; ok && len(ctHeader.Values) > 0 {
-			contentType := ctHeader.Values[0]
-			if strings.HasPrefix(contentType, "application/grpc") {
-				rpcType = "grpc"
-			}
-		}
-	}
-
 	// Find the backend configuration
 	var backendURL string
 	var configHeaders map[string]string
@@ -487,26 +537,11 @@ func (s *RelayGRPCService) forwardToBackend(
 		}
 		configHeaders = backend.Headers
 		auth = backend.Authentication
-	} else if backend, ok := svcConfig.Backends["rest"]; ok {
-		if backendURL == "" {
-			backendURL = backend.URL
-		}
-		configHeaders = backend.Headers
-		auth = backend.Authentication
-	} else {
-		// Use any available backend
-		for _, backend := range svcConfig.Backends {
-			if backendURL == "" {
-				backendURL = backend.URL
-			}
-			configHeaders = backend.Headers
-			auth = backend.Authentication
-			break
-		}
 	}
 
-	if backendURL == "" {
-		return nil, nil, 0, fmt.Errorf("no backend configured for service %s", serviceID)
+	backendURL, err := normalizeBackendURLForRPCType(backendURL, rpcType)
+	if err != nil {
+		return nil, nil, 0, err
 	}
 
 	// Build the request URL
@@ -564,6 +599,9 @@ func (s *RelayGRPCService) forwardToBackend(
 
 	// Execute request using service-specific HTTP client
 	client := s.getHTTPClient(serviceID)
+	if rpcType == BackendTypeGRPC {
+		client = s.grpcHTTPClient
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, nil, 0, fmt.Errorf("request failed: %w", err)
@@ -577,7 +615,7 @@ func (s *RelayGRPCService) forwardToBackend(
 		return nil, nil, 0, fmt.Errorf("failed to read response: %w", err)
 	}
 
-	return respBody, resp.Header, resp.StatusCode, nil
+	return respBody, mergeTrailersIntoHeader(resp.Header, resp.Trailer), resp.StatusCode, nil
 }
 
 // getCircuitBreakerThreshold returns the unhealthy threshold for circuit breaker evaluation.
