@@ -102,11 +102,18 @@ func TestForwardToBackend_MisconfigDoesNotHitNetwork(t *testing.T) {
 }
 
 func TestForwardToBackend_GRPCBackendViaH2C(t *testing.T) {
+	type observation struct {
+		proto       string
+		contentType string
+	}
+	observed := make(chan observation, 1)
 	server := httptest.NewUnstartedServer(h2c.NewHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		require.Equal(t, "HTTP/2.0", r.Proto)
+		observed <- observation{proto: r.Proto, contentType: r.Header.Get("Content-Type")}
+		w.Header().Set("Trailer", "Grpc-Status")
 		w.Header().Set("Content-Type", "application/grpc")
-		w.Header().Set("Grpc-Status", "0")
+		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("grpc-body"))
+		w.Header().Set("Grpc-Status", "0")
 	}), &http2.Server{}))
 	server.Start()
 	t.Cleanup(server.Close)
@@ -122,7 +129,12 @@ func TestForwardToBackend_GRPCBackendViaH2C(t *testing.T) {
 		context.Background(),
 		"svc",
 		&ServiceConfig{Backends: map[string]BackendConfig{BackendTypeGRPC: {URL: server.URL}}},
-		&sdktypes.POKTHTTPRequest{Method: http.MethodPost, Url: "http://relay/", BodyBz: []byte("request")},
+		&sdktypes.POKTHTTPRequest{
+			Method: http.MethodPost,
+			Url:    "http://relay/",
+			Header: map[string]*sdktypes.Header{"Content-Type": {Values: []string{"application/grpc"}}},
+			BodyBz: []byte("request"),
+		},
 		ep,
 		BackendTypeGRPC,
 	)
@@ -130,6 +142,57 @@ func TestForwardToBackend_GRPCBackendViaH2C(t *testing.T) {
 	require.Equal(t, http.StatusOK, statusCode)
 	require.Equal(t, []byte("grpc-body"), body)
 	require.Equal(t, "0", headers.Get("Grpc-Status"))
+	select {
+	case got := <-observed:
+		require.Equal(t, "HTTP/2.0", got.proto)
+		require.Equal(t, "application/grpc", got.contentType)
+	default:
+		t.Fatal("backend observation was not recorded")
+	}
+}
+
+func TestMergeTrailersIntoHeader_NilHeader(t *testing.T) {
+	merged := mergeTrailersIntoHeader(nil, http.Header{"Grpc-Status": []string{"0"}})
+	require.Equal(t, "0", merged.Get("Grpc-Status"))
+}
+
+func TestForwardToBackend_FallbackPoolUsesFallbackBackendConfig(t *testing.T) {
+	var requests int
+	var receivedHeader string
+	var receivedAuth string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		receivedHeader = r.Header.Get("X-Fallback")
+		receivedAuth = r.Header.Get("Authorization")
+		_, _ = w.Write([]byte("ok"))
+	}))
+	t.Cleanup(server.Close)
+
+	endpoint, err := pool.NewBackendEndpoint("fallback", server.URL)
+	require.NoError(t, err)
+	service := &RelayGRPCService{
+		bufferPool:    NewBufferPool(1024),
+		getHTTPClient: func(string) *http.Client { return http.DefaultClient },
+	}
+
+	body, _, _, err := service.forwardToBackend(
+		context.Background(),
+		"svc",
+		&ServiceConfig{Backends: map[string]BackendConfig{
+			BackendTypeJSONRPC: {
+				Headers:        map[string]string{"X-Fallback": "selected"},
+				Authentication: &AuthenticationConfig{BearerToken: "fallback-token"},
+			},
+		}},
+		&sdktypes.POKTHTTPRequest{Method: http.MethodPost, Url: "http://relay/", BodyBz: []byte("request")},
+		endpoint,
+		BackendTypeREST,
+	)
+	require.NoError(t, err)
+	require.Equal(t, []byte("ok"), body)
+	require.Equal(t, 1, requests)
+	require.Equal(t, "selected", receivedHeader)
+	require.Equal(t, "Bearer fallback-token", receivedAuth)
 }
 
 type roundTripFunc func(*http.Request) (*http.Response, error)

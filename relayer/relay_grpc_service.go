@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -489,12 +490,47 @@ func mergeTrailersIntoHeader(header, trailer http.Header) http.Header {
 		return header
 	}
 	merged := header.Clone()
+	if merged == nil {
+		merged = make(http.Header, len(trailer))
+	}
 	for key, values := range trailer {
 		for _, value := range values {
 			merged.Add(key, value)
 		}
 	}
 	return merged
+}
+
+func fallbackBackendConfig(svcConfig *ServiceConfig, rpcType string) *BackendConfig {
+	if svcConfig == nil {
+		return nil
+	}
+	candidates := []string{rpcType, svcConfig.DefaultBackend, BackendTypeJSONRPC, BackendTypeREST}
+	seen := make(map[string]struct{}, len(candidates))
+	for _, candidate := range candidates {
+		if candidate == "" {
+			continue
+		}
+		if _, ok := seen[candidate]; ok {
+			continue
+		}
+		seen[candidate] = struct{}{}
+		if backend, ok := svcConfig.Backends[candidate]; ok {
+			config := backend
+			return &config
+		}
+	}
+
+	keys := make([]string, 0, len(svcConfig.Backends))
+	for key := range svcConfig.Backends {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	if len(keys) > 0 {
+		config := svcConfig.Backends[keys[0]]
+		return &config
+	}
+	return nil
 }
 
 func (s *RelayGRPCService) forwardToBackend(
@@ -509,6 +545,7 @@ func (s *RelayGRPCService) forwardToBackend(
 	var backendURL string
 	var configHeaders map[string]string
 	var auth *AuthenticationConfig
+	var backendConfig *BackendConfig
 
 	// Use pool endpoint URL if available (circuit breaker integration)
 	if endpoint != nil {
@@ -516,12 +553,18 @@ func (s *RelayGRPCService) forwardToBackend(
 	}
 
 	// Get headers and auth from backend config (always needed regardless of pool usage)
-	if backend, ok := svcConfig.Backends[rpcType]; ok {
+	if s.getBackendConfig != nil {
+		backendConfig = s.getBackendConfig(serviceID, rpcType)
+	}
+	if backendConfig == nil {
+		backendConfig = fallbackBackendConfig(svcConfig, rpcType)
+	}
+	if backendConfig != nil {
 		if backendURL == "" {
-			backendURL = backend.URL
+			backendURL = backendConfig.URL
 		}
-		configHeaders = backend.Headers
-		auth = backend.Authentication
+		configHeaders = backendConfig.Headers
+		auth = backendConfig.Authentication
 	}
 
 	backendURL, err := normalizeBackendURLForRPCType(backendURL, rpcType)
