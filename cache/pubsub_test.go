@@ -75,3 +75,32 @@ func TestSubscribeToInvalidations_ContextCanceledWhileWaiting(t *testing.T) {
 	})
 	require.ErrorIs(t, err, context.Canceled)
 }
+
+func TestSubscribeToInvalidations_TimeoutReturnsNil(t *testing.T) {
+	previousTimeout := subscribeReadyTimeout
+	subscribeReadyTimeout = 25 * time.Millisecond
+	t.Cleanup(func() { subscribeReadyTimeout = previousTimeout })
+
+	mr, err := miniredis.Run()
+	require.NoError(t, err)
+	client, err := redisutil.NewClient(context.Background(), redisutil.ClientConfig{
+		URL: fmt.Sprintf("redis://%s", mr.Addr()),
+	})
+	require.NoError(t, err)
+	mr.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(func() {
+		cancel()
+		_ = client.Close()
+	})
+
+	started := time.Now()
+	logger := logging.NewLoggerFromConfig(logging.DefaultConfig())
+	err = SubscribeToInvalidations(ctx, client, logger, "service", func(context.Context, string) error {
+		return nil
+	})
+	require.NoError(t, err)
+	require.Less(t, time.Since(started), time.Second)
+	cancel()
+}
