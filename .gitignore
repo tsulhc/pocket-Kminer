@@ -37,3 +37,6 @@ scripts/localonly/
 
 # GSD Planning
 .planning
+
+# Local tooling state
+.cortexkit/
