@@ -373,30 +373,6 @@ func (s *RelayGRPCService) handleSendRelay(stream grpc.ServerStream) error {
 			return status.Errorf(codes.Internal, "failed to send error response: %v", sendErr)
 		}
 
-		// Still publish the error relay for tracking (even failed ones)
-		if s.relayProcessor != nil {
-			reqBz, marshalErr := relayRequest.Marshal()
-			if marshalErr == nil {
-				respBz, marshalErr := relayResponse.Marshal()
-				if marshalErr == nil {
-					// Process error relay (still subject to difficulty check)
-					_, processErr := s.relayProcessor.ProcessRelay(
-						ctx,
-						reqBz,
-						respBz,
-						supplierOperatorAddr,
-						serviceID,
-						arrivalHeight,
-					)
-					if processErr != nil {
-						logging.WithSessionContext(s.logger.Debug(), sessionCtx).
-							Err(processErr).
-							Msg("failed to process error relay")
-					}
-				}
-			}
-		}
-
 		return nil
 	}
 
@@ -439,13 +415,11 @@ func (s *RelayGRPCService) handleSendRelay(stream grpc.ServerStream) error {
 				Err(err).
 				Msg("failed to marshal relay request for processing")
 		} else {
-			respBz := relayResponseBz // Already marshaled above
-
 			// Process relay (includes difficulty check, cache warming, deduplication, publishing)
 			msg, err := s.relayProcessor.ProcessRelay(
 				ctx,
 				reqBz,
-				respBz,
+				respBody,
 				supplierOperatorAddr,
 				serviceID,
 				arrivalHeight,
@@ -458,8 +432,14 @@ func (s *RelayGRPCService) handleSendRelay(stream grpc.ServerStream) error {
 				// Relay didn't meet mining difficulty
 				logging.WithSessionContext(s.logger.Debug(), sessionCtx).
 					Msg("gRPC relay skipped (did not meet mining difficulty)")
+			} else if s.publisher == nil {
+				logging.WithSessionContext(s.logger.Warn(), sessionCtx).
+					Msg("gRPC relay processed but publisher is not configured")
+			} else if publishErr := s.publisher.Publish(ctx, msg); publishErr != nil {
+				logging.WithSessionContext(s.logger.Warn(), sessionCtx).
+					Err(publishErr).
+					Msg("failed to publish processed gRPC relay")
 			} else {
-				// Relay was successfully processed and published
 				logging.WithSessionContext(s.logger.Debug(), sessionCtx).
 					Msg("gRPC relay processed and published")
 				grpcRelaysPublished.WithLabelValues(serviceID).Inc()
