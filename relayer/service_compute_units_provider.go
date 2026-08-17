@@ -7,27 +7,25 @@ import (
 	"github.com/pokt-network/pocket-relay-miner/logging"
 )
 
-// serviceComputeUnitsLookupTimeout bounds the cache lookup on the relay hot
-// path. L1 (xsync) hits return in well under a microsecond; this timeout only
-// applies on a cold L1/L2 that must fall through to an L3 chain query.
+// serviceComputeUnitsLookupTimeout bounds a CUPR lookup on the relay hot path.
 const serviceComputeUnitsLookupTimeout = 5 * time.Second
 
-// serviceCacheComputeUnitsProvider adapts the orchestrator-refreshed ServiceCache
-// (L1 -> L2 -> L3 with pub/sub invalidation) into a ServiceComputeUnitsProvider.
-//
-// The value it returns becomes MinedRelayMessage.ComputeUnitsPerRelay, which the
-// miner uses verbatim as the SMST leaf weight (the claimed compute units). Reading
-// it from the SAME refreshed cache the RelayMeter already consumes means an
-// on-chain compute_units_per_relay change is picked up within the orchestrator's
-// refresh/invalidation window — instead of being frozen for the process lifetime,
-// which is what the previous sync.Map-backed provider did.
+// ServiceCUPRAtHeightQueryClient resolves the compute_units_per_relay that was
+// effective for a service at a block height.
+type ServiceCUPRAtHeightQueryClient interface {
+	GetServiceComputeUnitsPerRelayAtHeight(ctx context.Context, serviceID string, blockHeight int64) (uint64, error)
+}
+
+// serviceCacheComputeUnitsProvider pins CUPR to the relay's session start when
+// the backing cache exposes a height-aware query, and degrades to the refreshed
+// live cache when connected to a pre-v0.1.35 node or on query failure.
 type serviceCacheComputeUnitsProvider struct {
 	logger logging.Logger
 	cache  ServiceCache
 }
 
-// NewServiceCacheComputeUnitsProvider builds a compute-units provider backed by
-// the refreshed service cache.
+// NewServiceCacheComputeUnitsProvider keeps the existing fork wiring: the cache
+// itself exposes the optional at-height query through a narrow interface.
 func NewServiceCacheComputeUnitsProvider(logger logging.Logger, cache ServiceCache) ServiceComputeUnitsProvider {
 	return &serviceCacheComputeUnitsProvider{
 		logger: logging.ForComponent(logger, logging.ComponentRelayProcessor),
@@ -35,21 +33,47 @@ func NewServiceCacheComputeUnitsProvider(logger logging.Logger, cache ServiceCac
 	}
 }
 
-// GetServiceComputeUnits returns the compute units per relay for a service,
-// reading the refreshed service cache. It floors to 1 on any error or a zero
-// value so cost/claim math never divides by or multiplies against zero.
-func (p *serviceCacheComputeUnitsProvider) GetServiceComputeUnits(serviceID string) uint64 {
+// GetServiceComputeUnits returns CUPR at sessionStartHeight when available.
+// Errors deliberately fail open to the live cache so a v0.1.34 node continues
+// serving unchanged while the query layer periodically re-probes v0.1.35 support.
+func (p *serviceCacheComputeUnitsProvider) GetServiceComputeUnits(
+	ctx context.Context,
+	serviceID string,
+	sessionStartHeight int64,
+) uint64 {
 	if p.cache == nil {
 		return 1
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), serviceComputeUnitsLookupTimeout)
+	if sessionStartHeight > 0 {
+		if queryClient, ok := p.cache.(ServiceCUPRAtHeightQueryClient); ok {
+			queryCtx, cancel := context.WithTimeout(ctx, serviceComputeUnitsLookupTimeout)
+			computeUnits, err := queryClient.GetServiceComputeUnitsPerRelayAtHeight(queryCtx, serviceID, sessionStartHeight)
+			cancel()
+			if err == nil {
+				if computeUnits == 0 {
+					return 1
+				}
+				return computeUnits
+			}
+
+			p.logger.Debug().
+				Err(err).
+				Str(logging.FieldServiceID, serviceID).
+				Int64("session_start_height", sessionStartHeight).
+				Msg("session-start CUPR unavailable, falling back to live service cache")
+		}
+	}
+
+	return p.liveComputeUnits(ctx, serviceID)
+}
+
+func (p *serviceCacheComputeUnitsProvider) liveComputeUnits(ctx context.Context, serviceID string) uint64 {
+	lookupCtx, cancel := context.WithTimeout(ctx, serviceComputeUnitsLookupTimeout)
 	defer cancel()
 
-	service, err := p.cache.Get(ctx, serviceID)
+	service, err := p.cache.Get(lookupCtx, serviceID)
 	if err != nil {
-		// Hot path: keep this at Debug. A miss falls back to 1 CU; miners keep
-		// the cache warm, so this should be rare in steady state.
 		p.logger.Debug().
 			Err(err).
 			Str(logging.FieldServiceID, serviceID).
@@ -61,6 +85,5 @@ func (p *serviceCacheComputeUnitsProvider) GetServiceComputeUnits(serviceID stri
 	if computeUnits == 0 {
 		return 1
 	}
-
 	return computeUnits
 }
