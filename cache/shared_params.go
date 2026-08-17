@@ -225,7 +225,7 @@ func (c *RedisSharedParamCache) queryAndCacheParams(ctx context.Context, height 
 		chainQueries.WithLabelValues("shared_params").Inc()
 		chainStart := time.Now()
 
-		params, queryErr := c.sharedClient.GetParams(ctx)
+		params, queryErr := c.sharedClient.GetParamsAtHeight(ctx, height)
 		chainQueryLatency.WithLabelValues("shared_params").Observe(time.Since(chainStart).Seconds())
 
 		if queryErr != nil {
@@ -263,7 +263,7 @@ func (c *RedisSharedParamCache) queryAndCacheParams(ctx context.Context, height 
 	}
 
 	// Still not available - query chain directly
-	params, fallbackErr := c.sharedClient.GetParams(ctx)
+	params, fallbackErr := c.sharedClient.GetParamsAtHeight(ctx, height)
 	if fallbackErr != nil {
 		chainQueryErrors.WithLabelValues("shared_params").Inc()
 		return nil, fmt.Errorf("failed to query chain: %w", fallbackErr)
