@@ -20,16 +20,18 @@ type ServiceCUPRAtHeightQueryClient interface {
 // the backing cache exposes a height-aware query, and degrades to the refreshed
 // live cache when connected to a pre-v0.1.35 node or on query failure.
 type serviceCacheComputeUnitsProvider struct {
-	logger logging.Logger
-	cache  ServiceCache
+	logger      logging.Logger
+	cache       ServiceCache
+	queryClient ServiceCUPRAtHeightQueryClient
 }
 
 // NewServiceCacheComputeUnitsProvider keeps the existing fork wiring: the cache
 // itself exposes the optional at-height query through a narrow interface.
-func NewServiceCacheComputeUnitsProvider(logger logging.Logger, cache ServiceCache) ServiceComputeUnitsProvider {
+func NewServiceCacheComputeUnitsProvider(logger logging.Logger, cache ServiceCache, queryClient ServiceCUPRAtHeightQueryClient) ServiceComputeUnitsProvider {
 	return &serviceCacheComputeUnitsProvider{
-		logger: logging.ForComponent(logger, logging.ComponentRelayProcessor),
-		cache:  cache,
+		logger:      logging.ForComponent(logger, logging.ComponentRelayProcessor),
+		cache:       cache,
+		queryClient: queryClient,
 	}
 }
 
@@ -45,24 +47,22 @@ func (p *serviceCacheComputeUnitsProvider) GetServiceComputeUnits(
 		return 1
 	}
 
-	if sessionStartHeight > 0 {
-		if queryClient, ok := p.cache.(ServiceCUPRAtHeightQueryClient); ok {
-			queryCtx, cancel := context.WithTimeout(ctx, serviceComputeUnitsLookupTimeout)
-			computeUnits, err := queryClient.GetServiceComputeUnitsPerRelayAtHeight(queryCtx, serviceID, sessionStartHeight)
-			cancel()
-			if err == nil {
-				if computeUnits == 0 {
-					return 1
-				}
-				return computeUnits
+	if sessionStartHeight > 0 && p.queryClient != nil {
+		queryCtx, cancel := context.WithTimeout(ctx, serviceComputeUnitsLookupTimeout)
+		computeUnits, err := p.queryClient.GetServiceComputeUnitsPerRelayAtHeight(queryCtx, serviceID, sessionStartHeight)
+		cancel()
+		if err == nil {
+			if computeUnits == 0 {
+				return 1
 			}
-
-			p.logger.Debug().
-				Err(err).
-				Str(logging.FieldServiceID, serviceID).
-				Int64("session_start_height", sessionStartHeight).
-				Msg("session-start CUPR unavailable, falling back to live service cache")
+			return computeUnits
 		}
+
+		p.logger.Debug().
+			Err(err).
+			Str(logging.FieldServiceID, serviceID).
+			Int64("session_start_height", sessionStartHeight).
+			Msg("session-start CUPR unavailable, falling back to live service cache")
 	}
 
 	return p.liveComputeUnits(ctx, serviceID)

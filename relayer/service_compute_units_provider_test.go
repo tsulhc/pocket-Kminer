@@ -37,7 +37,7 @@ func TestServiceCacheComputeUnitsProvider_UsesSessionStartCUPR(t *testing.T) {
 		svc:      &sharedtypes.Service{Id: "seda", ComputeUnitsPerRelay: 6312},
 		atHeight: 6276,
 	}
-	p := NewServiceCacheComputeUnitsProvider(culog(), fc)
+	p := NewServiceCacheComputeUnitsProvider(culog(), fc, fc)
 
 	require.Equal(t, uint64(6276), p.GetServiceComputeUnits(context.Background(), "seda", 100))
 }
@@ -47,21 +47,21 @@ func TestServiceCacheComputeUnitsProvider_FallsBackToLiveOnAtHeightError(t *test
 		svc:       &sharedtypes.Service{Id: "seda", ComputeUnitsPerRelay: 6312},
 		heightErr: errors.New("unimplemented"),
 	}
-	p := NewServiceCacheComputeUnitsProvider(culog(), fc)
+	p := NewServiceCacheComputeUnitsProvider(culog(), fc, fc)
 
 	require.Equal(t, uint64(6312), p.GetServiceComputeUnits(context.Background(), "seda", 100))
 }
 
 func TestServiceCacheComputeUnitsProvider_DefaultsToOneOnLiveError(t *testing.T) {
 	fc := &fakeServiceCache{err: errors.New("service not found"), heightErr: errors.New("unimplemented")}
-	p := NewServiceCacheComputeUnitsProvider(culog(), fc)
+	p := NewServiceCacheComputeUnitsProvider(culog(), fc, fc)
 
 	require.Equal(t, uint64(1), p.GetServiceComputeUnits(context.Background(), "unknown", 100))
 }
 
 func TestServiceCacheComputeUnitsProvider_DefaultsToOneOnZero(t *testing.T) {
 	fc := &fakeServiceCache{svc: &sharedtypes.Service{Id: "seda", ComputeUnitsPerRelay: 0}, heightErr: errors.New("unimplemented")}
-	p := NewServiceCacheComputeUnitsProvider(culog(), fc)
+	p := NewServiceCacheComputeUnitsProvider(culog(), fc, fc)
 
 	require.Equal(t, uint64(1), p.GetServiceComputeUnits(context.Background(), "seda", 100))
 }

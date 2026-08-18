@@ -2,26 +2,39 @@
 
 package miner
 
-import "testing"
+import (
+	"context"
+	"errors"
+	"testing"
 
-func TestIsClaimCUPRConsistent_FailsOpenUntilHeightAwareGuardIsWired(t *testing.T) {
-	tests := []struct {
-		name    string
-		smstSum uint64
-		smstCnt uint64
-		cupr    uint64
-	}{
-		{name: "uniform CUPR", smstSum: 1783 * 6312, smstCnt: 1783, cupr: 6312},
-		{name: "mixed weights", smstSum: 11190188, smstCnt: 1783, cupr: 6312},
-		{name: "old tree against changed live CUPR", smstSum: 1783 * 6276, smstCnt: 1783, cupr: 6312},
-		{name: "unknown CUPR", smstSum: 1783 * 6276, smstCnt: 1783, cupr: 0},
-	}
+	"github.com/stretchr/testify/require"
+)
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if !isClaimCUPRConsistent(tt.smstSum, tt.smstCnt, tt.cupr) {
-				t.Fatalf("legacy live-CUPR guard must fail open on poktroll v0.1.35")
-			}
-		})
-	}
+type cuprGuardQueryClient struct {
+	cupr uint64
+	err  error
+}
+
+func (c cuprGuardQueryClient) GetServiceComputeUnitsPerRelayAtHeight(context.Context, string, int64) (uint64, error) {
+	return c.cupr, c.err
+}
+
+func TestIsClaimCUPRConsistent(t *testing.T) {
+	require.True(t, isClaimCUPRConsistent(1783*6312, 1783, 6312))
+	require.False(t, isClaimCUPRConsistent(1783*6276, 1783, 6312))
+	require.True(t, isClaimCUPRConsistent(1783*6276, 1783, 0))
+}
+
+func TestEvaluateClaimCUPRGuard_UsesSessionStartHeight(t *testing.T) {
+	allowed, cupr, err := evaluateClaimCUPRGuard(context.Background(), cuprGuardQueryClient{cupr: 6312}, "svc", 100, 1783*6312, 1783)
+	require.NoError(t, err)
+	require.True(t, allowed)
+	require.Equal(t, uint64(6312), cupr)
+}
+
+func TestEvaluateClaimCUPRGuard_QueryErrorFailsOpen(t *testing.T) {
+	allowed, cupr, err := evaluateClaimCUPRGuard(context.Background(), cuprGuardQueryClient{err: errors.New("node unavailable")}, "svc", 100, 1, 1)
+	require.Error(t, err)
+	require.True(t, allowed)
+	require.Zero(t, cupr)
 }

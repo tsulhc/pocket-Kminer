@@ -31,6 +31,7 @@ type mockCometBFTServer struct {
 
 	// WebSocket management
 	mu             sync.Mutex
+	wsWriteMu      sync.Mutex
 	wsConnections  []*websocket.Conn
 	subscriptions  map[string]chan blockEvent
 	autoSendBlocks bool
@@ -170,7 +171,7 @@ func (m *mockCometBFTServer) handleSubscribe(conn *websocket.Conn, req map[strin
 		"id":      req["id"],
 		"result":  map[string]interface{}{},
 	}
-	_ = conn.WriteJSON(response)
+	m.writeJSON(conn, response)
 
 	// Create event channel for this subscription
 	eventCh := make(chan blockEvent, 100)
@@ -203,7 +204,7 @@ func (m *mockCometBFTServer) handleUnsubscribe(conn *websocket.Conn, req map[str
 		"id":      req["id"],
 		"result":  map[string]interface{}{},
 	}
-	_ = conn.WriteJSON(response)
+	m.writeJSON(conn, response)
 }
 
 // handleUnsubscribeAll handles unsubscribe_all requests.
@@ -220,7 +221,7 @@ func (m *mockCometBFTServer) handleUnsubscribeAll(conn *websocket.Conn, req map[
 		"id":      req["id"],
 		"result":  map[string]interface{}{},
 	}
-	_ = conn.WriteJSON(response)
+	m.writeJSON(conn, response)
 }
 
 // sendBlockEvent sends a block event to a WebSocket connection.
@@ -244,7 +245,13 @@ func (m *mockCometBFTServer) sendBlockEvent(conn *websocket.Conn, event blockEve
 		},
 	}
 
-	_ = conn.WriteJSON(message)
+	m.writeJSON(conn, message)
+}
+
+func (m *mockCometBFTServer) writeJSON(conn *websocket.Conn, value any) {
+	m.wsWriteMu.Lock()
+	defer m.wsWriteMu.Unlock()
+	_ = conn.WriteJSON(value)
 }
 
 // handleJSONRPC handles JSON-RPC requests over HTTP.
@@ -372,7 +379,7 @@ func (m *mockCometBFTServer) sendError(conn *websocket.Conn, req map[string]inte
 			"message": errMsg,
 		},
 	}
-	_ = conn.WriteJSON(response)
+	m.writeJSON(conn, response)
 }
 
 // sendJSONError sends a JSON-RPC error response.
