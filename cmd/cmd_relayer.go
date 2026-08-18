@@ -627,7 +627,7 @@ func runHARelayer(cmd *cobra.Command, _ []string) error {
 			// mined ComputeUnitsPerRelay becomes the SMST leaf weight, so it MUST track
 			// on-chain CUPR changes; the previous sync.Map provider froze it at startup.
 			relayProcessor.SetServiceComputeUnitsProvider(
-				relayer.NewServiceCacheComputeUnitsProvider(logger, serviceCache),
+				relayer.NewServiceCacheComputeUnitsProvider(logger, serviceCache, queryClients.Service()),
 			)
 
 			// NOTE: App discovery callbacks are no longer needed on the relayer.
@@ -682,6 +682,9 @@ func runHARelayer(cmd *cobra.Command, _ []string) error {
 					serviceCache,        // L1->L2->L3 cache for service data (no Redis blocking!)
 					serviceFactorClient, // Reads service factors from Redis (published by miner)
 					relayMeterConfig,
+				)
+				relayMeter.SetServiceComputeUnitsProvider(
+					relayer.NewServiceCacheComputeUnitsProvider(logger, serviceCache, queryClients.Service()),
 				)
 
 				if err := relayMeter.Start(ctx); err != nil {

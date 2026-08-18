@@ -662,7 +662,13 @@ func (m *SessionLifecycleManager) checkSessionTransitions(ctx context.Context, c
 		if p, ok := paramsByEndHeight[sessionEndHeight]; ok {
 			return p
 		}
-		p, err := m.sharedClient.GetParamsAtHeight(ctx, sessionEndHeight)
+		var p *sharedtypes.Params
+		var err error
+		if currentHeight <= 0 || sessionEndHeight >= currentHeight {
+			p, err = m.sharedClient.GetParams(ctx)
+		} else {
+			p, err = m.sharedClient.GetParamsAtHeight(ctx, sessionEndHeight)
+		}
 		if err != nil {
 			// Cache the failure to avoid a retry storm within this pass. Callers fail
 			// open (pre-filter) / fail safe (determineTransition) on a nil result.

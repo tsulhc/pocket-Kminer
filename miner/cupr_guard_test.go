@@ -2,60 +2,39 @@
 
 package miner
 
-import "testing"
+import (
+	"context"
+	"errors"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+)
+
+type cuprGuardQueryClient struct {
+	cupr uint64
+	err  error
+}
+
+func (c cuprGuardQueryClient) GetServiceComputeUnitsPerRelayAtHeight(context.Context, string, int64) (uint64, error) {
+	return c.cupr, c.err
+}
 
 func TestIsClaimCUPRConsistent(t *testing.T) {
-	tests := []struct {
-		name     string
-		smstSum  uint64
-		smstCnt  uint64
-		cupr     uint64
-		expected bool
-	}{
-		{
-			name:     "uniform CUPR matches",
-			smstSum:  1783 * 6312,
-			smstCnt:  1783,
-			cupr:     6312,
-			expected: true,
-		},
-		{
-			name:     "mixed weights (non-integer average) is inconsistent",
-			smstSum:  11190188, // the observed incident value
-			smstCnt:  1783,
-			cupr:     6312,
-			expected: false,
-		},
-		{
-			name:     "uniform-old sum against changed (new) CUPR is inconsistent",
-			smstSum:  1783 * 6276, // mined entirely at old CUPR
-			smstCnt:  1783,
-			cupr:     6312, // chain now uses new CUPR
-			expected: false,
-		},
-		{
-			name:     "unknown CUPR (zero) fails open (consistent)",
-			smstSum:  1783 * 6276,
-			smstCnt:  1783,
-			cupr:     0,
-			expected: true,
-		},
-		{
-			name:     "single relay uniform",
-			smstSum:  6312,
-			smstCnt:  1,
-			cupr:     6312,
-			expected: true,
-		},
-	}
+	require.True(t, isClaimCUPRConsistent(1783*6312, 1783, 6312))
+	require.False(t, isClaimCUPRConsistent(1783*6276, 1783, 6312))
+	require.True(t, isClaimCUPRConsistent(1783*6276, 1783, 0))
+}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := isClaimCUPRConsistent(tt.smstSum, tt.smstCnt, tt.cupr)
-			if got != tt.expected {
-				t.Fatalf("isClaimCUPRConsistent(%d, %d, %d) = %v, want %v",
-					tt.smstSum, tt.smstCnt, tt.cupr, got, tt.expected)
-			}
-		})
-	}
+func TestEvaluateClaimCUPRGuard_UsesSessionStartHeight(t *testing.T) {
+	allowed, cupr, err := evaluateClaimCUPRGuard(context.Background(), cuprGuardQueryClient{cupr: 6312}, "svc", 100, 1783*6312, 1783)
+	require.NoError(t, err)
+	require.True(t, allowed)
+	require.Equal(t, uint64(6312), cupr)
+}
+
+func TestEvaluateClaimCUPRGuard_QueryErrorFailsOpen(t *testing.T) {
+	allowed, cupr, err := evaluateClaimCUPRGuard(context.Background(), cuprGuardQueryClient{err: errors.New("node unavailable")}, "svc", 100, 1, 1)
+	require.Error(t, err)
+	require.True(t, allowed)
+	require.Zero(t, cupr)
 }

@@ -24,6 +24,7 @@ import (
 // SharedParamCache defines the interface for accessing shared params with L1->L2->L3 caching.
 type SharedParamCache interface {
 	GetLatestSharedParams(ctx context.Context) (*sharedtypes.Params, error)
+	GetSharedParams(ctx context.Context, height int64) (*sharedtypes.Params, error)
 }
 
 // ServiceCache defines the interface for accessing service data with L1->L2->L3 caching.
@@ -140,6 +141,8 @@ type RelayMeter struct {
 	sharedParamCache      SharedParamCache
 	serviceCache          ServiceCache
 	serviceFactorProvider ServiceFactorProvider
+	computeUnitsProvider  ServiceComputeUnitsProvider
+	computeUnitsMu        sync.RWMutex
 
 	// Local L1 cache for hot path performance
 	// This is a read-through cache; writes go to Redis first
@@ -152,6 +155,13 @@ type RelayMeter struct {
 	wg       sync.WaitGroup
 	mu       sync.RWMutex
 	closed   bool
+}
+
+// SetServiceComputeUnitsProvider wires session-start CUPR resolution into the meter.
+func (m *RelayMeter) SetServiceComputeUnitsProvider(provider ServiceComputeUnitsProvider) {
+	m.computeUnitsMu.Lock()
+	defer m.computeUnitsMu.Unlock()
+	m.computeUnitsProvider = provider
 }
 
 // NewRelayMeter creates a new relay meter.
@@ -231,7 +241,9 @@ func (m *RelayMeter) CheckAndConsumeRelay(
 	appAddress string,
 	serviceID string,
 	supplierAddress string,
+	sessionStartHeight int64,
 	sessionEndHeight int64,
+	currentHeight int64,
 ) (allowed bool, err error) {
 	m.mu.RLock()
 	if m.closed {
@@ -241,7 +253,7 @@ func (m *RelayMeter) CheckAndConsumeRelay(
 	m.mu.RUnlock()
 
 	// Get relay cost first
-	relayCostUpokt, err := m.getRelayCost(ctx, serviceID)
+	relayCostUpokt, err := m.getRelayCost(ctx, serviceID, sessionStartHeight)
 	if err != nil {
 		m.logger.Warn().Err(err).Str(logging.FieldServiceID, serviceID).
 			Msg("failed to get relay cost")
@@ -249,7 +261,7 @@ func (m *RelayMeter) CheckAndConsumeRelay(
 	}
 
 	// Get or create session meter
-	_, maxStakeUpokt, err := m.getOrCreateSessionMeter(ctx, sessionID, appAddress, serviceID, supplierAddress, sessionEndHeight)
+	_, maxStakeUpokt, err := m.getOrCreateSessionMeter(ctx, sessionID, appAddress, serviceID, supplierAddress, sessionEndHeight, currentHeight)
 	if err != nil {
 		m.logger.Warn().Err(err).Str(logging.FieldSessionID, sessionID).
 			Msg("failed to get session meter")
@@ -309,14 +321,32 @@ func (m *RelayMeter) CheckAndConsumeRelay(
 	return false, nil
 }
 
+// CheckRelayHealth performs a read-only meter probe for simulated relays.
+func (m *RelayMeter) CheckRelayHealth(ctx context.Context, serviceID string) error {
+	m.mu.RLock()
+	if m.closed {
+		m.mu.RUnlock()
+		return fmt.Errorf("relay meter is closed")
+	}
+	m.mu.RUnlock()
+	if _, err := m.getRelayCost(ctx, serviceID, 0); err != nil {
+		return fmt.Errorf("relay cost unresolved for service %s: %w", serviceID, err)
+	}
+	if err := m.redisClient.Ping(ctx).Err(); err != nil {
+		return fmt.Errorf("redis meter unreachable: %w", err)
+	}
+	return nil
+}
+
 // RevertRelayConsumption reverts the stake consumption for a relay that wasn't mined.
 func (m *RelayMeter) RevertRelayConsumption(
 	ctx context.Context,
 	sessionID string,
 	supplierAddress string,
 	serviceID string,
+	sessionStartHeight int64,
 ) error {
-	relayCostUpokt, err := m.getRelayCost(ctx, serviceID)
+	relayCostUpokt, err := m.getRelayCost(ctx, serviceID, sessionStartHeight)
 	if err != nil {
 		return nil // Can't calculate, skip revert
 	}
@@ -418,6 +448,7 @@ func (m *RelayMeter) getOrCreateSessionMeter(
 	serviceID string,
 	supplierAddress string,
 	sessionEndHeight int64,
+	currentHeight int64,
 ) (*SessionMeterMeta, int64, error) {
 	// Snapshot serviceFactor and app stake so a cached meta whose MaxStake
 	// was computed under either stale input is recomputed on the next
@@ -472,7 +503,7 @@ func (m *RelayMeter) getOrCreateSessionMeter(
 		// Stale inputs — recompute maxStake, update cached meta in place.
 		oldFactor := meta.CreatedWithFactor
 		oldAppStake := meta.CreatedWithAppStake
-		newMax, newFactor, newAppStake, calcErr := m.calculateMaxStake(ctx, appAddress, serviceID)
+		newMax, newFactor, newAppStake, calcErr := m.calculateMaxStake(ctx, appAddress, serviceID, sessionEndHeight, currentHeight)
 		if calcErr != nil {
 			return nil, 0, fmt.Errorf("failed to recalculate max stake after input change: %w", calcErr)
 		}
@@ -499,7 +530,7 @@ func (m *RelayMeter) getOrCreateSessionMeter(
 	}
 
 	// Create new session meter
-	maxStakeUpokt, factorUsed, appStakeUsed, err := m.calculateMaxStake(ctx, appAddress, serviceID)
+	maxStakeUpokt, factorUsed, appStakeUsed, err := m.calculateMaxStake(ctx, appAddress, serviceID, sessionEndHeight, currentHeight)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to calculate max stake: %w", err)
 	}
@@ -531,7 +562,7 @@ func (m *RelayMeter) getOrCreateSessionMeter(
 
 	if !set {
 		// Another replica created it first, fetch their version
-		return m.getOrCreateSessionMeter(ctx, sessionID, appAddress, serviceID, supplierAddress, sessionEndHeight)
+		return m.getOrCreateSessionMeter(ctx, sessionID, appAddress, serviceID, supplierAddress, sessionEndHeight, currentHeight)
 	}
 
 	// Initialize consumed counter
@@ -587,7 +618,7 @@ func (m *RelayMeter) getSessionMeta(ctx context.Context, sessionID, supplierAddr
 // The protocol NEVER guarantees any payment amount - baseLimit is an estimate.
 // Returns (effectiveLimit, serviceFactorUsed, error).
 // serviceFactorUsed is the factor applied (0 if no factor was configured).
-func (m *RelayMeter) calculateMaxStake(ctx context.Context, appAddress string, serviceID string) (int64, float64, int64, error) {
+func (m *RelayMeter) calculateMaxStake(ctx context.Context, appAddress string, serviceID string, sessionEndHeight, currentHeight int64) (int64, float64, int64, error) {
 	// Get app stake via the cached application client so operator
 	// top-up/stake-down observed by the orchestrator's refresh loop is
 	// reflected without a sidecar cache going stale.
@@ -597,7 +628,12 @@ func (m *RelayMeter) calculateMaxStake(ctx context.Context, appAddress string, s
 	}
 
 	// Get shared params to calculate baseLimit (for comparison/warnings)
-	sharedParams, err := m.sharedParamCache.GetLatestSharedParams(ctx)
+	var sharedParams *sharedtypes.Params
+	if currentHeight <= 0 || sessionEndHeight >= currentHeight {
+		sharedParams, err = m.sharedParamCache.GetLatestSharedParams(ctx)
+	} else {
+		sharedParams, err = m.sharedParamCache.GetSharedParams(ctx, sessionEndHeight)
+	}
 	if err != nil {
 		return 0, 0, 0, fmt.Errorf("failed to get shared params: %w", err)
 	}
@@ -710,15 +746,15 @@ func (m *RelayMeter) calculateMaxStake(ctx context.Context, appAddress string, s
 
 // getRelayCost calculates the cost of a single relay in uPOKT.
 // Uses cached params from Redis when available.
-func (m *RelayMeter) getRelayCost(ctx context.Context, serviceID string) (int64, error) {
+func (m *RelayMeter) getRelayCost(ctx context.Context, serviceID string, sessionStartHeight int64) (int64, error) {
 	// Get shared params
-	sharedParams, err := m.getSharedParams(ctx)
+	sharedParams, err := m.getSharedParams(ctx, sessionStartHeight)
 	if err != nil {
 		return 0, err
 	}
 
 	// Get compute units per relay for this service
-	computeUnitsPerRelay, err := m.getServiceComputeUnits(ctx, serviceID)
+	computeUnitsPerRelay, err := m.getServiceComputeUnits(ctx, serviceID, sessionStartHeight)
 	if err != nil {
 		// Default to 1 if service not found
 		computeUnitsPerRelay = 1
@@ -772,9 +808,16 @@ func (m *RelayMeter) getAppStake(ctx context.Context, appAddress string) (int64,
 }
 
 // getSharedParams gets shared params using L1 -> L2 -> L3 cache.
-func (m *RelayMeter) getSharedParams(ctx context.Context) (*CachedSharedParams, error) {
+
+func (m *RelayMeter) getSharedParams(ctx context.Context, height int64) (*CachedSharedParams, error) {
 	// Use shared param cache (L1 -> L2 -> L3)
-	params, err := m.sharedParamCache.GetLatestSharedParams(ctx)
+	var params *sharedtypes.Params
+	var err error
+	if height > 0 {
+		params, err = m.sharedParamCache.GetSharedParams(ctx, height)
+	} else {
+		params, err = m.sharedParamCache.GetLatestSharedParams(ctx)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to get shared params: %w", err)
 	}
@@ -822,7 +865,13 @@ func (m *RelayMeter) getApplicationParams(ctx context.Context) (*apptypes.Params
 }
 
 // getServiceComputeUnits gets compute units per relay for a service using L1 -> L2 -> L3 cache.
-func (m *RelayMeter) getServiceComputeUnits(ctx context.Context, serviceID string) (uint64, error) {
+func (m *RelayMeter) getServiceComputeUnits(ctx context.Context, serviceID string, sessionStartHeight int64) (uint64, error) {
+	m.computeUnitsMu.RLock()
+	provider := m.computeUnitsProvider
+	m.computeUnitsMu.RUnlock()
+	if provider != nil && sessionStartHeight > 0 {
+		return provider.GetServiceComputeUnits(ctx, serviceID, sessionStartHeight), nil
+	}
 	// Defensive nil-check: the meter is sometimes constructed without a
 	// service cache (tests, minimal bootstraps). Fall back to the same
 	// default (1 CU) the "service not found" branch uses instead of

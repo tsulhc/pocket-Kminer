@@ -815,6 +815,14 @@ func (p *ProxyServer) handleRelay(w http.ResponseWriter, r *http.Request) {
 
 	// Pin block height at arrival time (for grace period calculation)
 	arrivalBlockHeight := p.currentBlockHeight.Load()
+	if relayRequest.Meta.SessionHeader != nil && !sessionHeightsPlausible(
+		relayRequest.Meta.SessionHeader.GetSessionStartBlockHeight(),
+		relayRequest.Meta.SessionHeader.GetSessionEndBlockHeight(), arrivalBlockHeight,
+	) {
+		p.sendError(w, http.StatusBadRequest, "implausible session heights")
+		relaysRejected.WithLabelValues(serviceID, rpcType, rejectReasonValidationFailed).Inc()
+		return
+	}
 
 	// Get validation mode
 	validationMode := p.config.GetServiceValidationMode(serviceID)
@@ -831,6 +839,7 @@ func (p *ProxyServer) handleRelay(w http.ResponseWriter, r *http.Request) {
 			sessionID := sessionHeader.SessionId
 			appAddress := sessionHeader.ApplicationAddress
 			supplierAddress := relayRequest.Meta.SupplierOperatorAddress
+			sessionStartHeight := sessionHeader.SessionStartBlockHeight
 			sessionEndHeight := sessionHeader.SessionEndBlockHeight
 
 			meterStart := time.Now()
@@ -840,7 +849,9 @@ func (p *ProxyServer) handleRelay(w http.ResponseWriter, r *http.Request) {
 				appAddress,
 				serviceID,
 				supplierAddress,
+				sessionStartHeight,
 				sessionEndHeight,
+				arrivalBlockHeight,
 			)
 			meterDuration := time.Since(meterStart)
 
@@ -1180,6 +1191,7 @@ func (p *ProxyServer) handleRelay(w http.ResponseWriter, r *http.Request) {
 				sessionHeader := capturedRequest.Meta.SessionHeader
 				sessionID := sessionHeader.SessionId
 				supplierAddress := capturedRequest.Meta.SupplierOperatorAddress
+				sessionStartHeight := sessionHeader.SessionStartBlockHeight
 				sessionEndHeight := sessionHeader.SessionEndBlockHeight
 
 				meterStart := time.Now()
@@ -1189,7 +1201,9 @@ func (p *ProxyServer) handleRelay(w http.ResponseWriter, r *http.Request) {
 					appAddress,
 					capturedServiceID,
 					supplierAddress,
+					sessionStartHeight,
 					sessionEndHeight,
+					capturedBlockHeight,
 				)
 				meterDuration := time.Since(meterStart)
 

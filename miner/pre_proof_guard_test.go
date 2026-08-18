@@ -35,10 +35,9 @@ func TestIsClaimNotFoundError_WrappedGrpcNotFound(t *testing.T) {
 	require.True(t, isClaimNotFoundError(wrapped), "guard must unwrap fmt.Errorf-wrapped gRPC NotFound")
 }
 
-func TestIsClaimNotFoundError_SubstringFallback(t *testing.T) {
-	// No gRPC status code, only a message — the substring fallback must fire.
+func TestIsClaimNotFoundError_TransientMessageFailsOpen(t *testing.T) {
 	err := errors.New("something: claim not found for session X")
-	require.True(t, isClaimNotFoundError(err))
+	require.False(t, isClaimNotFoundError(err))
 }
 
 func TestIsClaimNotFoundError_UnavailableIsFailOpen(t *testing.T) {
