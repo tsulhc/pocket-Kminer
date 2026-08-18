@@ -10,6 +10,7 @@ import (
 	"github.com/pokt-network/pocket-relay-miner/logging"
 	"github.com/pokt-network/poktroll/pkg/crypto"
 	servicetypes "github.com/pokt-network/poktroll/x/service/types"
+	sessiontypes "github.com/pokt-network/poktroll/x/session/types"
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 )
 
@@ -133,6 +134,13 @@ func (rv *relayValidator) ValidateRelayRequest(
 	if !rv.isSupplierAllowed(supplierAddr) {
 		return fmt.Errorf("supplier %s is not allowed by this relayer", supplierAddr)
 	}
+	if sessionHeader != nil && !sessionHeightsPlausible(
+		sessionHeader.GetSessionStartBlockHeight(),
+		sessionHeader.GetSessionEndBlockHeight(), rv.GetCurrentBlockHeight(),
+	) {
+		return fmt.Errorf("implausible session heights: start %d, end %d",
+			sessionHeader.GetSessionStartBlockHeight(), sessionHeader.GetSessionEndBlockHeight())
+	}
 
 	// Get target session block height
 	step2 := time.Now()
@@ -168,13 +176,8 @@ func (rv *relayValidator) ValidateRelayRequest(
 		Str(logging.FieldSessionID, sessionHeader.GetSessionId()).
 		Msg("validation timing breakdown")
 
-	// Verify session ID matches
-	if session.SessionId != sessionHeader.GetSessionId() {
-		return fmt.Errorf(
-			"session ID mismatch, expected: %s, got: %s",
-			session.SessionId,
-			sessionHeader.GetSessionId(),
-		)
+	if err := compareSessionHeaders(session.GetHeader(), sessionHeader); err != nil {
+		return err
 	}
 
 	// Verify supplier is in session
@@ -225,14 +228,20 @@ func (rv *relayValidator) CheckRewardEligibility(
 		// If we don't have block height info, assume it's eligible
 		return nil
 	}
+	sessionStartHeight := relayRequest.Meta.SessionHeader.GetSessionStartBlockHeight()
+	sessionEndHeight := relayRequest.Meta.SessionHeader.GetSessionEndBlockHeight()
 
-	sharedParams, err := rv.sharedParamCache.GetLatestSharedParams(ctx)
+	var sharedParams *sharedtypes.Params
+	var err error
+	if sessionEndHeight >= currentHeight {
+		sharedParams, err = rv.sharedParamCache.GetLatestSharedParams(ctx)
+	} else {
+		sharedParams, err = rv.sharedParamCache.GetSharedParams(ctx, sessionEndHeight)
+	}
 	if err != nil {
 		return fmt.Errorf("failed to get shared params: %w", err)
 	}
 
-	sessionStartHeight := relayRequest.Meta.SessionHeader.GetSessionStartBlockHeight()
-	sessionEndHeight := relayRequest.Meta.SessionHeader.GetSessionEndBlockHeight()
 	serviceID := relayRequest.Meta.SessionHeader.GetServiceId()
 	applicationAddress := relayRequest.Meta.SessionHeader.GetApplicationAddress()
 
@@ -320,7 +329,7 @@ func (rv *relayValidator) getTargetSessionBlockHeight(
 	}
 
 	// Session has ended, check grace period
-	sharedParams, err := rv.sharedParamCache.GetLatestSharedParams(ctx)
+	sharedParams, err := rv.sharedParamCache.GetSharedParams(ctx, sessionEndHeight)
 	if err != nil {
 		return 0, fmt.Errorf("failed to get shared params: %w", err)
 	}
@@ -339,4 +348,29 @@ func (rv *relayValidator) getTargetSessionBlockHeight(
 		sessionEndHeight,
 		currentHeight,
 	)
+}
+
+func compareSessionHeaders(onchain, request *sessiontypes.SessionHeader) error {
+	if onchain == nil {
+		return fmt.Errorf("onchain session header is nil")
+	}
+	if request == nil {
+		return fmt.Errorf("request session header is nil")
+	}
+	if request.GetApplicationAddress() != onchain.GetApplicationAddress() {
+		return fmt.Errorf("session header application address mismatch, expecting: %q, got: %q", onchain.GetApplicationAddress(), request.GetApplicationAddress())
+	}
+	if request.GetServiceId() != onchain.GetServiceId() {
+		return fmt.Errorf("session header service ID mismatch, expecting: %q, got: %q", onchain.GetServiceId(), request.GetServiceId())
+	}
+	if request.GetSessionStartBlockHeight() != onchain.GetSessionStartBlockHeight() {
+		return fmt.Errorf("session header start height mismatch, expecting: %d, got: %d", onchain.GetSessionStartBlockHeight(), request.GetSessionStartBlockHeight())
+	}
+	if request.GetSessionEndBlockHeight() != onchain.GetSessionEndBlockHeight() {
+		return fmt.Errorf("session header end height mismatch, expecting: %d, got: %d", onchain.GetSessionEndBlockHeight(), request.GetSessionEndBlockHeight())
+	}
+	if request.GetSessionId() != onchain.GetSessionId() {
+		return fmt.Errorf("session ID mismatch, expected: %s, got: %s", onchain.GetSessionId(), request.GetSessionId())
+	}
+	return nil
 }
