@@ -814,16 +814,6 @@ var (
 		[]string{"supplier"},
 	)
 
-	leaderOwnerMismatch = observability.MinerFactory.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Namespace: metricsNamespace,
-			Subsystem: metricsSubsystem,
-			Name:      "leader_owner_mismatch",
-			Help:      "1 when this instance owns supplier leases but is NOT the global leader (claim/proof stalled, memory accumulates). 0 otherwise.",
-		},
-		[]string{"state"},
-	)
-
 	blockEventAgeSeconds = observability.MinerFactory.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Namespace: metricsNamespace,

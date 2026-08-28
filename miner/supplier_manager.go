@@ -2,16 +2,13 @@ package miner
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"runtime/debug"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/alitto/pond/v2"
-	"github.com/redis/go-redis/v9"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -228,15 +225,6 @@ type SupplierManagerConfig struct {
 	// BlockTimeSeconds is forwarded to LifecycleCallbackConfig so the TX
 	// deadline can be computed from remaining window blocks. Default: 30.
 	BlockTimeSeconds int64
-
-	// LeaderOwnerMismatchMaxConsecutive controls how many consecutive watchdog
-	// failures are tolerated before invoking LeaderOwnerMismatchHandler. Default: 2.
-	LeaderOwnerMismatchMaxConsecutive int
-
-	// LeaderOwnerMismatchHandler is called when this miner owns supplier leases
-	// while another/no instance is global leader for too long. Production wires
-	// this to fail-fast so process supervision restarts into a coherent HA state.
-	LeaderOwnerMismatchHandler func(reason string)
 }
 
 // DefaultSupplierReconcileInterval is the default polling cadence for the
@@ -303,9 +291,6 @@ type SupplierManager struct {
 	cancelFn context.CancelFunc
 	closed   bool
 	mu       sync.RWMutex
-
-	leaderOwnerMismatchConsecutive atomic.Int32
-	leaderOwnerMismatchHandling    atomic.Bool
 }
 
 // NewSupplierManager creates a new supplier manager.
@@ -386,11 +371,6 @@ func (m *SupplierManager) Start(ctx context.Context) error {
 			Dur("interval", interval).
 			Msg("supplier stake reconcile loop started")
 	}
-
-	// Leader/supplier-owner mismatch watchdog: detects the split-brain state
-	// where this instance owns supplier leases but is NOT the global leader
-	// (block publisher stopped, claim/proof stalled, memory growth).
-	go m.runLeaderOwnerWatchdog(m.ctx)
 
 	return nil
 }
@@ -1774,117 +1754,6 @@ func (m *SupplierManager) ListSuppliers() []string {
 		suppliers = append(suppliers, addr)
 	}
 	return suppliers
-}
-
-const defaultLeaderOwnerWatchdogInterval = 30 * time.Second
-const defaultLeaderOwnerMismatchMaxConsecutive = 2
-
-func (m *SupplierManager) runLeaderOwnerWatchdog(ctx context.Context) {
-	ticker := time.NewTicker(defaultLeaderOwnerWatchdogInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			m.checkLeaderOwnerConsistency(ctx)
-		}
-	}
-}
-
-func (m *SupplierManager) checkLeaderOwnerConsistency(ctx context.Context) {
-	owned := len(m.ListSuppliers())
-	if owned == 0 {
-		setLeaderOwnerMismatchState("")
-		m.leaderOwnerMismatchConsecutive.Store(0)
-		return
-	}
-
-	leaderKey := m.config.RedisClient.KB().GlobalLeaderKey()
-	leaderID, err := m.config.RedisClient.Get(ctx, leaderKey).Result()
-	if err != nil && !errors.Is(err, redis.Nil) {
-		setLeaderOwnerMismatchState("redis_error")
-		return
-	}
-
-	if leaderID == "" {
-		setLeaderOwnerMismatchState("no_leader")
-		m.logger.Error().
-			Str("our_id", m.config.MinerID).
-			Int("suppliers_owned", owned).
-			Msg("NO GLOBAL LEADER but we own supplier leases — block publisher stopped, claim/proof stalled")
-		m.handleLeaderOwnerMismatch("no_leader")
-	} else if !m.matchesGlobalLeaderID(leaderID) {
-		m.logger.Error().
-			Str("global_leader", leaderID).
-			Str("our_id", m.config.MinerID).
-			Int("suppliers_owned", owned).
-			Msg("LEADER/OWNER MISMATCH: we own supplier leases but are NOT the global leader — claim/proof stalled, memory accumulates")
-		setLeaderOwnerMismatchState("mismatch")
-		m.handleLeaderOwnerMismatch("mismatch")
-	} else {
-		setLeaderOwnerMismatchState("")
-		m.leaderOwnerMismatchConsecutive.Store(0)
-		if m.config.BlockClient != nil {
-			currentBlockHeight.Set(float64(m.config.BlockClient.LastBlock(ctx).Height()))
-		}
-	}
-}
-
-func (m *SupplierManager) matchesGlobalLeaderID(leaderID string) bool {
-	if leaderID == m.config.MinerID {
-		return true
-	}
-
-	// Supplier leases use the Redis consumer name, which is prefixed with
-	// "miner-" in production (e.g. miner-pocket-relayminer-pg-1-123). The
-	// global leader lock uses the bare instance ID (pocket-relayminer-pg-1-123).
-	// Treat them as the same instance or the watchdog will false-positive and
-	// crash-loop the active miner immediately after deploy.
-	return leaderID == strings.TrimPrefix(m.config.MinerID, "miner-")
-}
-
-func setLeaderOwnerMismatchState(active string) {
-	for _, state := range []string{"redis_error", "no_leader", "mismatch"} {
-		value := 0.0
-		if state == active {
-			value = 1
-		}
-		leaderOwnerMismatch.WithLabelValues(state).Set(value)
-	}
-}
-
-func (m *SupplierManager) handleLeaderOwnerMismatch(reason string) {
-	count := int(m.leaderOwnerMismatchConsecutive.Add(1))
-	threshold := m.config.LeaderOwnerMismatchMaxConsecutive
-	if threshold <= 0 {
-		threshold = defaultLeaderOwnerMismatchMaxConsecutive
-	}
-	if count < threshold {
-		return
-	}
-
-	m.logger.Error().
-		Str("reason", reason).
-		Int("consecutive_failures", count).
-		Int("threshold", threshold).
-		Msg("leader/owner mismatch persisted — releasing supplier leases before fail-fast")
-
-	if !m.leaderOwnerMismatchHandling.CompareAndSwap(false, true) {
-		return
-	}
-
-	go func() {
-		if m.claimer != nil {
-			if err := m.claimer.Stop(context.Background()); err != nil {
-				m.logger.Error().Err(err).Msg("failed to release supplier leases during leader/owner mismatch handling")
-			}
-		}
-		if m.config.LeaderOwnerMismatchHandler != nil {
-			m.config.LeaderOwnerMismatchHandler(reason)
-		}
-	}()
 }
 
 // Close gracefully shuts down the supplier manager.
