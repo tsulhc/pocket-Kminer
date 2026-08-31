@@ -231,6 +231,11 @@ type SupplierManagerConfig struct {
 // on-chain stake reconciler.
 const DefaultSupplierReconcileInterval = 60 * time.Second
 
+// supplierClaimerShutdownTimeout bounds best-effort Redis lease release during
+// process shutdown. Supplier leases and instance registration have their own TTLs,
+// so a Redis outage must never prevent systemd from completing a restart.
+const supplierClaimerShutdownTimeout = 10 * time.Second
+
 // SupplierManager manages multiple suppliers in the HA Miner.
 // It handles dynamic addition/removal of suppliers based on key changes.
 type SupplierManager struct {
@@ -351,12 +356,17 @@ func (m *SupplierManager) Start(ctx context.Context) error {
 		return fmt.Errorf("supplier manager is closed")
 	}
 	m.ctx, m.cancelFn = context.WithCancel(ctx)
+	managerCtx := m.ctx
 	m.mu.Unlock()
 
 	// Register for key changes
 	m.keyManager.OnKeyChange(m.onKeyChange)
 
-	if err := m.startWithDistributedClaiming(ctx, m.keyManager.ListSuppliers()); err != nil {
+	// Everything owned by SupplierManager must derive from the manager lifecycle
+	// context, not directly from the caller. Close() cancels managerCtx before
+	// releasing Redis leases, which stops supplier consumers/lifecycle work before
+	// a standby can acquire those leases.
+	if err := m.startWithDistributedClaiming(managerCtx, m.keyManager.ListSuppliers()); err != nil {
 		return err
 	}
 
@@ -1770,11 +1780,16 @@ func (m *SupplierManager) Close() error {
 	}
 	m.mu.Unlock()
 
-	// Stop the claimer first (releases all claims)
+	// Stop the claimer first so peers can acquire our leases. Shutdown release
+	// skips per-supplier drain callbacks because this Close path owns the local
+	// teardown below. Bound Redis cleanup so an unavailable Redis cannot pin the
+	// process indefinitely; unreleased leases expire via ClaimTTL.
 	if m.claimer != nil {
-		if err := m.claimer.Stop(context.Background()); err != nil {
-			m.logger.Warn().Err(err).Msg("failed to stop supplier claimer")
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), supplierClaimerShutdownTimeout)
+		if err := m.claimer.Stop(stopCtx); err != nil {
+			m.logger.Warn().Err(err).Msg("failed to stop supplier claimer cleanly")
 		}
+		stopCancel()
 	}
 
 	// Stop the reconciler BEFORE tearing down suppliers, so an in-flight
