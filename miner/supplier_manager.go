@@ -356,12 +356,17 @@ func (m *SupplierManager) Start(ctx context.Context) error {
 		return fmt.Errorf("supplier manager is closed")
 	}
 	m.ctx, m.cancelFn = context.WithCancel(ctx)
+	managerCtx := m.ctx
 	m.mu.Unlock()
 
 	// Register for key changes
 	m.keyManager.OnKeyChange(m.onKeyChange)
 
-	if err := m.startWithDistributedClaiming(ctx, m.keyManager.ListSuppliers()); err != nil {
+	// Everything owned by SupplierManager must derive from the manager lifecycle
+	// context, not directly from the caller. Close() cancels managerCtx before
+	// releasing Redis leases, which stops supplier consumers/lifecycle work before
+	// a standby can acquire those leases.
+	if err := m.startWithDistributedClaiming(managerCtx, m.keyManager.ListSuppliers()); err != nil {
 		return err
 	}
 
