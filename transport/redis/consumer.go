@@ -15,13 +15,24 @@ import (
 
 var _ transport.MinedRelayConsumer = (*StreamsConsumer)(nil)
 
+// streamsReadBlockTimeout bounds how long an idle XREADGROUP may hold its
+// connection before returning redis.Nil. go-redis/v9 does not reliably abort an
+// already-blocked Redis read solely because the caller context was cancelled.
+// A finite server-side BLOCK therefore guarantees that Close can make progress.
+//
+// This remains push-based: Redis returns immediately when a relay is available;
+// the timeout only adds one idle command wake-up per consumer per second.
+const streamsReadBlockTimeout = time.Second
+
 // StreamsConsumer implements MinedRelayConsumer using Redis Streams with consumer groups.
 // It provides exactly-once delivery semantics within the consumer group.
-// TRUE PUSH architecture: BLOCK 0 means zero latency when data arrives.
-// - Each consumer holds 1 connection indefinitely waiting on XREADGROUP BLOCK 0
+// PUSH architecture: a bounded BLOCK keeps zero delivery latency when data arrives
+// while guaranteeing an idle read periodically returns so shutdown can observe
+// context cancellation.
+// - Each consumer holds 1 connection while waiting on XREADGROUP
 // - Pool sizing: Allocate numSuppliers + 20 overhead for cache/pubsub
-// - Context cancellation cleanly interrupts blocked calls
-// - Claims = money - we cannot afford ANY latency consuming relays.
+// - Claims = money - the BLOCK timeout does not delay available messages
+// - Idle reads wake periodically to make shutdown bounded under go-redis/v9.
 type StreamsConsumer struct {
 	logger     logging.Logger
 	client     redis.UniversalClient
@@ -48,7 +59,8 @@ type StreamsConsumer struct {
 }
 
 // NewStreamsConsumer creates a new Redis Streams consumer.
-// TRUE PUSH architecture: BLOCK 0 for zero-latency message delivery.
+// XREADGROUP uses a short bounded BLOCK for zero-latency delivery of available
+// messages plus deterministic idle shutdown.
 // The discoveryInterval parameter is ignored (kept for API compatibility).
 func NewStreamsConsumer(
 	logger logging.Logger,
@@ -166,36 +178,37 @@ func (c *StreamsConsumer) consumeLoop(ctx context.Context) {
 
 // consumeMessagesUntilError runs the message consumption loop until an error occurs.
 // Returns error to trigger reconnection via the reconnection loop.
-// TRUE PUSH SEMANTICS: Uses BLOCK 0 (infinite wait).
-// - Returns INSTANTLY when data arrives (zero latency)
-// - Blocks indefinitely when stream is empty (zero CPU waste)
-// - Context cancellation interrupts the blocked call (clean shutdown)
-// This is the most efficient approach - no polling, pure push.
+// PUSH SEMANTICS: Uses a finite server-side BLOCK.
+// - Returns INSTANTLY when data arrives (zero delivery latency)
+// - Wakes once per streamsReadBlockTimeout while idle
+// - After each wake, observes context cancellation and exits cleanly
+//
+// Do not use BLOCK 0 here. go-redis/v9 can remain blocked in the socket read
+// after context cancellation, which previously pinned StreamsConsumer.Close()
+// and therefore whole-miner shutdown until systemd killed the process.
 func (c *StreamsConsumer) consumeMessagesUntilError(ctx context.Context) error {
 	for {
-		// TRUE PUSH: BLOCK 0 = infinite wait until data arrives (live consumption)
-		// go-redis respects context cancellation, so this is safe:
-		// - When data arrives: returns immediately with messages
-		// - When context cancelled: returns with context.Canceled error
-		// - No polling, no wasted CPU cycles
-		// Note: Each blocked call holds 1 connection from the pool
+		// Keep the read server-blocking for push delivery, but give Redis a finite
+		// deadline. An idle timeout returns redis.Nil; the next loop iteration
+		// observes ctx cancellation before issuing another blocking read.
 		streams, err := c.client.XReadGroup(ctx, &redis.XReadGroupArgs{
 			Group:    c.config.ConsumerGroup,
 			Consumer: c.config.ConsumerName,
 			Streams:  []string{c.streamName, ">"},
 			Count:    c.config.BatchSize,
-			Block:    0, // TRUE PUSH: infinite wait, context cancellation interrupts
+			Block:    streamsReadBlockTimeout,
 		}).Result()
 
 		if err != nil {
-			// With BLOCK 0, context cancellation is the normal shutdown path
+			// A finite BLOCK may return redis.Nil at the same time shutdown cancels
+			// the context, so always prefer the lifecycle signal.
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
 
 			if err == redis.Nil {
-				// With BLOCK 0, this shouldn't happen often (only on timeout which we don't have)
-				// But handle it gracefully - consider claiming idle messages
+				// Normal idle wake-up. Use it as the opportunity to periodically
+				// inspect pending messages without turning the consumer into polling.
 				c.claimMu.Lock()
 				timeSinceLastClaim := time.Since(c.lastClaimTime)
 				shouldClaim := timeSinceLastClaim >= time.Duration(c.config.ClaimIdleTimeout)*time.Millisecond
