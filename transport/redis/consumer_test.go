@@ -122,6 +122,114 @@ func TestParseMessage_InvalidPayloadReleasesPooledMessage(t *testing.T) {
 	transport.ReleaseMinedRelayMessage(clean)
 }
 
+func TestStreamsConsumerCloseUnblocksIdleRead(t *testing.T) {
+	mr, err := miniredis.Run()
+	require.NoError(t, err)
+	defer mr.Close()
+
+	client := redis.NewClient(&redis.Options{
+		Addr:     mr.Addr(),
+		PoolSize: 4,
+	})
+	defer func() { require.NoError(t, client.Close()) }()
+
+	consumer, err := NewStreamsConsumer(
+		zerolog.Nop(),
+		client,
+		transport.ConsumerConfig{
+			StreamPrefix:            "ha:relays",
+			SupplierOperatorAddress: "pokt1shutdown",
+			ConsumerGroup:           "ha-miners",
+			ConsumerName:            "miner-1",
+			BatchSize:               1,
+			ClaimIdleTimeout:        30_000,
+		},
+		0,
+	)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	_ = consumer.Consume(ctx)
+
+	// Wait until the stream/group exists so the consumer has reached the
+	// blocking XREADGROUP path rather than merely racing startup.
+	require.Eventually(t, func() bool {
+		return mr.Exists("ha:relays:pokt1shutdown")
+	}, time.Second, 10*time.Millisecond)
+
+	cancel()
+
+	done := make(chan error, 1)
+	start := time.Now()
+	go func() {
+		done <- consumer.Close()
+	}()
+
+	select {
+	case closeErr := <-done:
+		require.NoError(t, closeErr)
+		assert.Less(t, time.Since(start), 2*streamsReadBlockTimeout,
+			"idle stream consumer must stop within one bounded Redis read interval")
+	case <-time.After(3 * streamsReadBlockTimeout):
+		t.Fatal("StreamsConsumer.Close remained blocked after idle XREADGROUP cancellation")
+	}
+}
+
+func TestStreamsConsumerBoundedBlockStillDeliversImmediately(t *testing.T) {
+	mr, err := miniredis.Run()
+	require.NoError(t, err)
+	defer mr.Close()
+
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	defer func() { require.NoError(t, client.Close()) }()
+
+	consumer, err := NewStreamsConsumer(
+		zerolog.Nop(),
+		client,
+		transport.ConsumerConfig{
+			StreamPrefix:            "ha:relays",
+			SupplierOperatorAddress: "pokt1push",
+			ConsumerGroup:           "ha-miners",
+			ConsumerName:            "miner-1",
+			BatchSize:               1,
+			ClaimIdleTimeout:        30_000,
+		},
+		0,
+	)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	msgCh := consumer.Consume(ctx)
+	defer func() { require.NoError(t, consumer.Close()) }()
+
+	require.Eventually(t, func() bool {
+		return mr.Exists("ha:relays:pokt1push")
+	}, time.Second, 10*time.Millisecond)
+
+	relay := newTestMinedRelayMessage("pokt1push", "session-push")
+	payload, err := relay.Marshal()
+	require.NoError(t, err)
+
+	publishedAt := time.Now()
+	_, err = client.XAdd(ctx, &redis.XAddArgs{
+		Stream: "ha:relays:pokt1push",
+		Values: map[string]interface{}{"data": string(payload)},
+	}).Result()
+	require.NoError(t, err)
+
+	select {
+	case msg := <-msgCh:
+		require.NotNil(t, msg.Message)
+		assert.Equal(t, "session-push", msg.Message.SessionId)
+		assert.Less(t, time.Since(publishedAt), streamsReadBlockTimeout,
+			"finite BLOCK must not turn push delivery into polling latency")
+		transport.ReleaseMinedRelayMessage(msg.Message)
+	case <-time.After(streamsReadBlockTimeout):
+		t.Fatal("relay was not delivered before the idle BLOCK timeout")
+	}
+}
+
 func TestAckMessageFallsBackToAckAndDelete(t *testing.T) {
 	mr, err := miniredis.Run()
 	require.NoError(t, err)
