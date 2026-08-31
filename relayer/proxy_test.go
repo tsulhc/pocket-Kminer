@@ -3,15 +3,45 @@
 package relayer
 
 import (
+	"context"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/pokt-network/pocket-relay-miner/pool"
 )
+
+func TestNewHTTPServerSupportsH2C(t *testing.T) {
+	protocol := make(chan string, 1)
+	server := newHTTPServer("127.0.0.1:0", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		protocol <- r.Proto
+		w.WriteHeader(http.StatusNoContent)
+	}), time.Second)
+	listener, err := net.Listen("tcp", server.Addr)
+	require.NoError(t, err)
+	serveErr := make(chan error, 1)
+	go func() {
+		serveErr <- server.Serve(listener)
+	}()
+	t.Cleanup(func() {
+		require.NoError(t, server.Shutdown(context.Background()))
+		require.ErrorIs(t, <-serveErr, http.ErrServerClosed)
+	})
+
+	clientProtocols := new(http.Protocols)
+	clientProtocols.SetUnencryptedHTTP2(true)
+	client := &http.Client{Transport: &http.Transport{Protocols: clientProtocols}}
+	response, err := client.Get("http://" + listener.Addr().String())
+	require.NoError(t, err)
+	require.NoError(t, response.Body.Close())
+	require.Equal(t, http.StatusNoContent, response.StatusCode)
+	require.Equal(t, "HTTP/2.0", <-protocol)
+}
 
 // --- sendServiceUnavailable Tests ---
 

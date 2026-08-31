@@ -85,7 +85,7 @@ Examples:
 			}
 
 			if cacheType == "all" && !dryRun && !yes {
-				return fmt.Errorf("--type all requires --yes (or --dry-run to preview). Use --type <single> for interactive confirmation.")
+				return fmt.Errorf("--type all requires --yes (or --dry-run to preview); use --type <single> for interactive confirmation")
 			}
 
 			if invalidate {
@@ -504,7 +504,7 @@ func channelForClearAll(client *DebugRedisClient, cacheType string) string {
 // redis.ClusterClient it iterates over every master node to ensure no
 // keys are missed on other shards.
 func scanAllKeysCluster(ctx context.Context, client *DebugRedisClient, pattern string) ([]string, error) {
-	if cluster, ok := client.Client.UniversalClient.(*redis.ClusterClient); ok {
+	if cluster, ok := client.UniversalClient.(*redis.ClusterClient); ok {
 		return scanAllKeysClusterNodes(ctx, cluster, pattern)
 	}
 	return scanAllKeys(ctx, client, pattern)

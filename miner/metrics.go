@@ -2,7 +2,6 @@ package miner
 
 import (
 	"context"
-	"fmt"
 	"time"
 
 	"github.com/alitto/pond/v2"
@@ -42,7 +41,7 @@ var (
 			Name:      "relays_added_to_smst_total",
 			Help:      "SMST UpdateTree successes (NOT unique leaves — see claim_num_leaves for billable count)",
 		},
-		[]string{"supplier", "service_id", "session_id"},
+		[]string{"supplier", "service_id"},
 	)
 
 	// claimNumLeaves is the number of distinct SMST leaves in the claim
@@ -57,7 +56,7 @@ var (
 			Name:      "claim_num_leaves",
 			Help:      "Distinct SMST leaves in the claim being submitted (matches on-chain num_relays)",
 		},
-		[]string{"supplier", "service_id", "session_id"},
+		[]string{"supplier", "service_id"},
 	)
 
 	// claimRelayAttempts is the session coordinator's RelayCount at claim
@@ -71,7 +70,7 @@ var (
 			Name:      "claim_relay_attempts",
 			Help:      "Session coordinator RelayCount at claim time (compare with claim_num_leaves to detect collapse)",
 		},
-		[]string{"supplier", "service_id", "session_id"},
+		[]string{"supplier", "service_id"},
 	)
 
 	// claimLeafCollapseTotal fires once per claim whose SMST leaf count
@@ -97,7 +96,7 @@ var (
 			Name:      "relays_failed_smst_total",
 			Help:      "Total number of relays that failed to add to SMST tree",
 		},
-		[]string{"supplier", "service_id", "session_id", "reason"},
+		[]string{"supplier", "service_id", "reason"},
 	)
 
 	// Relay consumption metrics
@@ -132,7 +131,7 @@ var (
 			Name:      "claim_scheduled_height",
 			Help:      "Block height when claim is scheduled to be submitted",
 		},
-		[]string{"supplier", "service_id", "session_id"},
+		[]string{"supplier", "service_id"},
 	)
 
 	claimSubmissionLatencyBlocks = observability.MinerFactory.NewHistogramVec(
@@ -154,7 +153,7 @@ var (
 			Name:      "proof_scheduled_height",
 			Help:      "Block height when proof is scheduled to be submitted",
 		},
-		[]string{"supplier", "service_id", "session_id"},
+		[]string{"supplier", "service_id"},
 	)
 
 	proofSubmissionLatencyBlocks = observability.MinerFactory.NewHistogramVec(
@@ -482,7 +481,7 @@ var (
 			Name:      "block_results_retries_total",
 			Help:      "Total number of block_results query retries due to ABCI indexing delays",
 		},
-		[]string{"height"},
+		nil,
 	)
 
 	// Deduplication metrics. The deduplicator only runs on the reclaim path
@@ -495,7 +494,7 @@ var (
 			Name:      "dedup_redis_cache_hits_total",
 			Help:      "Total number of reclaimed relays detected as already-processed (prevented double-count)",
 		},
-		[]string{"session_id"},
+		nil,
 	)
 
 	dedupMisses = observability.MinerFactory.NewCounterVec(
@@ -505,7 +504,7 @@ var (
 			Name:      "dedup_misses_total",
 			Help:      "Total number of deduplication cache misses (new relays)",
 		},
-		[]string{"session_id"},
+		nil,
 	)
 
 	dedupMarked = observability.MinerFactory.NewCounterVec(
@@ -515,7 +514,7 @@ var (
 			Name:      "dedup_marked_total",
 			Help:      "Total number of relays marked as processed",
 		},
-		[]string{"session_id"},
+		nil,
 	)
 
 	dedupErrors = observability.MinerFactory.NewCounterVec(
@@ -525,7 +524,7 @@ var (
 			Name:      "dedup_errors_total",
 			Help:      "Total number of deduplication errors",
 		},
-		[]string{"session_id", "operation"},
+		[]string{"operation"},
 	)
 
 	// Session tree metrics (reserved for future instrumentation)
@@ -537,16 +536,6 @@ var (
 			Help:      "Number of active session trees",
 		},
 		[]string{"supplier"},
-	)
-
-	_ = observability.MinerFactory.NewCounterVec(
-		prometheus.CounterOpts{
-			Namespace: metricsNamespace,
-			Subsystem: metricsSubsystem,
-			Name:      "session_tree_updates_total",
-			Help:      "Total number of session tree updates",
-		},
-		[]string{"supplier", "session_id"},
 	)
 
 	_ = observability.MinerFactory.NewCounterVec(
@@ -1276,8 +1265,8 @@ func RecordRelayConsumedFromStream(supplier, serviceID string) {
 }
 
 // RecordRelayAddedToSMST records a relay successfully added to SMST tree.
-func RecordRelayAddedToSMST(supplier, serviceID, sessionID string) {
-	relaysAddedToSMST.WithLabelValues(supplier, serviceID, sessionID).Inc()
+func RecordRelayAddedToSMST(supplier, serviceID, _ string) {
+	relaysAddedToSMST.WithLabelValues(supplier, serviceID).Inc()
 }
 
 // RecordClaimLeafStats pins the two gauges that let operators compare the
@@ -1285,24 +1274,23 @@ func RecordRelayAddedToSMST(supplier, serviceID, sessionID string) {
 // relays the session coordinator counted. When leaves < attempts, some
 // relays shared a RelayHash and were deduped at the SMST-key level — log +
 // collapse counter bumped so it surfaces in dashboards.
-func RecordClaimLeafStats(supplier, serviceID, sessionID string, leaves, attempts int64) {
-	claimNumLeaves.WithLabelValues(supplier, serviceID, sessionID).Set(float64(leaves))
-	claimRelayAttempts.WithLabelValues(supplier, serviceID, sessionID).Set(float64(attempts))
+func RecordClaimLeafStats(supplier, serviceID, _ string, leaves, attempts int64) {
+	claimNumLeaves.WithLabelValues(supplier, serviceID).Set(float64(leaves))
+	claimRelayAttempts.WithLabelValues(supplier, serviceID).Set(float64(attempts))
 	if leaves < attempts {
 		claimLeafCollapseTotal.WithLabelValues(supplier, serviceID).Inc()
 	}
 }
 
-// ClearClaimLeafStats removes the per-session claim leaf gauges (called on
-// terminal transitions to keep cardinality bounded).
-func ClearClaimLeafStats(supplier, serviceID, sessionID string) {
-	claimNumLeaves.DeleteLabelValues(supplier, serviceID, sessionID)
-	claimRelayAttempts.DeleteLabelValues(supplier, serviceID, sessionID)
+// ClearClaimLeafStats is retained for lifecycle call-site compatibility. Claim
+// statistics are aggregated by supplier and service and must survive a session
+// transition so operators can inspect the latest claim for each series.
+func ClearClaimLeafStats(_, _, _ string) {
 }
 
 // RecordRelayFailedSMST records a relay that failed to add to SMST tree.
-func RecordRelayFailedSMST(supplier, serviceID, sessionID, reason string) {
-	relaysFailedSMST.WithLabelValues(supplier, serviceID, sessionID, reason).Inc()
+func RecordRelayFailedSMST(supplier, serviceID, _ string, reason string) {
+	relaysFailedSMST.WithLabelValues(supplier, serviceID, reason).Inc()
 }
 
 // RecordRelayRejected records a relay that was rejected.
@@ -1320,16 +1308,14 @@ func RecordSessionCreated(supplier, serviceID string) {
 	sessionsCreatedTotal.WithLabelValues(supplier, serviceID).Inc()
 }
 
-// ClearSessionMetrics removes session-specific metrics when session completes.
-func ClearSessionMetrics(supplier, sessionID, serviceID string) {
-	claimScheduledHeight.DeleteLabelValues(supplier, serviceID, sessionID)
-	proofScheduledHeight.DeleteLabelValues(supplier, serviceID, sessionID)
-	ClearClaimLeafStats(supplier, serviceID, sessionID)
+// ClearSessionMetrics is retained for lifecycle call-site compatibility. Miner
+// metrics are aggregate-only and must not be deleted when one session ends.
+func ClearSessionMetrics(_, _, _ string) {
 }
 
 // SetClaimScheduledHeight sets when a claim is scheduled to be submitted.
-func SetClaimScheduledHeight(supplier, serviceID, sessionID string, height float64) {
-	claimScheduledHeight.WithLabelValues(supplier, serviceID, sessionID).Set(height)
+func SetClaimScheduledHeight(supplier, serviceID, _ string, height float64) {
+	claimScheduledHeight.WithLabelValues(supplier, serviceID).Set(height)
 }
 
 // RecordClaimSubmissionLatency records how many blocks after window opened the claim was submitted.
@@ -1338,8 +1324,8 @@ func RecordClaimSubmissionLatency(supplier string, blocksAfterWindowOpened float
 }
 
 // SetProofScheduledHeight sets when a proof is scheduled to be submitted.
-func SetProofScheduledHeight(supplier, serviceID, sessionID string, height float64) {
-	proofScheduledHeight.WithLabelValues(supplier, serviceID, sessionID).Set(height)
+func SetProofScheduledHeight(supplier, serviceID, _ string, height float64) {
+	proofScheduledHeight.WithLabelValues(supplier, serviceID).Set(height)
 }
 
 // RecordProofSubmissionLatency records how many blocks after window opened the proof was submitted.
@@ -1596,9 +1582,9 @@ func RecordClaimDiscarded(supplier, serviceID, _ string, _, _ int64) {
 }
 
 // RecordBlockResultsRetry records a retry attempt for block_results query.
-func RecordBlockResultsRetry(height int64, _ int) {
+func RecordBlockResultsRetry(_ int64, _ int) {
 	// Track retry attempts (helps identify ABCI indexing lag)
-	blockResultsRetriesTotal.WithLabelValues(fmt.Sprintf("%d", height)).Inc()
+	blockResultsRetriesTotal.WithLabelValues().Inc()
 }
 
 // ====== WORKER POOL METRICS HELPERS ======

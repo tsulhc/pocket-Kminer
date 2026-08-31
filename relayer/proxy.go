@@ -25,8 +25,6 @@ import (
 	sdktypes "github.com/pokt-network/shannon-sdk/types"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
-	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/h2c"
 	"google.golang.org/grpc"
 
 	"github.com/pokt-network/pocket-relay-miner/cache"
@@ -511,21 +509,12 @@ func (p *ProxyServer) Start(ctx context.Context) error {
 	// Note: All async workers (validation, publish, metrics) are managed by pond subpools
 	// No need to spawn worker goroutines manually - pond handles all concurrency
 
-	// Create HTTP server with h2c (HTTP/2 cleartext) support for native gRPC
+	// Create an HTTP server with HTTP/1.1 and h2c support for native gRPC.
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", p.handleRelay)
 
-	// Configure HTTP/2 server for h2c (HTTP/2 without TLS)
-	// This is required for native gRPC clients connecting without TLS
-	h2s := &http2.Server{
-		MaxConcurrentStreams: MaxConcurrentStreams,
-	}
-
-	// Wrap the handler with h2c to support both HTTP/1.1 and HTTP/2 cleartext
-	h2cHandler := h2c.NewHandler(mux, h2s)
-
 	// Wrap with panic recovery middleware to prevent handler panics from crashing the server
-	handler := PanicRecoveryMiddleware(p.logger, h2cHandler)
+	handler := PanicRecoveryMiddleware(p.logger, mux)
 
 	// Server timeout configuration:
 	// - ReadTimeout: max timeout for reading entire request (including body)
@@ -536,16 +525,7 @@ func (p *ProxyServer) Start(ctx context.Context) error {
 	// allowing different timeouts per service (e.g., 30s for fast services, 600s for streaming).
 	maxServiceTimeout := p.config.getMaxServiceTimeout()
 
-	p.server = &http.Server{
-		Addr:    p.config.ListenAddr,
-		Handler: handler,
-		// ReadTimeout: max service timeout + buffer for request parsing
-		ReadTimeout: maxServiceTimeout + ReadTimeoutBuffer,
-		// WriteTimeout: 0 (disabled) - we use ResponseController for per-request deadlines
-		// This allows streaming services to have 600s while fast services have 30s
-		WriteTimeout: 0,
-		IdleTimeout:  DefaultIdleTimeout,
-	}
+	p.server = newHTTPServer(p.config.ListenAddr, handler, maxServiceTimeout)
 
 	// Log the resolved response-compression state at startup. This prints once
 	// per replica and makes it trivial to verify the YAML was parsed as
@@ -578,6 +558,27 @@ func (p *ProxyServer) Start(ctx context.Context) error {
 	}()
 
 	return nil
+}
+
+func newHTTPServer(addr string, handler http.Handler, maxServiceTimeout time.Duration) *http.Server {
+	protocols := new(http.Protocols)
+	protocols.SetHTTP1(true)
+	protocols.SetUnencryptedHTTP2(true)
+
+	return &http.Server{
+		Addr:      addr,
+		Handler:   handler,
+		Protocols: protocols,
+		// ReadTimeout: max service timeout + buffer for request parsing
+		ReadTimeout: maxServiceTimeout + ReadTimeoutBuffer,
+		// WriteTimeout: 0 (disabled) - we use ResponseController for per-request deadlines
+		// This allows streaming services to have 600s while fast services have 30s
+		WriteTimeout: 0,
+		IdleTimeout:  DefaultIdleTimeout,
+		HTTP2: &http.HTTP2Config{
+			MaxConcurrentStreams: MaxConcurrentStreams,
+		},
+	}
 }
 
 // handleRelay handles incoming relay requests.
