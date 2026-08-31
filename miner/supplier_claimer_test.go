@@ -144,6 +144,57 @@ func (s *SupplierClaimerTestSuite) TestClaimedMapTimestamp() {
 		"claimed timestamp should be <= after time")
 }
 
+func (s *SupplierClaimerTestSuite) TestStopReleasesClaimsWithoutReleaseCallbacks() {
+	claimer := s.createTestClaimer("shutdown-instance")
+
+	const supplierCount = 180
+	suppliers := make([]string, 0, supplierCount)
+	for i := 0; i < supplierCount; i++ {
+		supplier := fmt.Sprintf("supplier-%03d", i)
+		s.Require().True(claimer.TryClaim(s.ctx, supplier), "claim %s", supplier)
+		suppliers = append(suppliers, supplier)
+	}
+	s.Require().Equal(supplierCount, claimer.ClaimedCount())
+
+	callbackCalls := 0
+	claimer.SetCallbacks(nil, func(context.Context, string) error {
+		callbackCalls++
+		return nil
+	})
+
+	stopCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	s.Require().NoError(claimer.Stop(stopCtx))
+
+	// Whole-process shutdown must not route every lease through the live
+	// rebalance callback. SupplierManager.Close owns local teardown.
+	s.Require().Zero(callbackCalls)
+	s.Require().Zero(claimer.ClaimedCount())
+
+	for _, supplier := range suppliers {
+		claimKey := s.redisClient.KB().MinerClaimKey(supplier)
+		exists, err := s.redisClient.Exists(s.ctx, claimKey).Result()
+		s.Require().NoError(err)
+		s.Require().Zero(exists, "claim key must be released for %s", supplier)
+	}
+}
+
+func (s *SupplierClaimerTestSuite) TestReleaseStillInvokesReleaseCallback() {
+	claimer := s.createTestClaimer("handoff-instance")
+	s.Require().True(claimer.TryClaim(s.ctx, "supplier-handoff"))
+
+	callbackCalls := 0
+	claimer.SetCallbacks(nil, func(_ context.Context, supplier string) error {
+		s.Equal("supplier-handoff", supplier)
+		callbackCalls++
+		return nil
+	})
+
+	s.Require().NoError(claimer.Release(s.ctx, "supplier-handoff"))
+	s.Require().Equal(1, callbackCalls, "live handoff must preserve release callback semantics")
+	s.Require().False(claimer.IsClaimed("supplier-handoff"))
+}
+
 func (s *SupplierClaimerTestSuite) TestUpdateSuppliersIgnoresOrderOnlyChanges() {
 	claimer := s.createTestClaimer("test-instance-order")
 	claimer.ctx, claimer.cancelFn = context.WithCancel(s.ctx)
