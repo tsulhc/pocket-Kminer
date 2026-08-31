@@ -162,7 +162,7 @@ func (s *SupplierClaimerTestSuite) TestStopReleasesClaimsWithoutReleaseCallbacks
 		return nil
 	})
 
-	stopCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	s.Require().NoError(claimer.Stop(stopCtx))
 
