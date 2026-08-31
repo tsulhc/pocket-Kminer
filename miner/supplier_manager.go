@@ -1065,7 +1065,7 @@ func (m *SupplierManager) addSupplierWithData(ctx context.Context, operatorAddr 
 		},
 	)
 
-	// Create consumer for this supplier (single stream per supplier, fast 100ms polling)
+	// Create consumer for this supplier (single stream per supplier, push-based bounded blocking read)
 	consumer, err := redistransport.NewStreamsConsumer(
 		m.logger,
 		m.config.RedisClient,
@@ -1077,7 +1077,7 @@ func (m *SupplierManager) addSupplierWithData(ctx context.Context, operatorAddr 
 			BatchSize:               int64(m.config.BatchSize),                // Use config value (default: 1000)
 			ClaimIdleTimeout:        m.config.ClaimIdleTimeout.Milliseconds(), // From config (default: 60000ms)
 			MaxRetries:              3,
-			// Note: Uses BLOCK 0 (TRUE PUSH) for live consumption - hardcoded in consumer
+			// Note: Uses a short bounded BLOCK for push delivery and deterministic shutdown
 		},
 		0, // Discovery interval ignored with single stream architecture
 	)
