@@ -94,8 +94,8 @@ func NewClient(ctx context.Context, cfg ClientConfig) (*Client, error) {
 
 	// Pool size must be large enough for blocked + non-blocked operations:
 	//
-	// BLOCKED CONNECTIONS (held indefinitely):
-	// - 1 per supplier: XREADGROUP BLOCK 0 (stream consumption)
+	// BLOCKING CONNECTIONS (held while waiting for relays):
+	// - 1 per supplier: XREADGROUP with a short bounded BLOCK (stream consumption)
 	// - 1: Block event pub/sub subscriber
 	// - 2-3: Cache invalidation pub/sub channels
 	// - 1: Supplier registry pub/sub
