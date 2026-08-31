@@ -209,36 +209,60 @@ func (c *SupplierClaimer) Start(ctx context.Context, suppliers []string) error {
 }
 
 // Stop gracefully shuts down the claimer and releases all claims.
+//
+// Shutdown is deliberately different from a live rebalance/handoff: the owning
+// SupplierManager.Close path already cancels and tears down every local supplier.
+// Calling the normal release callback here would therefore duplicate teardown and,
+// in SupplierManager.onSupplierReleased, perform one synchronous chain audit per
+// supplier before the Redis lease can be released. At hundreds of suppliers that
+// turns shutdown into a minutes-long serial operation and can race the manager's
+// own teardown.
+//
+// Release the leases directly during process shutdown. Normal Release calls still
+// invoke the callback and preserve the handoff semantics used by rebalancing.
 func (c *SupplierClaimer) Stop(ctx context.Context) error {
 	if c.cancelFn != nil {
 		c.cancelFn()
 	}
 
-	// Wait for goroutines to finish
+	// Wait for goroutines to finish.
 	c.wg.Wait()
 
-	// Release all claims
-	c.claimedMu.Lock()
+	c.claimedMu.RLock()
 	claimed := make([]string, 0, len(c.claimed))
 	for supplier := range c.claimed {
 		claimed = append(claimed, supplier)
 	}
-	c.claimedMu.Unlock()
+	c.claimedMu.RUnlock()
 
+	var stopErr error
 	for _, supplier := range claimed {
-		if err := c.Release(ctx, supplier); err != nil {
+		if err := ctx.Err(); err != nil {
+			stopErr = err
+			break
+		}
+		if err := c.releaseClaim(ctx, supplier, false); err != nil {
 			c.logger.Warn().Err(err).Str("supplier", supplier).Msg("failed to release claim on shutdown")
+			if stopErr == nil {
+				stopErr = err
+			}
 		}
 	}
 
-	// Unregister this instance
+	// Unregister this instance. If the shutdown deadline already expired, the
+	// registration/remaining leases are still bounded by their Redis TTLs.
 	if err := c.unregisterInstance(ctx); err != nil {
 		c.logger.Warn().Err(err).Msg("failed to unregister instance on shutdown")
+		if stopErr == nil {
+			stopErr = err
+		}
 	}
 
-	c.logger.Info().Msg("supplier claimer stopped")
+	c.logger.Info().
+		Int("claims_remaining", c.ClaimedCount()).
+		Msg("supplier claimer stopped")
 
-	return nil
+	return stopErr
 }
 
 // TryClaim attempts to claim a supplier using Redis SET NX with TTL.
@@ -319,9 +343,17 @@ func (c *SupplierClaimer) TryClaim(ctx context.Context, supplier string) bool {
 // callback returns an error, the claim key is kept and the supplier stays
 // claimed by this instance.
 func (c *SupplierClaimer) Release(ctx context.Context, supplier string) error {
-	// Invoke release callback FIRST. If it returns an error, we abort and keep
-	// the Redis claim key alive to prevent orphan-reclaim thrashing.
-	if c.onReleaseFn != nil {
+	return c.releaseClaim(ctx, supplier, true)
+}
+
+// releaseClaim releases one Redis lease. invokeCallback must be true for live
+// handoffs/rebalances and false for whole-process shutdown, where
+// SupplierManager.Close owns the local supplier teardown.
+func (c *SupplierClaimer) releaseClaim(ctx context.Context, supplier string, invokeCallback bool) error {
+	// Invoke release callback FIRST for live handoffs. If it returns an error,
+	// abort and keep the Redis claim key alive to prevent orphan-reclaim
+	// thrashing.
+	if invokeCallback && c.onReleaseFn != nil {
 		if err := c.onReleaseFn(ctx, supplier); err != nil {
 			c.logger.Debug().
 				Err(err).
