@@ -690,7 +690,7 @@ func (p *ProxyServer) handleRelay(w http.ResponseWriter, r *http.Request) {
 		ServiceID:    serviceID,
 		RPCType:      classification.RPCType,
 		Workload:     classification,
-		RequestBytes: len(body),
+		RelayRequestBytes: len(body),
 		Outcome:      "rejected",
 	}
 	defer func() {
@@ -708,6 +708,7 @@ func (p *ProxyServer) handleRelay(w http.ResponseWriter, r *http.Request) {
 	if serviceID == "" {
 		sendError(http.StatusBadRequest, "missing service ID in relay request")
 		relaysReceived.WithLabelValues(metricLabelUnknown, metricLabelUnknown).Inc()
+		observation.RejectReason = rejectReasonMissingServiceID
 		relaysRejected.WithLabelValues(metricLabelUnknown, metricLabelUnknown, rejectReasonMissingServiceID).Inc()
 		return
 	}
@@ -718,6 +719,7 @@ func (p *ProxyServer) handleRelay(w http.ResponseWriter, r *http.Request) {
 			Msg("response signer not configured")
 		sendError(http.StatusInternalServerError, "relayer not properly configured")
 		relaysReceived.WithLabelValues(serviceID, "unknown").Inc()
+		observation.RejectReason = rejectReasonResponseSignerNotConfigured
 		relaysRejected.WithLabelValues(serviceID, metricLabelUnknown, rejectReasonResponseSignerNotConfigured).Inc()
 		return
 	}
@@ -727,6 +729,7 @@ func (p *ProxyServer) handleRelay(w http.ResponseWriter, r *http.Request) {
 			Msg("supplier cache not configured")
 		sendError(http.StatusInternalServerError, "relayer not properly configured")
 		relaysReceived.WithLabelValues(serviceID, "unknown").Inc()
+		observation.RejectReason = rejectReasonSupplierCacheNotConfigured
 		relaysRejected.WithLabelValues(serviceID, metricLabelUnknown, rejectReasonSupplierCacheNotConfigured).Inc()
 		return
 	}
@@ -736,6 +739,7 @@ func (p *ProxyServer) handleRelay(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		sendError(http.StatusNotFound, fmt.Sprintf("unknown service: %s", serviceID))
 		relaysReceived.WithLabelValues(serviceID, "unknown").Inc()
+		observation.RejectReason = rejectReasonUnknownService
 		relaysRejected.WithLabelValues(serviceID, metricLabelUnknown, rejectReasonUnknownService).Inc()
 		return
 	}
@@ -773,6 +777,7 @@ func (p *ProxyServer) handleRelay(w http.ResponseWriter, r *http.Request) {
 		logging.WithSessionContext(p.logger.Warn(), sessionCtx).
 			Msg("missing supplier operator address in relay request")
 		sendError(http.StatusBadRequest, "missing supplier operator address in relay request")
+		observation.RejectReason = rejectReasonMissingSupplierAddress
 		relaysRejected.WithLabelValues(serviceID, rpcType, rejectReasonMissingSupplierAddress).Inc()
 		return
 	}
@@ -784,6 +789,7 @@ func (p *ProxyServer) handleRelay(w http.ResponseWriter, r *http.Request) {
 			Err(cacheErr).
 			Msg("failed to check supplier state in cache")
 		sendError(http.StatusServiceUnavailable, "failed to verify supplier state")
+		observation.RejectReason = rejectReasonSupplierCacheError
 		relaysRejected.WithLabelValues(serviceID, rpcType, rejectReasonSupplierCacheError).Inc()
 		return
 	}
@@ -791,6 +797,7 @@ func (p *ProxyServer) handleRelay(w http.ResponseWriter, r *http.Request) {
 		logging.WithSessionContext(p.logger.Warn(), sessionCtx).
 			Msg("supplier not found in cache")
 		sendError(http.StatusServiceUnavailable, fmt.Sprintf("supplier %s not registered with any miner", supplierOperatorAddr))
+		observation.RejectReason = rejectReasonSupplierNotFound
 		relaysRejected.WithLabelValues(serviceID, rpcType, rejectReasonSupplierNotFound).Inc()
 		return
 	}
@@ -799,6 +806,7 @@ func (p *ProxyServer) handleRelay(w http.ResponseWriter, r *http.Request) {
 			Str("status", supplierState.Status).
 			Msg("supplier not active")
 		sendError(http.StatusServiceUnavailable, fmt.Sprintf("supplier %s is %s", supplierOperatorAddr, supplierState.Status))
+		observation.RejectReason = rejectReasonSupplierInactive
 		relaysRejected.WithLabelValues(serviceID, rpcType, rejectReasonSupplierInactive).Inc()
 		return
 	}
@@ -806,6 +814,7 @@ func (p *ProxyServer) handleRelay(w http.ResponseWriter, r *http.Request) {
 		logging.WithSessionContext(p.logger.Warn(), sessionCtx).
 			Msg("supplier has no services registered")
 		sendError(http.StatusServiceUnavailable, fmt.Sprintf("supplier %s has no services registered", supplierOperatorAddr))
+		observation.RejectReason = rejectReasonNoServices
 		relaysRejected.WithLabelValues(serviceID, rpcType, rejectReasonNoServices).Inc()
 		return
 	}
@@ -814,6 +823,7 @@ func (p *ProxyServer) handleRelay(w http.ResponseWriter, r *http.Request) {
 			Int("num_services", len(supplierState.Services)).
 			Msg("supplier not staked for service")
 		sendError(http.StatusServiceUnavailable, fmt.Sprintf("supplier %s not staked for service %s", supplierOperatorAddr, serviceID))
+		observation.RejectReason = rejectReasonWrongService
 		relaysRejected.WithLabelValues(serviceID, rpcType, rejectReasonWrongService).Inc()
 		return
 	}
@@ -824,6 +834,7 @@ func (p *ProxyServer) handleRelay(w http.ResponseWriter, r *http.Request) {
 	if !p.healthChecker.IsHealthy(serviceID) {
 		// NOTE: this will return true always until is properly implemented.
 		sendError(http.StatusServiceUnavailable, "backend unhealthy")
+		observation.RejectReason = rejectReasonBackendUnhealthy
 		relaysRejected.WithLabelValues(serviceID, rpcType, rejectReasonBackendUnhealthy).Inc()
 		return
 	}
@@ -832,6 +843,7 @@ func (p *ProxyServer) handleRelay(w http.ResponseWriter, r *http.Request) {
 	serviceMaxBodySize := p.config.GetServiceMaxBodySize(serviceID)
 	if int64(len(body)) > serviceMaxBodySize {
 		sendError(http.StatusRequestEntityTooLarge, "request body too large for service")
+		observation.RejectReason = rejectReasonBodyTooLarge
 		relaysRejected.WithLabelValues(serviceID, rpcType, rejectReasonBodyTooLarge).Inc()
 		return
 	}
@@ -845,6 +857,7 @@ func (p *ProxyServer) handleRelay(w http.ResponseWriter, r *http.Request) {
 		relayRequest.Meta.SessionHeader.GetSessionEndBlockHeight(), arrivalBlockHeight,
 	) {
 		sendError(http.StatusBadRequest, "implausible session heights")
+		observation.RejectReason = rejectReasonValidationFailed
 		relaysRejected.WithLabelValues(serviceID, rpcType, rejectReasonValidationFailed).Inc()
 		return
 	}
@@ -889,6 +902,7 @@ func (p *ProxyServer) handleRelay(w http.ResponseWriter, r *http.Request) {
 					Msg("relay meter error (eager mode)")
 				if !allowed {
 					sendError(http.StatusServiceUnavailable, "relay metering unavailable")
+					observation.RejectReason = rejectReasonMeterError
 					relaysRejected.WithLabelValues(serviceID, rpcType, rejectReasonMeterError).Inc()
 					return
 				}
@@ -896,6 +910,7 @@ func (p *ProxyServer) handleRelay(w http.ResponseWriter, r *http.Request) {
 				logging.WithSessionContext(p.logger.Debug(), sessionCtx).
 					Msg("relay rejected: session relay limit reached (eager mode)")
 				sendError(http.StatusTooManyRequests, "session relay limit reached: claimable portion fully consumed")
+				observation.RejectReason = rejectReasonStakeExhausted
 				relaysRejected.WithLabelValues(serviceID, rpcType, rejectReasonStakeExhausted).Inc()
 				return
 			}
@@ -908,6 +923,7 @@ func (p *ProxyServer) handleRelay(w http.ResponseWriter, r *http.Request) {
 			ffPool := p.config.GetPool(serviceID, rpcType)
 			if ffPool == nil || !ffPool.HasHealthy() {
 				sendServiceUnavailable()
+				observation.RejectReason = rejectReasonBackendUnhealthy
 				fastFailsTotal.WithLabelValues(serviceID).Inc()
 				p.logger.Debug().Str("service_id", serviceID).Str("rpc_type", rpcType).Msg("fast-fail: all backends unhealthy (eager pre-validation)")
 				return
@@ -917,6 +933,7 @@ func (p *ProxyServer) handleRelay(w http.ResponseWriter, r *http.Request) {
 		eagerStart := time.Now()
 		if validationErr := p.validateRelayRequest(r.Context(), r, body, arrivalBlockHeight); validationErr != nil {
 			sendError(http.StatusForbidden, validationErr.Error())
+			observation.RejectReason = rejectReasonValidationFailed
 			relaysRejected.WithLabelValues(serviceID, rpcType, rejectReasonValidationFailed).Inc()
 			validationFailures.WithLabelValues(serviceID, "signature").Inc()
 			return
@@ -939,6 +956,7 @@ func (p *ProxyServer) handleRelay(w http.ResponseWriter, r *http.Request) {
 		ffPool := p.config.GetPool(serviceID, rpcType)
 		if ffPool == nil || !ffPool.HasHealthy() {
 			sendServiceUnavailable()
+			observation.RejectReason = rejectReasonBackendUnhealthy
 			fastFailsTotal.WithLabelValues(serviceID).Inc()
 			p.logger.Debug().Str("service_id", serviceID).Str("rpc_type", rpcType).Msg("fast-fail: all backends unhealthy")
 			return
@@ -1047,7 +1065,7 @@ func (p *ProxyServer) handleRelay(w http.ResponseWriter, r *http.Request) {
 	backendRequests.WithLabelValues(serviceID, outcome, statusLabel).Inc()
 
 	if err != nil {
-		observation.Outcome = outcome
+		observation.Outcome = "backend_error"
 		if observation.StatusCode == 0 {
 			observation.StatusCode = http.StatusBadGateway
 		}
@@ -1056,6 +1074,7 @@ func (p *ProxyServer) handleRelay(w http.ResponseWriter, r *http.Request) {
 			sendError(http.StatusBadGateway, "backend error")
 		}
 		// outcome doubles as the rejection reason for error cases.
+		observation.RejectReason = outcome
 		relaysRejected.WithLabelValues(serviceID, rpcType, outcome).Inc()
 		return
 	}
@@ -1064,9 +1083,10 @@ func (p *ProxyServer) handleRelay(w http.ResponseWriter, r *http.Request) {
 	// 2xx-4xx are valid relays (client/backend logic errors that should be paid)
 	// 5xx are infrastructure/backend failures (supplier should not be compensated)
 	if respStatus >= http.StatusInternalServerError {
-		observation.Outcome = rejectReasonBackend5xx
+		observation.Outcome = "backend_5xx"
 		// Return raw 5xx status to client (no wrapping in RelayResponse)
 		sendError(respStatus, "backend service error")
+		observation.RejectReason = rejectReasonBackend5xx
 		relaysRejected.WithLabelValues(serviceID, rpcType, rejectReasonBackend5xx).Inc()
 		logging.WithSessionContext(p.logger.Warn(), sessionCtx).
 			Int("status_code", respStatus).
@@ -1087,12 +1107,13 @@ func (p *ProxyServer) handleRelay(w http.ResponseWriter, r *http.Request) {
 			respStatus,
 		)
 		if signErr != nil {
-			observation.Outcome = rejectReasonSigningError
+			observation.Outcome = "signing_error"
 			observation.StatusCode = http.StatusInternalServerError
 			logging.WithSessionContext(p.logger.Error(), sessionCtx).
 				Err(signErr).
 				Msg("failed to sign relay response")
 			sendError(http.StatusInternalServerError, "failed to sign response")
+			observation.RejectReason = rejectReasonSigningError
 			relaysRejected.WithLabelValues(serviceID, rpcType, rejectReasonSigningError).Inc()
 			return
 		}

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
 
@@ -26,13 +27,17 @@ const (
 // RelayWorkload is the bounded, body-safe classification emitted with relay
 // telemetry. JSON-RPC params and REST query strings are intentionally ignored.
 type RelayWorkload struct {
-	RPCType          string
-	Workload         string
-	JSONRPCMethod    string
-	JSONRPCMethods   []string
-	JSONRPCBatch     bool
-	JSONRPCBatchSize int
-	RESTPath         string
+	RPCType                string
+	Workload               string
+	HTTPMethod             string
+	NormalizedPath         string
+	BackendRequestBytes    int
+	JSONRPCMethod          string
+	JSONRPCMethods         []string
+	JSONRPCBatch           bool
+	JSONRPCBatchSize       int
+	BatchMethodsTruncated  bool
+	RESTPath               string
 }
 
 // PocketRequestID returns a stable opaque ID derived from the complete signed
@@ -77,6 +82,10 @@ func ClassifyRelayWorkload(relayRequest *servicetypes.RelayRequest) RelayWorkloa
 		return classification
 	}
 
+	classification.HTTPMethod = httpRequest.Method
+	classification.NormalizedPath = safeRESTPath(httpRequest.Url)
+	classification.BackendRequestBytes = len(httpRequest.BodyBz)
+
 	rpcType := relayHeaderValue(httpRequest, "Rpc-Type")
 	if rpcType != "" {
 		classification.RPCType = RPCTypeToBackendType(rpcType)
@@ -89,7 +98,7 @@ func ClassifyRelayWorkload(relayRequest *servicetypes.RelayRequest) RelayWorkloa
 		classifyJSONRPC(httpRequest.BodyBz, &classification)
 	case BackendTypeREST:
 		classification.Workload = workloadREST
-		classification.RESTPath = safeRESTPath(httpRequest.Url)
+		classification.RESTPath = classification.NormalizedPath
 	}
 
 	return classification
@@ -125,17 +134,23 @@ func classifyJSONRPC(body []byte, classification *RelayWorkload) {
 		classification.Workload = workloadJSONRPCBatch
 		classification.JSONRPCBatch = true
 		classification.JSONRPCBatchSize = len(batch)
-		seenMethods := make(map[string]struct{}, 8)
+		seenMethods := make(map[string]struct{}, len(batch))
 		for _, request := range batch {
 			if request.Method == "" {
 				continue
 			}
-			if _, seen := seenMethods[request.Method]; seen || len(classification.JSONRPCMethods) >= 8 {
-				continue
-			}
 			seenMethods[request.Method] = struct{}{}
-			classification.JSONRPCMethods = append(classification.JSONRPCMethods, request.Method)
 		}
+		methods := make([]string, 0, len(seenMethods))
+		for method := range seenMethods {
+			methods = append(methods, method)
+		}
+		sort.Strings(methods)
+		classification.BatchMethodsTruncated = len(methods) > 8
+		if classification.BatchMethodsTruncated {
+			methods = methods[:8]
+		}
+		classification.JSONRPCMethods = methods
 		return
 	}
 
@@ -213,14 +228,15 @@ type RelayObservation struct {
 	ServiceID       string
 	RPCType         string
 	Workload        RelayWorkload
-	RequestBytes    int
-	ResponseBytes   int
+	RelayRequestBytes int
+	ResponseBytes     int
 	StatusCode      int
 	BackendEndpoint string
 	Retries         int
 	BackendLatency  time.Duration
 	TotalLatency    time.Duration
 	Outcome         string
+	RejectReason    string
 }
 
 func logRelayObservation(logger logging.Logger, relayRequest *servicetypes.RelayRequest, observation RelayObservation) {
@@ -235,7 +251,8 @@ func logRelayObservation(logger logging.Logger, relayRequest *servicetypes.Relay
 		Str(logging.FieldRPCType, observation.RPCType).
 		Str(logging.FieldWorkload, observation.Workload.Workload).
 		Str("outcome", observation.Outcome).
-		Int(logging.FieldRequestSize, observation.RequestBytes).
+		Int("backend_request_bytes", observation.Workload.BackendRequestBytes).
+		Int("relay_request_bytes", observation.RelayRequestBytes).
 		Int(logging.FieldResponseSize, observation.ResponseBytes).
 		Int("status_code", observation.StatusCode).
 		Int("retries", observation.Retries).
@@ -244,16 +261,23 @@ func logRelayObservation(logger logging.Logger, relayRequest *servicetypes.Relay
 	if observation.BackendEndpoint != "" {
 		event = event.Str("backend_endpoint", observation.BackendEndpoint)
 	}
+	if observation.Workload.HTTPMethod != "" {
+		event = event.Str("http_method", observation.Workload.HTTPMethod)
+	}
+	if observation.Workload.NormalizedPath != "" {
+		event = event.Str("normalized_path", observation.Workload.NormalizedPath)
+	}
+	if observation.RejectReason != "" {
+		event = event.Str("reject_reason", observation.RejectReason)
+	}
 	if observation.Workload.JSONRPCMethod != "" {
 		event = event.Str("jsonrpc_method", observation.Workload.JSONRPCMethod)
 	}
 	if observation.Workload.JSONRPCBatch {
 		event = event.Bool("jsonrpc_batch", true).
 			Int("jsonrpc_batch_size", observation.Workload.JSONRPCBatchSize).
-			Strs("jsonrpc_methods", observation.Workload.JSONRPCMethods)
-	}
-	if observation.Workload.RESTPath != "" {
-		event = event.Str("rest_path", observation.Workload.RESTPath)
+			Strs("jsonrpc_methods", observation.Workload.JSONRPCMethods).
+			Bool("batch_methods_truncated", observation.Workload.BatchMethodsTruncated)
 	}
 	event.Msg("pocket relay observation")
 }

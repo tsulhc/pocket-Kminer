@@ -27,14 +27,16 @@ one `pocket relay observation` JSON event containing:
 - `rpc_type`: normalized backend type
 - `workload`: JSON-RPC method, `jsonrpc_batch`, `jsonrpc_unknown`, `rest`, or `unknown`
 - `jsonrpc_method` for a single JSON-RPC request
-- `jsonrpc_batch`, `jsonrpc_batch_size`, and up to 8 unique `jsonrpc_methods`
-  for a batch
-- `rest_path` without the query string or high-cardinality identifiers for REST
-  requests
-- `request_bytes`, `response_bytes`, `status_code`, `retries`, backend endpoint,
-  backend latency, and total latency
-- `outcome`: `served`, `backend_error`, `backend_5xx`, rejection reason, or
-  signing error
+- `http_method` and `normalized_path` for the actual backend request
+- `jsonrpc_batch`, `jsonrpc_batch_size`, up to 8 sorted unique
+  `jsonrpc_methods`, and `batch_methods_truncated`
+- `backend_request_bytes` for the payload sent to Janus/RPC and
+  `relay_request_bytes` for the outer signed RelayRequest
+- `response_bytes`, `status_code`, `retries`, backend endpoint, backend
+  latency, and total latency
+- coarse `outcome`: `served`, `rejected`, `backend_error`,
+  `backend_5xx`, or `signing_error`
+- bounded `reject_reason` for the specific rejection/failure class
 
 The event does not contain JSON-RPC `params`, calldata, request or response
 payloads, REST query strings, client IPs, public keys, or Prometheus labels for
