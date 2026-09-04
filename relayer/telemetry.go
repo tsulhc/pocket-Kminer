@@ -5,8 +5,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	sdktypes "github.com/pokt-network/shannon-sdk/types"
 
@@ -15,8 +17,6 @@ import (
 )
 
 const (
-	pocketRequestIDPrefix = "pocket-req-"
-
 	workloadUnknown      = "unknown"
 	workloadJSONRPCBatch = "jsonrpc_batch"
 	workloadJSONRPCOther = "jsonrpc_unknown"
@@ -29,6 +29,7 @@ type RelayWorkload struct {
 	RPCType          string
 	Workload         string
 	JSONRPCMethod    string
+	JSONRPCMethods   []string
 	JSONRPCBatch     bool
 	JSONRPCBatchSize int
 	RESTPath         string
@@ -43,7 +44,7 @@ func PocketRequestID(relayRequestBytes []byte) string {
 	}
 
 	digest := sha256.Sum256(relayRequestBytes)
-	return pocketRequestIDPrefix + hex.EncodeToString(digest[:])
+	return hex.EncodeToString(digest[:16])
 }
 
 // PocketRequestIDFromRelayRequest returns the same ID for typed relay paths
@@ -124,6 +125,17 @@ func classifyJSONRPC(body []byte, classification *RelayWorkload) {
 		classification.Workload = workloadJSONRPCBatch
 		classification.JSONRPCBatch = true
 		classification.JSONRPCBatchSize = len(batch)
+		seenMethods := make(map[string]struct{}, 8)
+		for _, request := range batch {
+			if request.Method == "" {
+				continue
+			}
+			if _, seen := seenMethods[request.Method]; seen || len(classification.JSONRPCMethods) >= 8 {
+				continue
+			}
+			seenMethods[request.Method] = struct{}{}
+			classification.JSONRPCMethods = append(classification.JSONRPCMethods, request.Method)
+		}
 		return
 	}
 
@@ -143,48 +155,105 @@ func safeRESTPath(rawURL string) string {
 	if err != nil {
 		return ""
 	}
-	return parsed.Path
+	parts := strings.Split(parsed.Path, "/")
+	for i, part := range parts {
+		switch {
+		case isNumericPathPart(part):
+			parts[i] = ":height"
+		case isHexPathPart(part):
+			parts[i] = ":hash"
+		case isAddressPathPart(part):
+			parts[i] = ":address"
+		}
+	}
+	return strings.Join(parts, "/")
 }
 
-func logRelayTelemetry(
-	logger logging.Logger,
-	relayRequest *servicetypes.RelayRequest,
-	relayRequestBytes, responseBytes []byte,
-	serviceID, supplierAddress, requestID string,
-	classification RelayWorkload,
-	outcome, relayHash string,
-	computeUnits uint64,
-) {
+func isNumericPathPart(part string) bool {
+	if part == "" {
+		return false
+	}
+	for _, char := range part {
+		if char < '0' || char > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func isHexPathPart(part string) bool {
+	part = strings.TrimPrefix(part, "0x")
+	if len(part) < 16 {
+		return false
+	}
+	for _, char := range part {
+		if !((char >= '0' && char <= '9') || (char >= 'a' && char <= 'f') || (char >= 'A' && char <= 'F')) {
+			return false
+		}
+	}
+	return true
+}
+
+func isAddressPathPart(part string) bool {
+	separator := strings.IndexByte(part, '1')
+	return separator > 0 && len(part)-separator-1 >= 20
+}
+
+// setPocketRequestID overwrites any client-provided value with the identity
+// derived from the signed request bytes.
+func setPocketRequestID(header http.Header, relayRequestBytes []byte) {
+	if requestID := PocketRequestID(relayRequestBytes); requestID != "" {
+		header.Set(HeaderPocketRequestID, requestID)
+	}
+}
+
+// RelayObservation captures the request lifecycle at the proxy boundary.
+type RelayObservation struct {
+	RequestID       string
+	ServiceID       string
+	RPCType         string
+	Workload        RelayWorkload
+	RequestBytes    int
+	ResponseBytes   int
+	StatusCode      int
+	BackendEndpoint string
+	Retries         int
+	BackendLatency  time.Duration
+	TotalLatency    time.Duration
+	Outcome         string
+}
+
+func logRelayObservation(logger logging.Logger, relayRequest *servicetypes.RelayRequest, observation RelayObservation) {
 	sessionContext := logging.SessionContextFromRelayRequest(relayRequest)
 	if sessionContext.ServiceID == "" {
-		sessionContext.ServiceID = serviceID
-	}
-	if sessionContext.Supplier == "" {
-		sessionContext.Supplier = supplierAddress
+		sessionContext.ServiceID = observation.ServiceID
 	}
 
 	event := logging.WithSessionContext(logger.Info(), sessionContext).
-		Str("event", "relay").
-		Str(logging.FieldRequestID, requestID).
-		Str(logging.FieldRPCType, classification.RPCType).
-		Str(logging.FieldWorkload, classification.Workload).
-		Str("outcome", outcome).
-		Int(logging.FieldRequestSize, len(relayRequestBytes)).
-		Int(logging.FieldResponseSize, len(responseBytes)).
-		Uint64("compute_units", computeUnits)
-
-	if classification.JSONRPCMethod != "" {
-		event = event.Str("jsonrpc_method", classification.JSONRPCMethod)
+		Str("event", "pocket_relay_observation").
+		Str(logging.FieldRequestID, observation.RequestID).
+		Str(logging.FieldRPCType, observation.RPCType).
+		Str(logging.FieldWorkload, observation.Workload.Workload).
+		Str("outcome", observation.Outcome).
+		Int(logging.FieldRequestSize, observation.RequestBytes).
+		Int(logging.FieldResponseSize, observation.ResponseBytes).
+		Int("status_code", observation.StatusCode).
+		Int("retries", observation.Retries).
+		Float64("backend_latency_ms", float64(observation.BackendLatency)/float64(time.Millisecond)).
+		Float64("total_latency_ms", float64(observation.TotalLatency)/float64(time.Millisecond))
+	if observation.BackendEndpoint != "" {
+		event = event.Str("backend_endpoint", observation.BackendEndpoint)
 	}
-	if classification.JSONRPCBatch {
-		event = event.Bool("jsonrpc_batch", true).Int("jsonrpc_batch_size", classification.JSONRPCBatchSize)
+	if observation.Workload.JSONRPCMethod != "" {
+		event = event.Str("jsonrpc_method", observation.Workload.JSONRPCMethod)
 	}
-	if classification.RESTPath != "" {
-		event = event.Str("rest_path", classification.RESTPath)
+	if observation.Workload.JSONRPCBatch {
+		event = event.Bool("jsonrpc_batch", true).
+			Int("jsonrpc_batch_size", observation.Workload.JSONRPCBatchSize).
+			Strs("jsonrpc_methods", observation.Workload.JSONRPCMethods)
 	}
-	if relayHash != "" {
-		event = event.Str("relay_hash", relayHash)
+	if observation.Workload.RESTPath != "" {
+		event = event.Str("rest_path", observation.Workload.RESTPath)
 	}
-
-	event.Msg("relay telemetry")
+	event.Msg("pocket relay observation")
 }
