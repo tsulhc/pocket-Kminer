@@ -27,17 +27,17 @@ const (
 // RelayWorkload is the bounded, body-safe classification emitted with relay
 // telemetry. JSON-RPC params and REST query strings are intentionally ignored.
 type RelayWorkload struct {
-	RPCType                string
-	Workload               string
-	HTTPMethod             string
-	NormalizedPath         string
-	BackendRequestBytes    int
-	JSONRPCMethod          string
-	JSONRPCMethods         []string
-	JSONRPCBatch           bool
-	JSONRPCBatchSize       int
-	BatchMethodsTruncated  bool
-	RESTPath               string
+	RPCType               string
+	Workload              string
+	HTTPMethod            string
+	NormalizedPath        string
+	BackendRequestBytes   int
+	JSONRPCMethod         string
+	JSONRPCMethods        []string
+	JSONRPCBatch          bool
+	JSONRPCBatchSize      int
+	BatchMethodsTruncated bool
+	RESTPath              string
 }
 
 // PocketRequestID returns a stable opaque ID derived from the complete signed
@@ -224,19 +224,19 @@ func setPocketRequestID(header http.Header, relayRequestBytes []byte) {
 
 // RelayObservation captures the request lifecycle at the proxy boundary.
 type RelayObservation struct {
-	RequestID       string
-	ServiceID       string
-	RPCType         string
-	Workload        RelayWorkload
+	RequestID         string
+	ServiceID         string
+	RPCType           string
+	Workload          RelayWorkload
 	RelayRequestBytes int
 	ResponseBytes     int
-	StatusCode      int
-	BackendEndpoint string
-	Retries         int
-	BackendLatency  time.Duration
-	TotalLatency    time.Duration
-	Outcome         string
-	RejectReason    string
+	StatusCode        int
+	BackendEndpoint   string
+	Retries           int
+	BackendLatency    time.Duration
+	TotalLatency      time.Duration
+	Outcome           string
+	RejectReason      string
 }
 
 func logRelayObservation(logger logging.Logger, relayRequest *servicetypes.RelayRequest, observation RelayObservation) {

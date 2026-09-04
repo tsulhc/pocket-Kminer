@@ -686,12 +686,12 @@ func (p *ProxyServer) handleRelay(w http.ResponseWriter, r *http.Request) {
 	sessionCtx := logging.SessionContextFromRelayRequest(relayRequest)
 	classification := ClassifyRelayWorkload(relayRequest)
 	observation := RelayObservation{
-		RequestID:    PocketRequestID(body),
-		ServiceID:    serviceID,
-		RPCType:      classification.RPCType,
-		Workload:     classification,
+		RequestID:         PocketRequestID(body),
+		ServiceID:         serviceID,
+		RPCType:           classification.RPCType,
+		Workload:          classification,
 		RelayRequestBytes: len(body),
-		Outcome:      "rejected",
+		Outcome:           "rejected",
 	}
 	defer func() {
 		observation.TotalLatency = time.Since(startTime)
