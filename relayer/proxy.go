@@ -51,6 +51,8 @@ const (
 	HeaderPocketService = "Pocket-Service"
 	// HeaderPocketApplication is the application address that signed the relay.
 	HeaderPocketApplication = "Pocket-Application"
+	// HeaderPocketRequestID is the stable ID derived from the signed RelayRequest.
+	HeaderPocketRequestID = "Pocket-Request-ID"
 
 	// Metric label constants
 	metricLabelUnknown = "unknown"
@@ -1572,6 +1574,11 @@ func (p *ProxyServer) forwardToBackendWithStreaming(
 	req.Header.Set(HeaderPocketService, serviceID)
 	if applicationAddress != "" {
 		req.Header.Set(HeaderPocketApplication, applicationAddress)
+	}
+	if requestID := PocketRequestID(body); requestID != "" {
+		// Set after copied/configured headers so a client cannot override the
+		// identity used for relay telemetry correlation.
+		req.Header.Set(HeaderPocketRequestID, requestID)
 	}
 
 	// Execute backend request using service-specific HTTP client.

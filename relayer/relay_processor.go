@@ -3,6 +3,7 @@ package relayer
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"sync"
 
@@ -130,9 +131,31 @@ func (rp *relayProcessor) ProcessRelay(
 		return nil, nil
 	}
 
+	requestID := PocketRequestID(reqBody)
+	classification := ClassifyRelayWorkload(relayReq)
+	outcome := "processed"
+	relayHashHex := ""
+	var computeUnits uint64
+	defer func() {
+		logRelayTelemetry(
+			rp.logger,
+			relayReq,
+			reqBody,
+			respBody,
+			serviceID,
+			supplierAddr,
+			requestID,
+			classification,
+			outcome,
+			relayHashHex,
+			computeUnits,
+		)
+	}()
+
 	// Build relay response
 	relayResp, err := rp.buildRelayResponse(ctx, relayReq, respBody, supplierAddr)
 	if err != nil {
+		outcome = "response_error"
 		return nil, fmt.Errorf("failed to build relay response: %w", err)
 	}
 
@@ -152,10 +175,12 @@ func (rp *relayProcessor) ProcessRelay(
 	// Calculate relay hash (now WITHOUT payload - matches blockchain expectation)
 	relayBz, err := relay.Marshal()
 	if err != nil {
+		outcome = "marshal_error"
 		return nil, fmt.Errorf("failed to marshal relay: %w", err)
 	}
 
 	relayHash := protocol.GetRelayHashFromBytes(relayBz)
+	relayHashHex = hex.EncodeToString(relayHash[:])
 
 	// Extract session info from relay request for logging and message construction
 	sessionHeader := relayReq.Meta.SessionHeader
@@ -182,6 +207,7 @@ func (rp *relayProcessor) ProcessRelay(
 	}
 
 	if !isApplicable {
+		outcome = "not_mined"
 		// Relay doesn't meet difficulty, skip publishing
 		sessionCtx := logging.SessionContextPartial(sessionID, serviceID, supplierAddr, appAddress, sessionEndHeight)
 		logging.WithSessionContext(rp.logger.Debug(), sessionCtx).
@@ -191,10 +217,11 @@ func (rp *relayProcessor) ProcessRelay(
 	}
 
 	// Build mined relay message
+	computeUnits = rp.getComputeUnits(ctx, serviceID, sessionStartHeight)
 	msg := &transport.MinedRelayMessage{
 		RelayHash:               relayHash[:],
 		RelayBytes:              relayBz,
-		ComputeUnitsPerRelay:    rp.getComputeUnits(ctx, serviceID, sessionStartHeight),
+		ComputeUnitsPerRelay:    computeUnits,
 		SessionId:               sessionID,
 		SessionStartHeight:      sessionStartHeight,
 		SessionEndHeight:        sessionEndHeight,
