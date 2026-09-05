@@ -538,7 +538,6 @@ func (b *WebSocketBridge) handleGatewayMessage(msg wsMessage) {
 
 	b.logger.Debug().
 		Int("payload_size", len(relayReq.Payload)).
-		Str("payload_preview", string(relayReq.Payload[:min(50, len(relayReq.Payload))])).
 		Msg("forwarding payload to backend")
 
 	// Forward payload to backend as BinaryMessage (transport-agnostic opaque bytes)
@@ -554,7 +553,6 @@ func (b *WebSocketBridge) handleGatewayMessage(msg wsMessage) {
 
 	b.logger.Debug().
 		Int("bytes_sent", len(relayReq.Payload)).
-		Str("sent_to_backend", string(relayReq.Payload[:min(50, len(relayReq.Payload))])).
 		Msg("successfully forwarded payload to backend")
 }
 
@@ -565,7 +563,6 @@ func (b *WebSocketBridge) handleBackendMessage(msg wsMessage) {
 
 	b.logger.Debug().
 		Int("message_size", len(msg.data)).
-		Str("backend_response", string(msg.data[:min(50, len(msg.data))])).
 		Msg("handleBackendMessage called")
 
 	latestReq := b.getLatestRequest()

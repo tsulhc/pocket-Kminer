@@ -191,10 +191,11 @@ func (rp *relayProcessor) ProcessRelay(
 	}
 
 	// Build mined relay message
+	computeUnits := rp.getComputeUnits(ctx, serviceID, sessionStartHeight)
 	msg := &transport.MinedRelayMessage{
 		RelayHash:               relayHash[:],
 		RelayBytes:              relayBz,
-		ComputeUnitsPerRelay:    rp.getComputeUnits(ctx, serviceID, sessionStartHeight),
+		ComputeUnitsPerRelay:    computeUnits,
 		SessionId:               sessionID,
 		SessionStartHeight:      sessionStartHeight,
 		SessionEndHeight:        sessionEndHeight,

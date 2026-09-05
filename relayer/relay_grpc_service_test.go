@@ -96,6 +96,7 @@ func TestForwardToBackend_MisconfigDoesNotHitNetwork(t *testing.T) {
 		&sdktypes.POKTHTTPRequest{Method: http.MethodPost, Url: "http://relay/", BodyBz: []byte("x")},
 		ep,
 		BackendTypeREST,
+		"",
 	)
 	require.ErrorIs(t, err, errBackendMisconfigured)
 	require.Zero(t, requests)
@@ -105,10 +106,15 @@ func TestForwardToBackend_GRPCBackendViaH2C(t *testing.T) {
 	type observation struct {
 		proto       string
 		contentType string
+		requestID   string
 	}
 	observed := make(chan observation, 1)
 	server := httptest.NewUnstartedServer(h2c.NewHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		observed <- observation{proto: r.Proto, contentType: r.Header.Get("Content-Type")}
+		observed <- observation{
+			proto:       r.Proto,
+			contentType: r.Header.Get("Content-Type"),
+			requestID:   r.Header.Get(HeaderPocketRequestID),
+		}
 		w.Header().Set("Trailer", "Grpc-Status")
 		w.Header().Set("Content-Type", "application/grpc")
 		w.WriteHeader(http.StatusOK)
@@ -137,6 +143,7 @@ func TestForwardToBackend_GRPCBackendViaH2C(t *testing.T) {
 		},
 		ep,
 		BackendTypeGRPC,
+		"pocket-req-test",
 	)
 	require.NoError(t, err)
 	require.Equal(t, http.StatusOK, statusCode)
@@ -146,6 +153,7 @@ func TestForwardToBackend_GRPCBackendViaH2C(t *testing.T) {
 	case got := <-observed:
 		require.Equal(t, "HTTP/2.0", got.proto)
 		require.Equal(t, "application/grpc", got.contentType)
+		require.Equal(t, "pocket-req-test", got.requestID)
 	default:
 		t.Fatal("backend observation was not recorded")
 	}
@@ -187,6 +195,7 @@ func TestForwardToBackend_FallbackPoolUsesFallbackBackendConfig(t *testing.T) {
 		&sdktypes.POKTHTTPRequest{Method: http.MethodPost, Url: "http://relay/", BodyBz: []byte("request")},
 		endpoint,
 		BackendTypeREST,
+		"",
 	)
 	require.NoError(t, err)
 	require.Equal(t, []byte("ok"), body)

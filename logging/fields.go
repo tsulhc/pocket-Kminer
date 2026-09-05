@@ -78,7 +78,12 @@ const (
 	FieldMaxRetry  = "max_retries"
 
 	// Relay fields
-	FieldRelayHash = "relay_hash"
+	FieldRelayHash    = "relay_hash"
+	FieldRequestID    = "pocket_request_id"
+	FieldRPCType      = "rpc_type"
+	FieldWorkload     = "workload"
+	FieldRequestSize  = "request_bytes"
+	FieldResponseSize = "response_bytes"
 
 	// Query fields
 	FieldQueryType   = "query_type"

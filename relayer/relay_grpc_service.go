@@ -343,7 +343,8 @@ func (s *RelayGRPCService) handleSendRelay(stream grpc.ServerStream) error {
 	grpcEndpoint = grpcPool.Next()
 
 	// Forward request to backend and get response
-	respBody, respHeaders, respStatus, err := s.forwardToBackend(ctx, serviceID, &svcConfig, poktHTTPRequest, grpcEndpoint, grpcRPCType)
+	requestID := PocketRequestIDFromRelayRequest(relayRequest)
+	respBody, respHeaders, respStatus, err := s.forwardToBackend(ctx, serviceID, &svcConfig, poktHTTPRequest, grpcEndpoint, grpcRPCType, requestID)
 
 	// Record result for circuit breaker (covers both success and error paths)
 	if grpcEndpoint != nil && grpcPool != nil && !errors.Is(err, errBackendMisconfigured) {
@@ -540,6 +541,7 @@ func (s *RelayGRPCService) forwardToBackend(
 	poktHTTPRequest *sdktypes.POKTHTTPRequest,
 	endpoint *pool.BackendEndpoint,
 	rpcType string,
+	requestID string,
 ) ([]byte, http.Header, int, error) {
 	// Find the backend configuration
 	var backendURL string
@@ -620,6 +622,9 @@ func (s *RelayGRPCService) forwardToBackend(
 		} else if auth.PlainToken != "" {
 			req.Header.Set("Authorization", auth.PlainToken)
 		}
+	}
+	if requestID != "" {
+		req.Header.Set(HeaderPocketRequestID, requestID)
 	}
 
 	// Set host header
