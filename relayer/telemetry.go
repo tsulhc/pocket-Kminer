@@ -246,6 +246,9 @@ func logRelayObservation(logger logging.Logger, relayRequest *servicetypes.Relay
 		sessionContext.ServiceID = observation.ServiceID
 	}
 
+	// Request telemetry must remain observable when production suppresses
+	// ordinary Info logs with logging.level=warn. Level returns a child logger,
+	// so the caller's minimum level remains unchanged.
 	telemetryLogger := logger.Level(zerolog.InfoLevel)
 	event := logging.WithSessionContext(telemetryLogger.Info(), sessionContext).
 		Str("event", "pocket_relay_observation").
