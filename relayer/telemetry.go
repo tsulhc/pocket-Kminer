@@ -12,6 +12,7 @@ import (
 	"time"
 
 	sdktypes "github.com/pokt-network/shannon-sdk/types"
+	"github.com/rs/zerolog"
 
 	"github.com/pokt-network/pocket-relay-miner/logging"
 	servicetypes "github.com/pokt-network/poktroll/x/service/types"
@@ -245,7 +246,11 @@ func logRelayObservation(logger logging.Logger, relayRequest *servicetypes.Relay
 		sessionContext.ServiceID = observation.ServiceID
 	}
 
-	event := logging.WithSessionContext(logger.Info(), sessionContext).
+	// Request telemetry must remain observable when production suppresses
+	// ordinary Info logs with logging.level=warn. Level returns a child logger,
+	// so the caller's minimum level remains unchanged.
+	telemetryLogger := logger.Level(zerolog.InfoLevel)
+	event := logging.WithSessionContext(telemetryLogger.Info(), sessionContext).
 		Str("event", "pocket_relay_observation").
 		Str(logging.FieldRequestID, observation.RequestID).
 		Str(logging.FieldRPCType, observation.RPCType).

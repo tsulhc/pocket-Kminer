@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"net/http"
 	"regexp"
 	"strings"
@@ -148,6 +149,43 @@ func TestRelayObservationIncludesBackendFailure(t *testing.T) {
 	require.NotContains(t, logLine, "secret")
 	require.NotContains(t, logLine, "request_payload")
 	require.NotContains(t, logLine, "response_payload")
+}
+
+func TestRelayObservationUsesInfoChildLogger(t *testing.T) {
+	var output bytes.Buffer
+	logger := zerolog.New(&output).Level(zerolog.WarnLevel)
+
+	logger.Info().Msg("ordinary info before telemetry")
+	require.Empty(t, output.String())
+
+	logger.Warn().Msg("ordinary warning")
+	require.Contains(t, output.String(), "ordinary warning")
+	output.Reset()
+
+	logRelayObservation(logger, &servicetypes.RelayRequest{}, RelayObservation{
+		RequestID: "0123456789abcdef0123456789abcdef",
+		RPCType:   BackendTypeJSONRPC,
+		Workload:  RelayWorkload{Workload: "eth_call"},
+		Outcome:   "success",
+	})
+
+	lines := strings.Split(strings.TrimSpace(output.String()), "\n")
+	require.Len(t, lines, 1)
+
+	var record struct {
+		Level   string `json:"level"`
+		Event   string `json:"event"`
+		Message string `json:"message"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(lines[0]), &record))
+	require.Equal(t, zerolog.WarnLevel, logger.GetLevel())
+	require.Equal(t, "info", record.Level)
+	require.Equal(t, "pocket_relay_observation", record.Event)
+	require.Equal(t, "pocket relay observation", record.Message)
+
+	output.Reset()
+	logger.Info().Msg("ordinary info after telemetry")
+	require.Empty(t, output.String())
 }
 
 func relayRequestWithHTTPRequest(t *testing.T, body, rpcType, rawURL string) *servicetypes.RelayRequest {
