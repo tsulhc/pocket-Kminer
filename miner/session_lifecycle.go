@@ -496,7 +496,7 @@ func (m *SessionLifecycleManager) runBlockEventFallbackWithInterval(
 func (m *SessionLifecycleManager) currentChainHeight(ctx context.Context) (int64, error) {
 	var currentHeightErr error
 	if provider, ok := m.blockClient.(currentHeightProvider); ok {
-		height, err := provider.CurrentHeight(ctx)
+		height, err := queryCurrentHeight(ctx, provider)
 		if err == nil {
 			return height, nil
 		}
