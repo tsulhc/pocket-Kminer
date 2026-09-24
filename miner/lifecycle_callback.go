@@ -622,7 +622,7 @@ func (lc *LifecycleCallback) OnSessionsNeedClaim(ctx context.Context, snapshots 
 		// Wait for claim window to open and get the block hash for timing spread
 		claimWindowOpenHeight := sharedtypes.GetClaimWindowOpenHeight(sharedParams, sessionEndHeight)
 		claimWindowCloseHeight := sharedtypes.GetClaimWindowCloseHeight(sharedParams, sessionEndHeight)
-		currentHeight := lc.blockClient.LastBlock(ctx).Height()
+		currentHeight := lc.currentHeightForTiming(ctx)
 
 		// Build session IDs list for logging (truncate if too many)
 		sessionIDs := make([]string, 0, len(groupSnapshots))
@@ -660,15 +660,15 @@ func (lc *LifecycleCallback) OnSessionsNeedClaim(ctx context.Context, snapshots 
 		// CRITICAL: Verify claim window is still open AND we have enough time to build+submit
 		// AGGRESSIVE MODE: Push claims until the very last block of the window
 		claimWindowClose := sharedtypes.GetClaimWindowCloseHeight(sharedParams, sessionEndHeight)
-		currentBlock := lc.blockClient.LastBlock(ctx)
-		blocksRemaining := claimWindowClose - currentBlock.Height()
+		currentHeight = lc.currentHeightForTiming(ctx)
+		blocksRemaining := claimWindowClose - currentHeight
 
 		// AGGRESSIVE: No buffer - use every available block in the window
 		const minBlocksRequired = 2
 
 		if blocksRemaining <= minBlocksRequired {
 			logger.Error().
-				Int64("current_height", currentBlock.Height()).
+				Int64("current_height", currentHeight).
 				Int64("claim_window_close", claimWindowClose).
 				Int64("blocks_remaining", blocksRemaining).
 				Int64("min_blocks_required", minBlocksRequired).
@@ -696,14 +696,14 @@ func (lc *LifecycleCallback) OnSessionsNeedClaim(ctx context.Context, snapshots 
 			}
 
 			return nil, fmt.Errorf("insufficient time to build claims: %d blocks remaining, %d required (window closes at %d, current: %d)",
-				blocksRemaining, minBlocksRequired, claimWindowClose, currentBlock.Height())
+				blocksRemaining, minBlocksRequired, claimWindowClose, currentHeight)
 		}
 
 		logger.Debug().
 			Int("group_size", len(groupSnapshots)).
 			Int64("claim_window_close", claimWindowClose).
-			Int64("current_height", currentBlock.Height()).
-			Int64("blocks_remaining", claimWindowClose-currentBlock.Height()).
+			Int64("current_height", currentHeight).
+			Int64("blocks_remaining", claimWindowClose-currentHeight).
 			Msg("claim window timing reached - flushing SMSTs and submitting batched claims")
 
 		// DEBUG/TEST: Intentionally delay claim submission to test claim window timeout tracking
@@ -714,12 +714,12 @@ func (lc *LifecycleCallback) OnSessionsNeedClaim(ctx context.Context, snapshots 
 			logger.Warn().
 				Int("delay_seconds", testCfg.ClaimDelaySeconds).
 				Int64("claim_window_close", claimWindowClose).
-				Int64("current_height", currentBlock.Height()).
+				Int64("current_height", currentHeight).
 				Msg("TEST MODE: Intentionally delaying claim submission to test window timeout tracking")
 			time.Sleep(delayDuration)
 
 			// Log current state after delay
-			postDelayHeight := lc.blockClient.LastBlock(ctx).Height()
+			postDelayHeight := lc.currentHeightForTiming(ctx)
 			logger.Warn().
 				Int64("height_after_delay", postDelayHeight).
 				Int64("claim_window_close", claimWindowClose).
@@ -1024,10 +1024,10 @@ func (lc *LifecycleCallback) OnSessionsNeedClaim(ctx context.Context, snapshots 
 
 		// CRITICAL: Re-check window is still open RIGHT before submission
 		// Building claims (SMST flush, headers) takes time - blocks may have advanced!
-		currentBlock = lc.blockClient.LastBlock(ctx)
-		if currentBlock.Height() >= claimWindowClose {
+		currentHeight = lc.currentHeightForTiming(ctx)
+		if currentHeight >= claimWindowClose {
 			logger.Error().
-				Int64("current_height", currentBlock.Height()).
+				Int64("current_height", currentHeight).
 				Int64("claim_window_close", claimWindowClose).
 				Int64("session_end_height", sessionEndHeight).
 				Int("batch_size", len(claimMsgs)).
@@ -1050,10 +1050,10 @@ func (lc *LifecycleCallback) OnSessionsNeedClaim(ctx context.Context, snapshots 
 				}
 			}
 
-			return nil, fmt.Errorf("claim window closed while building claims at height %d (current: %d)", claimWindowClose, currentBlock.Height())
+			return nil, fmt.Errorf("claim window closed while building claims at height %d (current: %d)", claimWindowClose, currentHeight)
 		}
 
-		claimBlocksLeft := claimWindowClose - currentBlock.Height()
+		claimBlocksLeft := claimWindowClose - currentHeight
 		claimBlockTimeSec := lc.config.BlockTimeSeconds
 		if claimBlockTimeSec <= 0 {
 			claimBlockTimeSec = 30
@@ -1062,7 +1062,7 @@ func (lc *LifecycleCallback) OnSessionsNeedClaim(ctx context.Context, snapshots 
 		claimCtx := tx.WithTxWindowTimeout(ctx, rawClaimTimeout)
 
 		logger.Info().
-			Int64("current_height", currentBlock.Height()).
+			Int64("current_height", currentHeight).
 			Int64("claim_window_close", claimWindowClose).
 			Int64("blocks_remaining", claimBlocksLeft).
 			Dur("window_remaining_estimate", rawClaimTimeout).
@@ -1082,7 +1082,7 @@ func (lc *LifecycleCallback) OnSessionsNeedClaim(ctx context.Context, snapshots 
 				if strings.Contains(errorMsg, "claim window") || strings.Contains(errorMsg, "claim_window") {
 					logger.Error().
 						Err(submitErr).
-						Int64("current_height", lc.blockClient.LastBlock(ctx).Height()).
+						Int64("current_height", lc.currentHeightForTiming(ctx)).
 						Int64("claim_window_close", claimWindowClose).
 						Int("batch_size", len(claimMsgs)).
 						Msg("claim window closed during submission - permanent failure, not retrying")
@@ -1129,8 +1129,8 @@ func (lc *LifecycleCallback) OnSessionsNeedClaim(ctx context.Context, snapshots 
 					claimTxHash = haClient.GetLastClaimTxHash()
 				}
 
-				currentBlock := lc.blockClient.LastBlock(ctx)
-				blocksAfterWindowOpen := float64(currentBlock.Height() - claimWindowOpenHeight)
+				currentHeight := lc.currentHeightForTiming(ctx)
+				blocksAfterWindowOpen := float64(currentHeight - claimWindowOpenHeight)
 
 				// CRITICAL: Save TX hash to Redis IMMEDIATELY (1 line after broadcast)
 				// This prevents duplicate submissions if we crash after TX broadcast
@@ -1188,7 +1188,7 @@ func (lc *LifecycleCallback) OnSessionsNeedClaim(ctx context.Context, snapshots 
 							true, // success
 							"",   // no error
 							earliestClaimHeight,
-							currentBlock.Height(),
+							currentHeight,
 							snapshot.RelayCount,
 							int64(snapshot.TotalComputeUnits),
 							false, // proof_required unknown at claim time
@@ -1209,7 +1209,7 @@ func (lc *LifecycleCallback) OnSessionsNeedClaim(ctx context.Context, snapshots 
 				// ordered set). Survives leader failover (state lives in Redis).
 				if lc.rebroadcastStore != nil && claimTxHash != "" {
 					lc.persistRebroadcastEntries(
-						ctx, RebroadcastPhaseClaim, validSnapshots, currentBlock.Height(), claimTxHash,
+						ctx, RebroadcastPhaseClaim, validSnapshots, currentHeight, claimTxHash,
 						func(i int) ([]byte, error) { return claimMsgs[i].Marshal() },
 					)
 				}
@@ -1257,7 +1257,7 @@ func (lc *LifecycleCallback) OnSessionsNeedClaim(ctx context.Context, snapshots 
 						false, // failed
 						lastErr.Error(),
 						earliestClaimHeight,
-						lc.blockClient.LastBlock(ctx).Height(),
+						lc.currentHeightForTiming(ctx),
 						snapshot.RelayCount,
 						int64(snapshot.TotalComputeUnits),
 						false, // proof_required unknown at claim time
@@ -1280,7 +1280,7 @@ func (lc *LifecycleCallback) OnSessionsNeedClaim(ctx context.Context, snapshots 
 			// broadcast", so the reconciler resends promptly (not at mid-window).
 			if lc.rebroadcastStore != nil {
 				lc.persistRebroadcastEntries(
-					ctx, RebroadcastPhaseClaim, validSnapshots, lc.blockClient.LastBlock(ctx).Height(), "",
+					ctx, RebroadcastPhaseClaim, validSnapshots, lc.currentHeightForTiming(ctx), "",
 					func(i int) ([]byte, error) { return claimMsgs[i].Marshal() },
 				)
 			}
@@ -1369,7 +1369,7 @@ func (lc *LifecycleCallback) OnSessionsNeedProof(ctx context.Context, snapshots 
 		// Wait for proof window to open
 		proofWindowOpenHeight := sharedtypes.GetProofWindowOpenHeight(sharedParams, sessionEndHeight)
 		proofWindowCloseHeight := sharedtypes.GetProofWindowCloseHeight(sharedParams, sessionEndHeight)
-		currentHeight := lc.blockClient.LastBlock(ctx).Height()
+		currentHeight := lc.currentHeightForTiming(ctx)
 
 		// Build session IDs list for logging (truncate if too many)
 		proofSessionIDs := make([]string, 0, len(groupSnapshots))
@@ -1558,10 +1558,10 @@ func (lc *LifecycleCallback) OnSessionsNeedProof(ctx context.Context, snapshots 
 		// CRITICAL: Verify proof window is still open before proceeding
 		// This prevents wasting fees on proofs that will be rejected
 		proofWindowClose := sharedtypes.GetProofWindowCloseHeight(sharedParams, sessionEndHeight)
-		currentBlock := lc.blockClient.LastBlock(ctx)
-		if currentBlock.Height() >= proofWindowClose {
+		currentHeight = lc.currentHeightForTiming(ctx)
+		if currentHeight >= proofWindowClose {
 			logger.Error().
-				Int64("current_height", currentBlock.Height()).
+				Int64("current_height", currentHeight).
 				Int64("proof_window_close", proofWindowClose).
 				Int64("session_end_height", sessionEndHeight).
 				Int("group_size", len(sessionsNeedingProof)).
@@ -1584,7 +1584,7 @@ func (lc *LifecycleCallback) OnSessionsNeedProof(ctx context.Context, snapshots 
 				lc.cleanupSessionResources(ctx, snapshot, "proof_window_closed")
 			}
 
-			return submittedProofSnapshots, fmt.Errorf("proof window already closed at height %d (current: %d)", proofWindowClose, currentBlock.Height())
+			return submittedProofSnapshots, fmt.Errorf("proof window already closed at height %d (current: %d)", proofWindowClose, currentHeight)
 		}
 
 		// CRITICAL: Re-check proof requirement RIGHT before building proofs
@@ -1660,8 +1660,8 @@ func (lc *LifecycleCallback) OnSessionsNeedProof(ctx context.Context, snapshots 
 		logger.Debug().
 			Int("group_size", len(sessionsNeedingProof)).
 			Int64("proof_window_close", proofWindowClose).
-			Int64("current_height", currentBlock.Height()).
-			Int64("blocks_remaining", proofWindowClose-currentBlock.Height()).
+			Int64("current_height", currentHeight).
+			Int64("blocks_remaining", proofWindowClose-currentHeight).
 			Msg("proof window timing reached - generating and submitting batched proofs")
 
 		// DEBUG/TEST: Intentionally delay proof submission to test proof expiration tracking
@@ -1672,12 +1672,12 @@ func (lc *LifecycleCallback) OnSessionsNeedProof(ctx context.Context, snapshots 
 			logger.Warn().
 				Int("delay_seconds", testCfg.ProofDelaySeconds).
 				Int64("proof_window_close", proofWindowClose).
-				Int64("current_height", currentBlock.Height()).
+				Int64("current_height", currentHeight).
 				Msg("TEST MODE: Intentionally delaying proof submission to test expiration tracking")
 			time.Sleep(delayDuration)
 
 			// Log current state after delay
-			postDelayHeight := lc.blockClient.LastBlock(ctx).Height()
+			postDelayHeight := lc.currentHeightForTiming(ctx)
 			logger.Warn().
 				Int64("height_after_delay", postDelayHeight).
 				Int64("proof_window_close", proofWindowClose).
@@ -1839,10 +1839,10 @@ func (lc *LifecycleCallback) OnSessionsNeedProof(ctx context.Context, snapshots 
 
 		// CRITICAL: Re-check window is still open RIGHT before submission
 		// Building proofs (proof generation, headers) takes time - blocks may have advanced!
-		currentBlock = lc.blockClient.LastBlock(ctx)
-		if currentBlock.Height() >= proofWindowClose {
+		currentHeight = lc.currentHeightForTiming(ctx)
+		if currentHeight >= proofWindowClose {
 			logger.Error().
-				Int64("current_height", currentBlock.Height()).
+				Int64("current_height", currentHeight).
 				Int64("proof_window_close", proofWindowClose).
 				Int64("session_end_height", sessionEndHeight).
 				Int("batch_size", len(proofMsgs)).
@@ -1867,10 +1867,10 @@ func (lc *LifecycleCallback) OnSessionsNeedProof(ctx context.Context, snapshots 
 				lc.cleanupSessionResources(ctx, snapshot, "proof_window_closed")
 			}
 
-			return submittedProofSnapshots, fmt.Errorf("proof window closed while building proofs at height %d (current: %d)", proofWindowClose, currentBlock.Height())
+			return submittedProofSnapshots, fmt.Errorf("proof window closed while building proofs at height %d (current: %d)", proofWindowClose, currentHeight)
 		}
 
-		proofBlocksRemaining := proofWindowClose - currentBlock.Height()
+		proofBlocksRemaining := proofWindowClose - currentHeight
 		proofBlockTimeSec := lc.config.BlockTimeSeconds
 		if proofBlockTimeSec <= 0 {
 			proofBlockTimeSec = 30
@@ -1879,7 +1879,7 @@ func (lc *LifecycleCallback) OnSessionsNeedProof(ctx context.Context, snapshots 
 		proofCtx := tx.WithTxWindowTimeout(ctx, rawProofTimeout)
 
 		logger.Info().
-			Int64("current_height", currentBlock.Height()).
+			Int64("current_height", currentHeight).
 			Int64("proof_window_close", proofWindowClose).
 			Int64("blocks_remaining", proofBlocksRemaining).
 			Dur("window_remaining_estimate", rawProofTimeout).
@@ -1899,7 +1899,7 @@ func (lc *LifecycleCallback) OnSessionsNeedProof(ctx context.Context, snapshots 
 				if strings.Contains(errorMsg, "proof window") || strings.Contains(errorMsg, "proof_window") {
 					logger.Error().
 						Err(submitErr).
-						Int64("current_height", lc.blockClient.LastBlock(ctx).Height()).
+						Int64("current_height", lc.currentHeightForTiming(ctx)).
 						Int64("proof_window_close", proofWindowClose).
 						Int("batch_size", len(proofMsgs)).
 						Msg("proof window closed during submission - permanent failure, not retrying")
@@ -1948,8 +1948,8 @@ func (lc *LifecycleCallback) OnSessionsNeedProof(ctx context.Context, snapshots 
 					proofTxHash = haClient.GetLastProofTxHash()
 				}
 
-				currentBlock := lc.blockClient.LastBlock(ctx)
-				blocksAfterWindowOpen := float64(currentBlock.Height() - proofWindowOpenHeight)
+				currentHeight := lc.currentHeightForTiming(ctx)
+				blocksAfterWindowOpen := float64(currentHeight - proofWindowOpenHeight)
 
 				// CRITICAL: Save TX hash to Redis IMMEDIATELY (1 line after broadcast)
 				// This prevents duplicate submissions if we crash after TX broadcast.
@@ -1993,7 +1993,7 @@ func (lc *LifecycleCallback) OnSessionsNeedProof(ctx context.Context, snapshots 
 							true, // success
 							"",   // no error
 							earliestProofHeight,
-							currentBlock.Height(),
+							currentHeight,
 							true,                 // proof was required
 							proofRequirementSeed, // seed used for proof requirement check
 						); trackErr != nil {
@@ -2015,7 +2015,7 @@ func (lc *LifecycleCallback) OnSessionsNeedProof(ctx context.Context, snapshots 
 				// ordered set). Survives leader failover (state lives in Redis).
 				if lc.rebroadcastStore != nil && proofTxHash != "" {
 					lc.persistRebroadcastEntries(
-						ctx, RebroadcastPhaseProof, validProofSnapshots, currentBlock.Height(), proofTxHash,
+						ctx, RebroadcastPhaseProof, validProofSnapshots, currentHeight, proofTxHash,
 						func(i int) ([]byte, error) { return proofMsgs[i].Marshal() },
 					)
 				}
@@ -2067,7 +2067,7 @@ func (lc *LifecycleCallback) OnSessionsNeedProof(ctx context.Context, snapshots 
 						false, // failed
 						lastErr.Error(),
 						earliestProofHeight,
-						lc.blockClient.LastBlock(ctx).Height(),
+						lc.currentHeightForTiming(ctx),
 						true,                 // proof was required (we attempted submission)
 						proofRequirementSeed, // seed used for proof requirement check
 					); trackErr != nil {
@@ -2088,7 +2088,7 @@ func (lc *LifecycleCallback) OnSessionsNeedProof(ctx context.Context, snapshots 
 			// reconciler resends promptly (not at mid-window).
 			if lc.rebroadcastStore != nil {
 				lc.persistRebroadcastEntries(
-					ctx, RebroadcastPhaseProof, validProofSnapshots, lc.blockClient.LastBlock(ctx).Height(), "",
+					ctx, RebroadcastPhaseProof, validProofSnapshots, lc.currentHeightForTiming(ctx), "",
 					func(i int) ([]byte, error) { return proofMsgs[i].Marshal() },
 				)
 			}
@@ -2348,14 +2348,44 @@ func (lc *LifecycleCallback) OnProofTxError(ctx context.Context, snapshot *Sessi
 	return nil
 }
 
+const blockWaitHeightProbeInterval = 2 * time.Second
+
+// currentHeightForTiming returns the best available current chain height. The
+// block-event-backed LastBlock cache can lag behind CometBFT when Redis events
+// stall, so prefer the direct RPC provider for lifecycle timing decisions.
+func (lc *LifecycleCallback) currentHeightForTiming(ctx context.Context) int64 {
+	if provider, ok := lc.blockClient.(currentHeightProvider); ok {
+		height, err := provider.CurrentHeight(ctx)
+		if err == nil {
+			return height
+		}
+		lc.logger.Warn().Err(err).Msg("failed to query current chain height; falling back to last block event")
+	}
+
+	block := lc.blockClient.LastBlock(ctx)
+	if block == nil {
+		lc.logger.Warn().Msg("block client returned nil LastBlock while reading current height")
+		return 0
+	}
+	return block.Height()
+}
+
 // waitForBlock waits for a specific block height to be reached using event-driven
-// block notifications. This is more efficient than polling and doesn't block workers.
+// block notifications, with a bounded RPC height probe to recover from a silent
+// but still-open event subscription. The returned block is always fetched at the
+// exact target height so proof generation retains canonical hash semantics.
 func (lc *LifecycleCallback) waitForBlock(ctx context.Context, targetHeight int64) (pocktclient.Block, error) {
+	return lc.waitForBlockWithInterval(ctx, targetHeight, blockWaitHeightProbeInterval)
+}
+
+func (lc *LifecycleCallback) waitForBlockWithInterval(ctx context.Context, targetHeight int64, interval time.Duration) (pocktclient.Block, error) {
+	if interval <= 0 {
+		interval = blockWaitHeightProbeInterval
+	}
 	startTime := time.Now()
 
 	// Check if we're already at or past the target height
-	currentBlock := lc.blockClient.LastBlock(ctx)
-	currentHeight := currentBlock.Height()
+	currentHeight := lc.currentHeightForTiming(ctx)
 
 	if currentHeight >= targetHeight {
 		// Already at target height - no wait needed
@@ -2384,7 +2414,7 @@ func (lc *LifecycleCallback) waitForBlock(ctx context.Context, targetHeight int6
 		lc.logger.Warn().
 			Int64("target_height", targetHeight).
 			Msg("block client does not support Subscribe(), falling back to polling")
-		return lc.waitForBlockPolling(ctx, targetHeight)
+		return lc.waitForBlockPolling(ctx, targetHeight, interval)
 	}
 
 	// Subscribe to block events with a child context so the temporary
@@ -2393,6 +2423,8 @@ func (lc *LifecycleCallback) waitForBlock(ctx context.Context, targetHeight int6
 	subCtx, cancelSub := context.WithCancel(ctx)
 	defer cancelSub()
 	blockCh := subscriber.Subscribe(subCtx, 10)
+	probeTicker := time.NewTicker(interval)
+	defer probeTicker.Stop()
 
 	for {
 		select {
@@ -2409,10 +2441,11 @@ func (lc *LifecycleCallback) waitForBlock(ctx context.Context, targetHeight int6
 				lc.logger.Warn().
 					Int64("target_height", targetHeight).
 					Msg("block subscription channel closed, falling back to polling")
-				return lc.waitForBlockPolling(ctx, targetHeight)
+				cancelSub()
+				return lc.waitForBlockPolling(ctx, targetHeight, interval)
 			}
 
-			if block.Height() >= targetHeight {
+			if block != nil && block.Height() >= targetHeight {
 				elapsed := time.Since(startTime)
 				lc.logger.Info().
 					Int64("target_height", targetHeight).
@@ -2422,13 +2455,32 @@ func (lc *LifecycleCallback) waitForBlock(ctx context.Context, targetHeight int6
 					Msg("waitForBlock: target height reached")
 				return lc.getBlockAtHeight(ctx, targetHeight)
 			}
+
+		case <-probeTicker.C:
+			currentHeight = lc.currentHeightForTiming(ctx)
+			if currentHeight >= targetHeight {
+				lc.logger.Info().
+					Int64("target_height", targetHeight).
+					Int64("current_height", currentHeight).
+					Dur("elapsed_ms", time.Since(startTime)).
+					Msg("waitForBlock: current chain height reached target")
+				return lc.getBlockAtHeight(ctx, targetHeight)
+			}
 		}
 	}
 }
 
-// waitForBlockPolling is the fallback polling approach (only used if Subscribe unavailable).
-func (lc *LifecycleCallback) waitForBlockPolling(ctx context.Context, targetHeight int64) (pocktclient.Block, error) {
-	ticker := time.NewTicker(500 * time.Millisecond)
+// waitForBlockPolling polls the best available current-height source when block
+// subscriptions are unavailable or have closed.
+func (lc *LifecycleCallback) waitForBlockPolling(ctx context.Context, targetHeight int64, interval time.Duration) (pocktclient.Block, error) {
+	if interval <= 0 {
+		interval = blockWaitHeightProbeInterval
+	}
+	if currentHeight := lc.currentHeightForTiming(ctx); currentHeight >= targetHeight {
+		return lc.getBlockAtHeight(ctx, targetHeight)
+	}
+
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {
@@ -2436,13 +2488,13 @@ func (lc *LifecycleCallback) waitForBlockPolling(ctx context.Context, targetHeig
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case <-ticker.C:
-			currentBlock := lc.blockClient.LastBlock(ctx)
-			if currentBlock.Height() >= targetHeight {
+			currentHeight := lc.currentHeightForTiming(ctx)
+			if currentHeight >= targetHeight {
 				return lc.getBlockAtHeight(ctx, targetHeight)
 			}
 
 			lc.logger.Debug().
-				Int64("current_height", currentBlock.Height()).
+				Int64("current_height", currentHeight).
 				Int64("target_height", targetHeight).
 				Msg("waiting for block height (polling fallback)")
 		}

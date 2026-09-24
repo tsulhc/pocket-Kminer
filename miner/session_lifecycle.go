@@ -412,18 +412,18 @@ func (m *SessionLifecycleManager) lifecycleCheckerEventDriven(ctx context.Contex
 
 	var transitionMu sync.Mutex
 	onHeightFn := func(height int64) {
-		transitionMu.Lock()
-		defer transitionMu.Unlock()
-
-		if prev := lastHeight.Load(); prev > 0 {
-			sessionBlockProcessingLag.WithLabelValues(m.config.SupplierAddress).Set(float64(height - prev))
-		}
-		lastHeight.Store(height)
+		processLifecycleHeight(&transitionMu, &lastHeight, height, func(prev int64) {
+			if prev > 0 {
+				sessionBlockProcessingLag.WithLabelValues(m.config.SupplierAddress).Set(float64(height - prev))
+			}
+			currentBlockHeight.Set(float64(height))
+			m.recordTransitionQueueDepth()
+			m.checkSessionTransitions(ctx, height)
+		})
+	}
+	onBlockEventFn := func(int64) {
 		lastEventTimeNano.Store(time.Now().UnixNano())
-		currentBlockHeight.Set(float64(height))
 		blockEventAgeSeconds.WithLabelValues(m.config.SupplierAddress).Set(0)
-		m.recordTransitionQueueDepth()
-		m.checkSessionTransitions(ctx, height)
 	}
 
 	// Safety-net: if block events stop arriving (block publisher dead,
@@ -432,7 +432,7 @@ func (m *SessionLifecycleManager) lifecycleCheckerEventDriven(ctx context.Contex
 	// terminal cleanup. Runs concurrently with the coalescing loop.
 	go m.runBlockEventFallback(ctx, &lastHeight, &lastEventTimeNano, onHeightFn)
 
-	runCoalescingBlockLoop(ctx, blockCh, onHeightFn)
+	runCoalescingBlockLoopWithEvent(ctx, blockCh, onBlockEventFn, onHeightFn)
 
 	if ctx.Err() == nil {
 		m.logger.Warn().Msg("block events channel closed unexpectedly; session lifecycle block loop stopped")
@@ -440,7 +440,7 @@ func (m *SessionLifecycleManager) lifecycleCheckerEventDriven(ctx context.Contex
 }
 
 // runBlockEventFallback polls chain height every defaultEventFallbackInterval.
-// When no block event has been processed for >2 intervals, it triggers a
+// When no block event has been received for >2 intervals, it triggers a
 // transition check at the current chain height so sessions do not stall.
 func (m *SessionLifecycleManager) runBlockEventFallback(
 	ctx context.Context,
@@ -448,7 +448,20 @@ func (m *SessionLifecycleManager) runBlockEventFallback(
 	lastEventTimeNano *atomic.Int64,
 	onHeightFn func(int64),
 ) {
-	ticker := time.NewTicker(defaultEventFallbackInterval)
+	m.runBlockEventFallbackWithInterval(ctx, lastHeight, lastEventTimeNano, onHeightFn, defaultEventFallbackInterval)
+}
+
+func (m *SessionLifecycleManager) runBlockEventFallbackWithInterval(
+	ctx context.Context,
+	lastHeight *atomic.Int64,
+	lastEventTimeNano *atomic.Int64,
+	onHeightFn func(int64),
+	interval time.Duration,
+) {
+	if interval <= 0 {
+		interval = defaultEventFallbackInterval
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {
@@ -457,12 +470,9 @@ func (m *SessionLifecycleManager) runBlockEventFallback(
 			return
 		case <-ticker.C:
 			lh := lastHeight.Load()
-			if lh == 0 {
-				continue
-			}
 			age := time.Since(time.Unix(0, lastEventTimeNano.Load())).Seconds()
 			blockEventAgeSeconds.WithLabelValues(m.config.SupplierAddress).Set(age)
-			if age > defaultEventFallbackInterval.Seconds()*2 {
+			if age > interval.Seconds()*2 {
 				m.logger.Warn().
 					Float64("seconds_since_last_event", age).
 					Int64("last_height", lh).
@@ -475,7 +485,7 @@ func (m *SessionLifecycleManager) runBlockEventFallback(
 						Msg("failed to query current chain height for block event fallback")
 					continue
 				}
-				if ch > lh {
+				if ch > lastHeight.Load() {
 					onHeightFn(ch)
 				}
 			}
@@ -484,18 +494,51 @@ func (m *SessionLifecycleManager) runBlockEventFallback(
 }
 
 func (m *SessionLifecycleManager) currentChainHeight(ctx context.Context) (int64, error) {
+	var currentHeightErr error
 	if provider, ok := m.blockClient.(currentHeightProvider); ok {
-		return provider.CurrentHeight(ctx)
+		height, err := provider.CurrentHeight(ctx)
+		if err == nil {
+			return height, nil
+		}
+		currentHeightErr = err
+		if ctx.Err() != nil {
+			return 0, fmt.Errorf("failed to query current chain height: %w", err)
+		}
+		m.logger.Warn().Err(err).Msg("failed to query current chain height; falling back to last block event")
 	}
 
 	block := m.blockClient.LastBlock(ctx)
 	if block == nil {
-		return 0, fmt.Errorf("block client returned nil LastBlock and does not implement CurrentHeight")
+		if currentHeightErr != nil {
+			return 0, fmt.Errorf("current-height provider failed and LastBlock fallback is unavailable: %w", currentHeightErr)
+		}
+		return 0, fmt.Errorf("block client returned nil LastBlock and does not provide a usable current height")
 	}
 	return block.Height(), nil
 }
 
 const defaultEventFallbackInterval = 30 * time.Second
+
+// processLifecycleHeight serializes transition checks and rejects duplicate or
+// out-of-order heights regardless of whether the height came from an event or
+// the RPC liveness fallback.
+func processLifecycleHeight(
+	transitionMu *sync.Mutex,
+	lastHeight *atomic.Int64,
+	height int64,
+	onAdvance func(previousHeight int64),
+) bool {
+	transitionMu.Lock()
+	defer transitionMu.Unlock()
+
+	previousHeight := lastHeight.Load()
+	if height <= previousHeight {
+		return false
+	}
+	lastHeight.Store(height)
+	onAdvance(previousHeight)
+	return true
+}
 
 // recordTransitionQueueDepth samples the transition subpool queue depth into
 // the per-supplier gauge. The subpool queue is intentionally unbounded, so a
@@ -513,6 +556,15 @@ func (m *SessionLifecycleManager) recordTransitionQueueDepth() {
 // work is level-triggered by height, so coalescing redundant ticks never skips
 // a transition and prevents stale backlogs from wedging the channel.
 func runCoalescingBlockLoop(ctx context.Context, blockCh <-chan *localclient.SimpleBlock, onHeight func(height int64)) {
+	runCoalescingBlockLoopWithEvent(ctx, blockCh, nil, onHeight)
+}
+
+func runCoalescingBlockLoopWithEvent(
+	ctx context.Context,
+	blockCh <-chan *localclient.SimpleBlock,
+	onBlockEvent func(height int64),
+	onHeight func(height int64),
+) {
 	var latest atomic.Int64
 	wake := make(chan struct{}, 1)
 	readerDone := make(chan struct{})
@@ -527,7 +579,11 @@ func runCoalescingBlockLoop(ctx context.Context, blockCh <-chan *localclient.Sim
 				if !ok {
 					return
 				}
-				if h := block.Height(); h > latest.Load() {
+				h := block.Height()
+				if onBlockEvent != nil {
+					onBlockEvent(h)
+				}
+				if h > latest.Load() {
 					latest.Store(h)
 				}
 				select {
