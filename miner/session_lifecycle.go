@@ -494,13 +494,25 @@ func (m *SessionLifecycleManager) runBlockEventFallbackWithInterval(
 }
 
 func (m *SessionLifecycleManager) currentChainHeight(ctx context.Context) (int64, error) {
+	var currentHeightErr error
 	if provider, ok := m.blockClient.(currentHeightProvider); ok {
-		return provider.CurrentHeight(ctx)
+		height, err := provider.CurrentHeight(ctx)
+		if err == nil {
+			return height, nil
+		}
+		currentHeightErr = err
+		if ctx.Err() != nil {
+			return 0, fmt.Errorf("failed to query current chain height: %w", err)
+		}
+		m.logger.Warn().Err(err).Msg("failed to query current chain height; falling back to last block event")
 	}
 
 	block := m.blockClient.LastBlock(ctx)
 	if block == nil {
-		return 0, fmt.Errorf("block client returned nil LastBlock and does not implement CurrentHeight")
+		if currentHeightErr != nil {
+			return 0, fmt.Errorf("current-height provider failed and LastBlock fallback is unavailable: %w", currentHeightErr)
+		}
+		return 0, fmt.Errorf("block client returned nil LastBlock and does not provide a usable current height")
 	}
 	return block.Height(), nil
 }

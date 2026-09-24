@@ -59,6 +59,49 @@ func TestSessionLifecycleCurrentChainHeight_FallsBackToLastBlock(t *testing.T) {
 	require.Equal(t, int64(100), height)
 }
 
+func TestSessionLifecycleCurrentChainHeight_FallsBackToLastBlockWhenProviderFails(t *testing.T) {
+	providerErr := errors.New("RPC unavailable")
+	blockClient := &fallbackProbeBlockClient{
+		fallbackHeightBlockClient: fallbackHeightBlockClient{lastHeight: 120},
+		currentHeightFn: func(context.Context) (int64, error) {
+			return 0, providerErr
+		},
+	}
+	m := &SessionLifecycleManager{
+		logger:      logging.NewLoggerFromConfig(logging.DefaultConfig()),
+		blockClient: blockClient,
+	}
+
+	height, err := m.currentChainHeight(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, int64(120), height)
+}
+
+type nilLastBlockFallbackProbe struct {
+	fallbackProbeBlockClient
+}
+
+func (b *nilLastBlockFallbackProbe) LastBlock(context.Context) client.Block { return nil }
+
+func TestSessionLifecycleCurrentChainHeightReturnsProviderErrorWhenFallbackUnavailable(t *testing.T) {
+	providerErr := errors.New("RPC unavailable")
+	blockClient := &nilLastBlockFallbackProbe{
+		fallbackProbeBlockClient: fallbackProbeBlockClient{
+			currentHeightFn: func(context.Context) (int64, error) {
+				return 0, providerErr
+			},
+		},
+	}
+	m := &SessionLifecycleManager{
+		logger:      logging.NewLoggerFromConfig(logging.DefaultConfig()),
+		blockClient: blockClient,
+	}
+
+	height, err := m.currentChainHeight(context.Background())
+	require.ErrorIs(t, err, providerErr)
+	require.Zero(t, height)
+}
+
 type fallbackProbeBlockClient struct {
 	fallbackHeightBlockClient
 	currentHeightFn func(context.Context) (int64, error)
@@ -145,6 +188,57 @@ func TestSessionLifecycleFallbackRunsBeforeAnyBlockEventAndPreservesEventAge(t *
 	processedMu.Unlock()
 	require.Equal(t, int64(120), lastHeight.Load())
 	require.Equal(t, staleEventTime, lastEventTimeNano.Load(), "RPC fallback must not refresh real-event freshness")
+}
+
+func TestSessionLifecycleFallbackUsesLastBlockWhenCurrentHeightFails(t *testing.T) {
+	blockClient := &fallbackProbeBlockClient{
+		fallbackHeightBlockClient: fallbackHeightBlockClient{lastHeight: 120},
+		currentHeightFn: func(context.Context) (int64, error) {
+			return 0, errors.New("temporary RPC failure")
+		},
+	}
+	m := &SessionLifecycleManager{
+		logger:      logging.NewLoggerFromConfig(logging.DefaultConfig()),
+		blockClient: blockClient,
+	}
+	var lastHeight atomic.Int64
+	lastHeight.Store(100)
+	var lastEventTimeNano atomic.Int64
+	staleEventTime := time.Now().Add(-time.Hour).UnixNano()
+	lastEventTimeNano.Store(staleEventTime)
+	var transitionMu sync.Mutex
+	var processed atomic.Int64
+	advanced := make(chan int64, 1)
+	onHeight := func(height int64) {
+		processLifecycleHeight(&transitionMu, &lastHeight, height, func(int64) {
+			processed.Add(1)
+			advanced <- height
+		})
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		m.runBlockEventFallbackWithInterval(ctx, &lastHeight, &lastEventTimeNano, onHeight, time.Millisecond)
+		close(done)
+	}()
+
+	select {
+	case height := <-advanced:
+		require.Equal(t, int64(120), height)
+	case <-time.After(time.Second):
+		cancel()
+		t.Fatal("RPC fallback did not use LastBlock after CurrentHeight failed")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("RPC fallback did not stop after cancellation")
+	}
+	require.Equal(t, int64(1), processed.Load(), "fallback height should only be processed once")
+	require.Equal(t, int64(120), lastHeight.Load())
+	require.Equal(t, staleEventTime, lastEventTimeNano.Load(), "RPC failure fallback must not refresh real-event freshness")
 }
 
 func TestSessionLifecycleFallbackAndCallbackWaitRecoverFromSameSilentFeed(t *testing.T) {
