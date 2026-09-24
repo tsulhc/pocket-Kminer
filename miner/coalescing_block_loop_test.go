@@ -222,3 +222,51 @@ func TestCoalescingBlockLoop_ProcessesFinalHeightOnClose(t *testing.T) {
 		require.Greater(t, processed[i], processed[i-1])
 	}
 }
+
+func TestCoalescingBlockLoop_ReportsEveryRealEventButProcessesOnlyNewHeights(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	blockCh := make(chan *localclient.SimpleBlock, 4)
+	var mu sync.Mutex
+	var receivedEvents []int64
+	var processedHeights []int64
+	firstProcessed := make(chan struct{}, 1)
+	done := make(chan struct{})
+	go func() {
+		runCoalescingBlockLoopWithEvent(ctx, blockCh, func(height int64) {
+			mu.Lock()
+			receivedEvents = append(receivedEvents, height)
+			mu.Unlock()
+		}, func(height int64) {
+			mu.Lock()
+			processedHeights = append(processedHeights, height)
+			mu.Unlock()
+			if height == 5 {
+				firstProcessed <- struct{}{}
+			}
+		})
+		close(done)
+	}()
+
+	blockCh <- blk(5)
+	select {
+	case <-firstProcessed:
+	case <-time.After(time.Second):
+		t.Fatal("coalescing loop did not process the first height")
+	}
+	blockCh <- blk(5)
+	blockCh <- blk(3)
+	blockCh <- blk(6)
+	close(blockCh)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("coalescing loop did not finish after event channel close")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Equal(t, []int64{5, 5, 3, 6}, receivedEvents)
+	require.Equal(t, []int64{5, 6}, processedHeights)
+}
