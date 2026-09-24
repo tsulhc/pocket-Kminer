@@ -2355,7 +2355,7 @@ const blockWaitHeightProbeInterval = 2 * time.Second
 // stall, so prefer the direct RPC provider for lifecycle timing decisions.
 func (lc *LifecycleCallback) currentHeightForTiming(ctx context.Context) int64 {
 	if provider, ok := lc.blockClient.(currentHeightProvider); ok {
-		height, err := provider.CurrentHeight(ctx)
+		height, err := queryCurrentHeight(ctx, provider)
 		if err == nil {
 			return height
 		}
