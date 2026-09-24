@@ -1,12 +1,12 @@
 name: Release
 
 on:
+  # Release/deploy is an explicit operator action. Merging to main or dev must
+  # never publish registry artifacts by itself.
+  workflow_dispatch:
   push:
-    branches:
-      - dev      # Development builds → dev tag
-      - main     # Release candidates → rc tag
     tags:
-      - 'v*'     # Production releases → version + latest tags
+      - 'v*'     # Explicit production release → version + latest tags
 
 permissions:
   contents: write
