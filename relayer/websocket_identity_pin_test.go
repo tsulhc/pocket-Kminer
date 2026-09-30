@@ -444,6 +444,21 @@ func TestWebSocketIdentityRejectsFrameSupplierDifferentFromHandshake(t *testing.
 	require.Equal(t, before+1, rejectionCount(service, rejectReasonSupplierChanged))
 }
 
+func TestWebSocketIdentityAcceptsTheSupplierPinnedByHandshake(t *testing.T) {
+	service := "ws-identity-handshake-owner"
+	f := newWebSocketIdentityFixture(t, service, true, websocketIdentityTestApp)
+	request := f.relay("session-handshake-owner", f.supplier, service, websocketIdentityTestApp, 101, 110)
+
+	f.serveRelay(t, request)
+
+	require.Equal(t, int64(1), f.backendHits.Load())
+	require.Equal(t, int64(1), f.validator.calls.Load())
+	require.Equal(t, int64(1), f.processor.total.Load())
+	require.Equal(t, int64(1), f.publisher.total.Load())
+	require.True(t, f.miniRedis.Exists(f.meter.consumedKey(request.Meta.SessionHeader.SessionId, f.supplier)),
+		"a frame matching the handshake owner must be metered under that pinned supplier")
+}
+
 func TestWebSocketIdentityAllowsSessionRolloverForPinnedIdentity(t *testing.T) {
 	service := "ws-identity-rollover"
 	f := newWebSocketIdentityFixture(t, service, false, websocketIdentityTestApp)
