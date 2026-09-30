@@ -163,11 +163,15 @@ type WebSocketBridge struct {
 	latestResponse *servicetypes.RelayResponse
 	latestMu       sync.RWMutex
 
-	// Service and supplier info
-	serviceID       string
-	supplierAddress string
-	arrivalHeight   int64
-	computeUnits    uint64 // Compute units for this service
+	// Service identity is fixed by the handshake. Supplier identity is fixed
+	// there for PATH v2 or adopted from the first frame for PATH v1. Application
+	// identity is adopted from the first frame; the session ID may roll over.
+	serviceID      string
+	owner          atomic.Pointer[string]
+	application    string
+	applicationSet bool // distinguishes an adopted empty address from no identity
+	arrivalHeight  int64
+	computeUnits   uint64 // Compute units for this service
 
 	// Relay counting for billing
 	relayCount atomic.Uint64
@@ -240,13 +244,16 @@ func NewWebSocketBridge(
 		relayPipeline:    relayPipeline,
 		msgChan:          make(chan wsMessage, 100),
 		serviceID:        serviceID,
-		supplierAddress:  supplierAddress,
 		arrivalHeight:    arrivalHeight,
 		computeUnits:     computeUnits,
 		sessionMonitor:   sessionMonitor,
 		sessionEndHeight: 0, // Will be set from first relay request
 		ctx:              ctx,
 		cancelFn:         cancelFn,
+	}
+	if supplierAddress != "" {
+		owner := supplierAddress
+		bridge.owner.Store(&owner)
 	}
 
 	// Track connection
@@ -476,14 +483,21 @@ func (b *WebSocketBridge) handleGatewayMessage(msg wsMessage) {
 		return
 	}
 
-	// Extract session parameters from first request and register with global monitor
-	if b.sessionEndHeight == 0 && relayReq.Meta.SessionHeader != nil {
+	// Identity is checked before mutating bridge/session state or allowing this
+	// frame to reach validation, metering, the backend, or mining.
+	if !b.adoptOrVerifyIdentity(relayReq) {
+		return
+	}
+
+	// Extract session parameters from the first identity-valid request and
+	// register with the global monitor. Session IDs are deliberately not pinned:
+	// the next session may use this connection during its grace window.
+	if b.sessionEndHeight == 0 {
 		b.sessionEndHeight = relayReq.Meta.SessionHeader.SessionEndBlockHeight
 		b.logger.Info().
 			Int64("session_end_height", b.sessionEndHeight).
 			Msg("session parameters initialized from first relay request")
 
-		// Register with global session monitor
 		if b.sessionMonitor != nil {
 			b.sessionMonitor.RegisterBridge(b, b.sessionEndHeight)
 		}
@@ -495,7 +509,7 @@ func (b *WebSocketBridge) handleGatewayMessage(msg wsMessage) {
 		relayCtx := &RelayContext{
 			Request:            relayReq,
 			ServiceID:          b.serviceID,
-			SupplierAddress:    b.supplierAddress,
+			SupplierAddress:    b.ownerAddress(),
 			SessionID:          relayReq.Meta.SessionHeader.SessionId,
 			ComputeUnits:       b.computeUnits,
 			ArrivalBlockHeight: b.arrivalHeight,
@@ -554,6 +568,79 @@ func (b *WebSocketBridge) handleGatewayMessage(msg wsMessage) {
 	b.logger.Debug().
 		Int("bytes_sent", len(relayReq.Payload)).
 		Msg("successfully forwarded payload to backend")
+}
+
+// ownerAddress returns the supplier pinned to this WebSocket connection, or
+// empty before a PATH v1 connection has accepted its first relay frame.
+func (b *WebSocketBridge) ownerAddress() string {
+	owner := b.owner.Load()
+	if owner == nil {
+		return ""
+	}
+	return *owner
+}
+
+// adoptOrVerifyIdentity pins a bridge to one supplier, service, and application.
+// The service is fixed by the handshake. Supplier identity is fixed there for
+// PATH v2 or adopted from the first frame for PATH v1; the application is
+// adopted from the first frame. The session ID is deliberately not pinned so a
+// connection can roll over to the next session without changing identity.
+//
+// This gate must remain before session monitor registration, validation,
+// metering, backend forwarding, and relay mining.
+func (b *WebSocketBridge) adoptOrVerifyIdentity(relayReq *servicetypes.RelayRequest) bool {
+	requestedSupplier := relayReq.Meta.SupplierOperatorAddress
+	if requestedSupplier == "" {
+		relaysRejected.WithLabelValues(b.serviceID, "websocket", rejectReasonMissingSupplierAddress).Inc()
+		b.logger.Debug().Msg("relay request names no supplier operator address - closing connection")
+		_ = b.closeWithReason(CloseValidationFailed, "relay request names no supplier", wsCloseInitiatorRelayer)
+		return false
+	}
+
+	if relayReq.Meta.SessionHeader == nil {
+		relaysRejected.WithLabelValues(b.serviceID, "websocket", rejectReasonInvalidRelayRequest).Inc()
+		b.logger.Debug().Msg("relay request carries no session header - closing connection")
+		_ = b.closeWithReason(CloseValidationFailed, "relay request carries no session header", wsCloseInitiatorRelayer)
+		return false
+	}
+
+	if requestedService := relayReq.Meta.SessionHeader.ServiceId; requestedService != b.serviceID {
+		relaysRejected.WithLabelValues(b.serviceID, "websocket", rejectReasonServiceChanged).Inc()
+		b.logger.Debug().Msg("relay request names a different service than this connection - closing connection")
+		_ = b.closeWithReason(CloseValidationFailed, "service does not match this connection", wsCloseInitiatorRelayer)
+		return false
+	}
+
+	requestedApplication := relayReq.Meta.SessionHeader.ApplicationAddress
+	if !b.applicationSet {
+		// An empty address is still a value: applicationSet distinguishes it
+		// from an identity that has not been adopted yet.
+		b.application = requestedApplication
+		b.applicationSet = true
+	} else if requestedApplication != b.application {
+		relaysRejected.WithLabelValues(b.serviceID, "websocket", rejectReasonApplicationChanged).Inc()
+		b.logger.Debug().Msg("relay request names a different application than this connection - closing connection")
+		_ = b.closeWithReason(CloseValidationFailed, "application does not match this connection", wsCloseInitiatorRelayer)
+		return false
+	}
+
+	owner := b.owner.Load()
+	if owner == nil {
+		// PATH v1 has no supplier in the handshake. A rejected first frame
+		// closes the connection below, so this adopted owner cannot outlive it.
+		pinnedSupplier := requestedSupplier
+		b.owner.Store(&pinnedSupplier)
+		return true
+	}
+
+	if *owner != requestedSupplier {
+		relaysRejected.WithLabelValues(b.serviceID, "websocket", rejectReasonSupplierChanged).Inc()
+		b.logger.Debug().Msg("relay request names a different supplier than this connection - closing connection")
+		_ = b.closeWithReason(CloseValidationFailed, "supplier does not own this connection", wsCloseInitiatorRelayer)
+		return false
+	}
+
+	return true
 }
 
 // handleBackendMessage handles messages from the backend.
@@ -651,11 +738,9 @@ func (b *WebSocketBridge) emitRelay(req *servicetypes.RelayRequest, resp *servic
 	// Increment relay count for this connection
 	count := b.relayCount.Add(1)
 
-	// Get supplier address from request metadata or fallback to bridge config
-	supplierAddr := b.supplierAddress
-	if req.Meta.SupplierOperatorAddress != "" {
-		supplierAddr = req.Meta.SupplierOperatorAddress
-	}
+	// Use the bridge's pinned owner, not a frame-supplied address. The identity
+	// gate has already established that every accepted frame matches this owner.
+	supplierAddr := b.ownerAddress()
 
 	// Extract session context for logging
 	sessionCtx := logging.SessionContextFromRelayRequest(req)
@@ -729,10 +814,7 @@ func (b *WebSocketBridge) sendSessionExpirationMessage() error {
 		return nil // No session to expire
 	}
 
-	supplierAddr := b.supplierAddress
-	if latestReq.Meta.SupplierOperatorAddress != "" {
-		supplierAddr = latestReq.Meta.SupplierOperatorAddress
-	}
+	supplierAddr := b.ownerAddress()
 
 	// Build error response
 	_, respBytes, err := b.responseSigner.BuildErrorRelayResponse(
