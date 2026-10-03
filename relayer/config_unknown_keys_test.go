@@ -130,6 +130,22 @@ func TestLoadConfig_RetiredKeysAreNamedWithWhatTheyChanged(t *testing.T) {
 			mustCarry: "refuses",
 			why:       "an operator who tuned it must expect a relayer that starts before the miner to refuse relays, not price them by the protocol formula",
 		},
+		{
+			name:      "redis.namespace.cache_prefix",
+			anchor:    "redis:\n",
+			extra:     "    namespace:\n        cache_prefix: legacy\n",
+			key:       "cache_prefix",
+			mustCarry: "per-family Redis prefixes are removed",
+			why:       "an operator who customized a sub-prefix must remove the line instead of silently relocating that data",
+		},
+		{
+			name:      "redis.namespace.consumer_group_prefix",
+			anchor:    "redis:\n",
+			extra:     "    namespace:\n        consumer_group_prefix: legacy\n",
+			key:       "consumer_group_prefix",
+			mustCarry: "orphans its pending-entries list",
+			why:       "renaming the consumer group orphans relays already delivered and not yet acked",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg, err := LoadConfig(writeConfigWithExtra(t, tc.anchor, tc.extra))

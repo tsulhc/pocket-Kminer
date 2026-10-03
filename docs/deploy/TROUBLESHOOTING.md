@@ -43,17 +43,20 @@ EXIT=1
 **Action**: delete the key, or move it where the message says. The full list
 of removed keys is in the v0.1.0 release notes.
 
-A retired Redis namespace prefix. Real output:
+A retired Redis namespace prefix. Real output (a config still carrying
+`redis.namespace.cache_prefix`):
 
 ```
-Error: config is INVALID: failed to load config: invalid config: redis.namespace no longer supports per-family prefixes, and yours customizes 1 of them: cache_prefix: "custom" (keys now use "cache"). ...
+Error: config is INVALID: 1 key(s) this miner does not understand:
+  line 12: field cache_prefix not found in type config.RedisNamespaceConfig -- this setting was REMOVED: per-family Redis prefixes are removed: the key layout below base_prefix is now fixed in code ... ...
 EXIT=1
 ```
 
-**Action**: remove the `redis.namespace.*_prefix` lines. **Stop and ask a
-human** if keys really live under a custom prefix today: the fleet has to be
-drained and migrated first, and the old value must not be folded into
-`redis.namespace.base_prefix`.
+**Action**: remove the `redis.namespace.*_prefix` lines. If a line says the
+value it already had (e.g. `cache_prefix: "cache"`), nothing moves -- just
+delete it. **Stop and ask a human** if keys really live under a custom prefix
+today: the fleet has to be drained and migrated first, and the old value must
+not be folded into `redis.namespace.base_prefix`.
 
 A serving binary (not `validate`) with an unknown key warns and starts; with
 `--strict-config` it refuses instead. Run `validate` to see the list.

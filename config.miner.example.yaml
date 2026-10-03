@@ -94,9 +94,9 @@ redis:
   #
   # The per-family prefixes (cache_prefix, events_prefix, streams_prefix,
   # miner_prefix, supplier_prefix, meter_prefix, params_prefix,
-  # consumer_group_prefix) are RETIRED. Setting one to anything other than its
-  # historical value fails at startup instead of silently relocating that
-  # data -- see docs/REDIS.md.
+  # consumer_group_prefix) are REMOVED, not just retired: they are no longer
+  # fields, so setting one fails `validate` (and warns at startup) instead of
+  # silently relocating that data -- see docs/REDIS.md. Delete those lines.
   # namespace:
   #   # Root prefix for all keys. Default: "ha".
   #   base_prefix: "ha"

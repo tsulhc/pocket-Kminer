@@ -268,10 +268,12 @@ you turn it off quietly: with `hot_reload_enabled: false` the key manager logs a
 **warning** at startup saying a key added or removed now takes effect only on
 restart.
 
-`hot_reload_enabled` at the TOP level of a miner config is a startup error, not
-an ignored line. It used to live there, and until 2026-08-22 it was read by
-nothing: a miner whose config said `true` ran with key hot reload off. The error
-names the new location so the migration is one line.
+`hot_reload_enabled` at the TOP level of a config is rejected, not an ignored
+line. It used to live there, and until 2026-08-22 it was read by nothing: a
+miner whose config said `true` ran with key hot reload off. `miner validate`
+and `relayer validate` fail on it, and a serving binary warns at startup (or
+refuses with `--strict-config`). The message names the new location so the
+migration is one line.
 
 Two mechanisms feed the same reload, so there is one piece of code deciding what
 changed:
