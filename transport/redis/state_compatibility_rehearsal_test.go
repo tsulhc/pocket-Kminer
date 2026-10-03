@@ -20,13 +20,19 @@ import (
 // revision).
 //
 // What this proves, per domain, against an isolated Redis 8.10.2 holding
-// representative sanitized state in the OLD shape: every required family is
-// readable by the NEW code paths, a crashed consumer's pending entries are
-// reclaimed without loss or duplication, lease ownership is exclusive, and a
-// restart resumes from live/claimed roots. The OLD shape IS the NEW shape
-// here — the KeyBuilder layout is unchanged (pinned by
-// key_layout_equivalence_test.go) — so the rehearsal proves the state the
-// fleet holds today works as-is under the NEW binary.
+// representative sanitized state in the OLD shape: the transport-level
+// families are usable by the NEW code — a crashed consumer's pending entries
+// are reclaimed without loss or duplication, and lease ownership is
+// exclusive. The OLD shape IS the NEW shape here — the KeyBuilder layout is
+// unchanged (pinned by key_layout_equivalence_test.go) — so the rehearsal
+// proves the state the fleet holds today works as-is under the NEW binary.
+//
+// The miner-level families (submission tracking, rebroadcast store, SMST
+// live/claimed roots and leaves, session metadata incl. the legacy string
+// layout, dedup sets) are rehearsed through their PRODUCTION write/read
+// paths in miner/state_compatibility_rehearsal_test.go. A raw-client
+// round-trip of a self-shaped value would pass while the NEW binary cannot
+// use the state, so those gates live where the production APIs live.
 //
 // Verdict rule: these tests passing on 8.10.2 IS the SHORT_CUTOVER_COMPATIBLE
 // verdict for that domain. Any gate failing here flips the verdict to
@@ -64,7 +70,6 @@ func rehearseDomain(t *testing.T, domain string, withLeases bool) {
 	kb := redisutil.NewKeyBuilder(config.RedisNamespaceConfig{BasePrefix: testredis.Prefix(t)})
 
 	const supplier = "pokt1rehearsal_supplier"
-	const session = "sess-rehearsal-1"
 
 	// Gate 1 — streams/groups: a crashed consumer's pending entries are
 	// reclaimed by a new consumer with identical bytes (no silent loss), and
@@ -102,44 +107,9 @@ func rehearseDomain(t *testing.T, domain string, withLeases bool) {
 	require.NoError(t, err)
 	require.Zero(t, pending.Count, "acked entries must not be redelivered")
 
-	// Gate 2 — session metadata survives a restart read.
-	require.NoError(t, rdb.HSet(ctx, kb.MinerSessionKey(supplier, session),
-		"session_id", session, "service_id", "eth", "application", "pokt1rehearsal_app").Err())
-	meta, err := rdb.HGetAll(ctx, kb.MinerSessionKey(supplier, session)).Result()
-	require.NoError(t, err)
-	require.Equal(t, map[string]string{
-		"session_id": session, "service_id": "eth", "application": "pokt1rehearsal_app",
-	}, meta)
-	require.NoError(t, rdb.SAdd(ctx, kb.MinerSessionsIndexKey(supplier), session).Err())
-	require.NoError(t, rdb.SAdd(ctx, kb.MinerSessionStateIndexKey(supplier, "active"), session).Err())
-	require.Contains(t, rdb.SMembers(ctx, kb.MinerSessionsIndexKey(supplier)).Val(), session)
-
-	// Gate 3 — SMST live root (mid-session resume) and claimed root + leaves
-	// (proof rebuild) are intact.
-	liveRoot := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-	claimedRoot := "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
-	require.NoError(t, rdb.Set(ctx, kb.SMSTLiveRootKey(supplier, session), liveRoot, 0).Err())
-	require.NoError(t, rdb.Set(ctx, kb.SMSTRootKey(supplier, session), claimedRoot, 0).Err())
-	require.Equal(t, liveRoot, rdb.Get(ctx, kb.SMSTLiveRootKey(supplier, session)).Val(),
-		"a follower promoted mid-session must resume from the live root")
-	require.Equal(t, claimedRoot, rdb.Get(ctx, kb.SMSTRootKey(supplier, session)).Val(),
-		"a proof must rebuild from the claimed root")
-
-	// Gate 4 — claim/proof/inclusion tracking: tx track entry and rebroadcast
-	// store round-trip; dedup set stays idempotent (no double counting).
-	require.NoError(t, rdb.HSet(ctx, kb.TxTrackKey(supplier, 100, session),
-		"tx_hash", "ABCDEF1234", "phase", "claim").Err())
-	require.Equal(t, "ABCDEF1234",
-		rdb.HGet(ctx, kb.TxTrackKey(supplier, 100, session), "tx_hash").Val())
-	require.NoError(t, rdb.HSet(ctx, kb.RebroadcastKey("claim", supplier, 100),
-		"group:"+session, claimedRoot).Err())
-	require.NoError(t, rdb.SAdd(ctx, kb.RebroadcastIndexKey("claim"),
-		"group:"+session).Err())
-	require.Contains(t, rdb.SMembers(ctx, kb.RebroadcastIndexKey("claim")).Val(), "group:"+session)
-	require.NoError(t, rdb.SAdd(ctx, kb.MinerDedupSessionKey(session), "relayhash1").Err())
-	require.NoError(t, rdb.SAdd(ctx, kb.MinerDedupSessionKey(session), "relayhash1").Err())
-	require.EqualValues(t, 1, rdb.SCard(ctx, kb.MinerDedupSessionKey(session)).Val(),
-		"replayed dedup members must not double count")
+	// Gates 2-4 (session metadata, SMST roots/leaves, tx-track/rebroadcast/
+	// dedup) run through their production write/read paths in
+	// miner/state_compatibility_rehearsal_test.go.
 
 	if withLeases {
 		// Gate 5 (PG only) — supplier lease ownership is exclusive: holder A
