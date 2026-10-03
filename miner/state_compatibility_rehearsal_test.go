@@ -127,9 +127,23 @@ func rehearseMinerState(t *testing.T, withCompaction bool) {
 	resumed := newSMSTManager()
 	_, err = resumed.GetOrCreateTree(ctx, session)
 	require.NoError(t, err, "a restarted miner must resume the live tree")
-	liveProof, err := resumed.ProveClosest(ctx, session, leafKeys[0])
-	require.NoError(t, err, "the resumed tree must prove from the live root")
-	require.NotEmpty(t, liveProof)
+	// A live tree has no claimed root yet, so ProveClosest correctly
+	// refuses it — proofs only exist for sealed trees (gate below).
+	// Resume continuity instead: the reimported root matches the
+	// checkpoint, and the tree keeps accumulating relays past it.
+	checkpointed, err := mgr.GetTreeRoot(ctx, session)
+	require.NoError(t, err)
+	resumedRoot, err := resumed.GetTreeRoot(ctx, session)
+	require.NoError(t, err)
+	require.Equal(t, checkpointed, resumedRoot, "the resumed root must equal the checkpointed live root")
+	extra := sha256.Sum256([]byte{0xFF, 0xA5})
+	require.NoError(t, resumed.UpdateTree(ctx, session, extra[:], []byte{0xFF, 0x01, 0x02}, 1),
+		"the resumed tree must accept new relays")
+	_, _, err = resumed.CheckpointLiveRoot(ctx, session)
+	require.NoError(t, err)
+	advanced, err := resumed.GetTreeRoot(ctx, session)
+	require.NoError(t, err)
+	require.NotEqual(t, resumedRoot, advanced, "the resumed tree must advance past the checkpoint")
 	root, err := resumed.FlushTree(ctx, session)
 	require.NoError(t, err, "the resumed tree must flush a claimed root")
 	require.Len(t, root, SMSTRootLen)
