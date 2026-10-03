@@ -1234,7 +1234,6 @@ func (b *WebSocketBridge) handleBackendMessage(msg wsMessage) {
 
 	b.logger.Debug().
 		Int("message_size", len(msg.data)).
-		Str("backend_response", string(msg.data[:min(50, len(msg.data))])).
 		Msg("handleBackendMessage called")
 
 	latestReq := b.getLatestRequest()
@@ -1442,6 +1441,35 @@ func (b *WebSocketBridge) emitRelay(req *servicetypes.RelayRequest, resp *servic
 	// because relays_served_total is everything SERVED, not everything mined
 	// and not everything published.
 	relaysServed.WithLabelValues(b.serviceID, BackendTypeWebSocket, statusCodeNoHTTP).Inc()
+
+	// W2 trusted request intelligence: accepted-frame observation only.
+	// Emitted after the client has the signed response and after the served
+	// counter, before publish. Log-side correlation only: the fixed backend
+	// WebSocket handshake cannot carry a per-relay header. Pinned supplier
+	// comes from the atomic owner, pinned service from the bridge; session
+	// and application come from the accepted frame and may roll.
+	{
+		pinnedCtx := logging.SessionContextFromRelayRequest(req)
+		if pinnedCtx == nil {
+			pinnedCtx = &logging.SessionContext{}
+		}
+		pinnedCtx.Supplier = b.ownerAddress()
+		pinnedCtx.ServiceID = b.serviceID
+		wsObservation := relayObservation{
+			RequestID:            pocketRequestIDFromRelayRequest(req),
+			ServiceID:            b.serviceID,
+			RPCType:              workloadWebSocket,
+			Workload:             workloadWebSocket,
+			RequestBytes:         len(req.GetPayload()),
+			BackendRequestBytes:  len(req.GetPayload()),
+			BackendResponseBytes: len(respPayload),
+			Retries:              0,
+			Outcome:              relayOutcomeServed,
+			SignatureVerified:    true,
+			sessionContext:       pinnedCtx,
+		}
+		logRelayObservation(b.logger, req, wsObservation)
+	}
 
 	if b.publisher == nil {
 		return

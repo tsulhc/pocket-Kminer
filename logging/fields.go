@@ -137,6 +137,17 @@ const (
 	FieldApplication = "application"
 )
 
+// Relay request intelligence fields. These values are structured log fields,
+// never Prometheus labels.
+const (
+	FieldRequestID           = "pocket_request_id"
+	FieldRPCType             = "rpc_type"
+	FieldWorkload            = "workload"
+	FieldRequestSize         = "request_size"
+	FieldBackendRequestSize  = "backend_request_bytes"
+	FieldBackendResponseSize = "backend_response_size"
+)
+
 // Replica role constants for the "replica" field.
 const (
 	ReplicaLeader  = "leader"

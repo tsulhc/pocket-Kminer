@@ -176,7 +176,7 @@ func TestForwardToBackend_MisconfigDoesNotHitNetwork(t *testing.T) {
 	}
 
 	respBody, respHeaders, respStatus, err := svc.forwardToBackend(
-		context.Background(), "svc", svcConfig, poktReq, nil, BackendTypeREST,
+		context.Background(), "svc", svcConfig, poktReq, nil, BackendTypeREST, "",
 	)
 
 	require.Error(t, err)
@@ -236,7 +236,7 @@ func TestForwardToBackend_GRPCBackendViaH2C(t *testing.T) {
 	}
 
 	respBody, respHeaders, respStatus, err := svc.forwardToBackend(
-		context.Background(), "svc", svcConfig, poktReq, nil, BackendTypeGRPC,
+		context.Background(), "svc", svcConfig, poktReq, nil, BackendTypeGRPC, "",
 	)
 	require.NoError(t, err)
 
