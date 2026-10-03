@@ -4,70 +4,142 @@ package relayer
 
 import (
 	"context"
+	"io"
+	"net"
 	"net/http"
-	"net/http/httptest"
 	"testing"
+	"time"
 
 	sdktypes "github.com/pokt-network/shannon-sdk/types"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/h2c"
 	"google.golang.org/grpc/metadata"
-
-	"github.com/pokt-network/pocket-relay-miner/pool"
 )
 
+// grpcReqWithContentType builds a minimal POKTHTTPRequest carrying a single
+// Content-Type header (or none when ct is empty), used to exercise the inner
+// Content-Type heuristic in resolveGRPCRelayRPCType.
+func grpcReqWithContentType(ct string) *sdktypes.POKTHTTPRequest {
+	if ct == "" {
+		return &sdktypes.POKTHTTPRequest{}
+	}
+	return &sdktypes.POKTHTTPRequest{
+		Header: map[string]*sdktypes.Header{
+			"Content-Type": {Key: "Content-Type", Values: []string{ct}},
+		},
+	}
+}
+
+// TestResolveGRPCRelayRPCType pins the precedence contract that fixes native
+// gRPC relays: the client's declared "rpc-type" metadata wins over the inner
+// Content-Type, then the service default, then the global default. This mirrors
+// the HTTP path (proxy.go:719-728).
 func TestResolveGRPCRelayRPCType(t *testing.T) {
 	tests := []struct {
-		name        string
-		metadata    metadata.MD
-		contentType string
-		defaultRPC  string
-		want        string
+		name           string
+		md             metadata.MD
+		contentType    string
+		defaultBackend string
+		want           string
 	}{
-		{name: "metadata numeric grpc", metadata: metadata.Pairs("rpc-type", "1"), want: BackendTypeGRPC},
-		{name: "metadata named grpc", metadata: metadata.Pairs("rpc-type", "grpc"), want: BackendTypeGRPC},
-		{name: "metadata rest wins", metadata: metadata.Pairs("rpc-type", "4"), contentType: "application/grpc", want: BackendTypeREST},
-		{name: "content type grpc", contentType: "application/grpc", want: BackendTypeGRPC},
-		{name: "default grpc", defaultRPC: BackendTypeGRPC, want: BackendTypeGRPC},
-		{name: "global default", want: DefaultBackendType},
+		{
+			name: "metadata numeric code 1 maps to grpc",
+			md:   metadata.Pairs("rpc-type", "1"),
+			want: BackendTypeGRPC,
+		},
+		{
+			name: "metadata name grpc stays grpc",
+			md:   metadata.Pairs("rpc-type", "grpc"),
+			want: BackendTypeGRPC,
+		},
+		{
+			name: "metadata numeric code 4 maps to rest",
+			md:   metadata.Pairs("rpc-type", "4"),
+			want: BackendTypeREST,
+		},
+		{
+			name:        "no metadata falls back to inner content-type grpc",
+			md:          nil,
+			contentType: "application/grpc+proto",
+			want:        BackendTypeGRPC,
+		},
+		{
+			name:           "no metadata json content-type uses service default",
+			md:             nil,
+			contentType:    "application/json",
+			defaultBackend: BackendTypeGRPC,
+			want:           BackendTypeGRPC,
+		},
+		{
+			name:        "no metadata json content-type no default uses global default",
+			md:          nil,
+			contentType: "application/json",
+			want:        DefaultBackendType,
+		},
+		{
+			name: "empty metadata no content-type no default uses global default",
+			md:   metadata.MD{},
+			want: DefaultBackendType,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			req := &sdktypes.POKTHTTPRequest{}
-			if tt.contentType != "" {
-				req.Header = map[string]*sdktypes.Header{
-					"Content-Type": {Values: []string{tt.contentType}},
-				}
-			}
-			got := resolveGRPCRelayRPCType(tt.metadata, req, &ServiceConfig{DefaultBackend: tt.defaultRPC})
+			svcConfig := &ServiceConfig{DefaultBackend: tt.defaultBackend}
+			got := resolveGRPCRelayRPCType(tt.md, grpcReqWithContentType(tt.contentType), svcConfig)
 			require.Equal(t, tt.want, got)
 		})
 	}
 }
 
+// TestNormalizeBackendURLForRPCType pins that gRPC backends given as bare
+// host:port become h2c-dialable http:// URLs, real http/https URLs are left
+// alone, non-gRPC types are never rewritten, and an explicit non-http scheme is
+// a hard error.
 func TestNormalizeBackendURLForRPCType(t *testing.T) {
 	tests := []struct {
 		name    string
-		backend string
+		url     string
 		rpcType string
 		want    string
 		wantErr bool
 	}{
-		{name: "grpc bare host", backend: "backend:50051", rpcType: BackendTypeGRPC, want: "http://backend:50051"},
-		{name: "grpc http", backend: "http://backend:50051", rpcType: BackendTypeGRPC, want: "http://backend:50051"},
-		{name: "grpc https", backend: "https://backend:50051", rpcType: BackendTypeGRPC, want: "https://backend:50051"},
-		{name: "grpc unsupported scheme", backend: "ftp://backend:50051", rpcType: BackendTypeGRPC, wantErr: true},
-		{name: "rest bare host misconfigured", backend: "backend:50051", rpcType: BackendTypeREST, wantErr: true},
+		{
+			name:    "grpc bare host:port gets http scheme",
+			url:     "backend:50051",
+			rpcType: BackendTypeGRPC,
+			want:    "http://backend:50051",
+		},
+		{
+			name:    "grpc http url unchanged",
+			url:     "http://b:1",
+			rpcType: BackendTypeGRPC,
+			want:    "http://b:1",
+		},
+		{
+			name:    "grpc https url unchanged",
+			url:     "https://b",
+			rpcType: BackendTypeGRPC,
+			want:    "https://b",
+		},
+		{
+			name:    "rest bare host:port unchanged (not grpc, not normalized)",
+			url:     "backend:50051",
+			rpcType: BackendTypeREST,
+			want:    "backend:50051",
+		},
+		{
+			name:    "grpc explicit non-http scheme errors",
+			url:     "ftp://x",
+			rpcType: BackendTypeGRPC,
+			wantErr: true,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := normalizeBackendURLForRPCType(tt.backend, tt.rpcType)
+			got, err := normalizeBackendURLForRPCType(tt.url, tt.rpcType)
 			if tt.wantErr {
 				require.Error(t, err)
-				require.ErrorIs(t, err, errBackendMisconfigured)
 				return
 			}
 			require.NoError(t, err)
@@ -76,136 +148,137 @@ func TestNormalizeBackendURLForRPCType(t *testing.T) {
 	}
 }
 
-func TestForwardToBackend_MisconfigDoesNotHitNetwork(t *testing.T) {
-	var requests int
-	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
-		requests++
-		return nil, context.Canceled
-	})}
-	svc := &RelayGRPCService{
-		getHTTPClient: func(string) *http.Client { return client },
-		bufferPool:    NewBufferPool(1024),
-	}
-	ep, err := pool.NewBackendEndpoint("bare", "backend:50051")
-	require.NoError(t, err)
-
-	_, _, _, err = svc.forwardToBackend(
-		context.Background(),
-		"svc",
-		&ServiceConfig{Backends: map[string]BackendConfig{BackendTypeREST: {URL: "backend:50051"}}},
-		&sdktypes.POKTHTTPRequest{Method: http.MethodPost, Url: "http://relay/", BodyBz: []byte("x")},
-		ep,
-		BackendTypeREST,
-		"",
-	)
-	require.ErrorIs(t, err, errBackendMisconfigured)
-	require.Zero(t, requests)
+// newTestGRPCService builds a RelayGRPCService with only the dependencies that
+// forwardToBackend touches (the h2c client, default HTTP client, and buffer
+// pool are all created by the constructor). The remaining collaborators are
+// nil because the forwarding path under test never reaches them.
+func newTestGRPCService(t *testing.T) *RelayGRPCService {
+	t.Helper()
+	return NewRelayGRPCService(testLogger(), RelayGRPCServiceConfig{})
 }
 
+// TestForwardToBackend_MisconfigDoesNotHitNetwork proves a scheme-less backend
+// for a non-gRPC relay is reported as errBackendMisconfigured before any dial,
+// so it never reaches -- and never poisons -- the circuit breaker.
+func TestForwardToBackend_MisconfigDoesNotHitNetwork(t *testing.T) {
+	svc := newTestGRPCService(t)
+
+	svcConfig := &ServiceConfig{
+		Backends: map[string]BackendConfig{
+			// Scheme-less URL: url.Parse reads "backend" as the scheme, which
+			// http.NewRequest cannot dial. For a REST relay this is a config error.
+			BackendTypeREST: {URL: "backend:50051"},
+		},
+	}
+	poktReq := &sdktypes.POKTHTTPRequest{
+		Method: http.MethodPost,
+		Url:    "/v1",
+	}
+
+	respBody, respHeaders, respStatus, err := svc.forwardToBackend(
+		context.Background(), "svc", svcConfig, poktReq, nil, BackendTypeREST,
+	)
+
+	require.Error(t, err)
+	require.ErrorIs(t, err, errBackendMisconfigured)
+	require.Nil(t, respBody)
+	require.Nil(t, respHeaders)
+	require.Zero(t, respStatus)
+}
+
+// TestForwardToBackend_GRPCBackendViaH2C is the end-to-end proof that a gRPC
+// relay reaches a real gRPC backend over h2c: the backend, configured as a bare
+// host:port, must be dialed as HTTP/2 cleartext with Content-Type
+// application/grpc, and the grpc-status trailer must come back inside the
+// returned headers so the gRPC client can interpret the response.
 func TestForwardToBackend_GRPCBackendViaH2C(t *testing.T) {
-	type observation struct {
+	type observed struct {
 		proto       string
 		contentType string
-		requestID   string
 	}
-	observed := make(chan observation, 1)
-	server := httptest.NewUnstartedServer(h2c.NewHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		observed <- observation{
-			proto:       r.Proto,
-			contentType: r.Header.Get("Content-Type"),
-			requestID:   r.Header.Get(HeaderPocketRequestID),
-		}
+	obsCh := make(chan observed, 1)
+
+	echoBody := []byte{0x00, 0x00, 0x00, 0x00, 0x05, 'h', 'e', 'l', 'l', 'o'}
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Report what the server negotiated so the assertions reflect the
+		// server-side view, not just the client's. Channel send/receive gives a
+		// happens-before edge, keeping this race-free under -race.
+		obsCh <- observed{proto: r.Proto, contentType: r.Header.Get("Content-Type")}
+
+		body, _ := io.ReadAll(r.Body)
+
+		// Announce the trailer before writing the body, then set it after -- the
+		// standard Go pattern for HTTP trailers (how gRPC carries grpc-status).
 		w.Header().Set("Trailer", "Grpc-Status")
 		w.Header().Set("Content-Type", "application/grpc")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("grpc-body"))
+		_, _ = w.Write(body)
 		w.Header().Set("Grpc-Status", "0")
-	}), &http2.Server{}))
-	server.Start()
-	t.Cleanup(server.Close)
-
-	svc := NewRelayGRPCService(testLogger(), RelayGRPCServiceConfig{
-		ServiceConfigs: map[string]ServiceConfig{},
-		MaxBodySize:    1024,
 	})
-	ep, err := pool.NewBackendEndpoint("h2c", server.URL)
-	require.NoError(t, err)
 
-	body, headers, statusCode, err := svc.forwardToBackend(
-		context.Background(),
-		"svc",
-		&ServiceConfig{Backends: map[string]BackendConfig{BackendTypeGRPC: {URL: server.URL}}},
-		&sdktypes.POKTHTTPRequest{
-			Method: http.MethodPost,
-			Url:    "http://relay/",
-			Header: map[string]*sdktypes.Header{"Content-Type": {Values: []string{"application/grpc"}}},
-			BodyBz: []byte("request"),
+	backendAddr := serveH2CBackend(t, handler)
+
+	svc := newTestGRPCService(t)
+	svcConfig := &ServiceConfig{
+		Backends: map[string]BackendConfig{
+			// Bare host:port, exactly how gRPC backends are configured in yaml.
+			BackendTypeGRPC: {URL: backendAddr},
 		},
-		ep,
-		BackendTypeGRPC,
-		"pocket-req-test",
-	)
-	require.NoError(t, err)
-	require.Equal(t, http.StatusOK, statusCode)
-	require.Equal(t, []byte("grpc-body"), body)
-	require.Equal(t, "0", headers.Get("Grpc-Status"))
-	select {
-	case got := <-observed:
-		require.Equal(t, "HTTP/2.0", got.proto)
-		require.Equal(t, "application/grpc", got.contentType)
-		require.Equal(t, "pocket-req-test", got.requestID)
-	default:
-		t.Fatal("backend observation was not recorded")
 	}
-}
-
-func TestMergeTrailersIntoHeader_NilHeader(t *testing.T) {
-	merged := mergeTrailersIntoHeader(nil, http.Header{"Grpc-Status": []string{"0"}})
-	require.Equal(t, "0", merged.Get("Grpc-Status"))
-}
-
-func TestForwardToBackend_FallbackPoolUsesFallbackBackendConfig(t *testing.T) {
-	var requests int
-	var receivedHeader string
-	var receivedAuth string
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requests++
-		receivedHeader = r.Header.Get("X-Fallback")
-		receivedAuth = r.Header.Get("Authorization")
-		_, _ = w.Write([]byte("ok"))
-	}))
-	t.Cleanup(server.Close)
-
-	endpoint, err := pool.NewBackendEndpoint("fallback", server.URL)
-	require.NoError(t, err)
-	service := &RelayGRPCService{
-		bufferPool:    NewBufferPool(1024),
-		getHTTPClient: func(string) *http.Client { return http.DefaultClient },
+	poktReq := &sdktypes.POKTHTTPRequest{
+		Method: http.MethodPost,
+		Url:    "/pb.Demo/Echo",
+		Header: map[string]*sdktypes.Header{
+			"Content-Type": {Key: "Content-Type", Values: []string{"application/grpc"}},
+		},
+		BodyBz: echoBody,
 	}
 
-	body, _, _, err := service.forwardToBackend(
-		context.Background(),
-		"svc",
-		&ServiceConfig{Backends: map[string]BackendConfig{
-			BackendTypeJSONRPC: {
-				Headers:        map[string]string{"X-Fallback": "selected"},
-				Authentication: &AuthenticationConfig{BearerToken: "fallback-token"},
-			},
-		}},
-		&sdktypes.POKTHTTPRequest{Method: http.MethodPost, Url: "http://relay/", BodyBz: []byte("request")},
-		endpoint,
-		BackendTypeREST,
-		"",
+	respBody, respHeaders, respStatus, err := svc.forwardToBackend(
+		context.Background(), "svc", svcConfig, poktReq, nil, BackendTypeGRPC,
 	)
 	require.NoError(t, err)
-	require.Equal(t, []byte("ok"), body)
-	require.Equal(t, 1, requests)
-	require.Equal(t, "selected", receivedHeader)
-	require.Equal(t, "Bearer fallback-token", receivedAuth)
+
+	obs := <-obsCh
+	require.Equal(t, "HTTP/2.0", obs.proto, "backend must be dialed over HTTP/2 cleartext")
+	require.Equal(t, "application/grpc", obs.contentType, "gRPC content-type must reach the backend")
+
+	require.Equal(t, http.StatusOK, respStatus)
+	require.Equal(t, echoBody, respBody)
+	require.Equal(t, "0", respHeaders.Get("Grpc-Status"), "grpc-status trailer must be folded into returned headers")
 }
 
-type roundTripFunc func(*http.Request) (*http.Response, error)
+// serveH2CBackend starts an HTTP server on an ephemeral port that speaks both
+// HTTP/1.1 and HTTP/2 cleartext (h2c), mirroring the relayer listener, and
+// returns its bare host:port address (no scheme) -- the form gRPC backends take
+// in configuration. The server is shut down on test cleanup.
+func serveH2CBackend(t *testing.T, handler http.Handler) string {
+	t.Helper()
 
-func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
-	return f(req)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	protocols := new(http.Protocols)
+	protocols.SetHTTP1(true)
+	protocols.SetUnencryptedHTTP2(true)
+
+	srv := &http.Server{
+		Handler:           handler,
+		Protocols:         protocols,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+
+	serveErrCh := make(chan error, 1)
+	go func() {
+		serveErrCh <- srv.Serve(listener)
+	}()
+
+	t.Cleanup(func() {
+		require.NoError(t, srv.Close())
+		// Serve always returns a non-nil error; after Close it must be ErrServerClosed.
+		require.ErrorIs(t, <-serveErrCh, http.ErrServerClosed)
+	})
+
+	return listener.Addr().String()
 }

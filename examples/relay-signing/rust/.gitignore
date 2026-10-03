@@ -1,0 +1,4 @@
+# This crate lives inside a Go repo. Keep cargo's build output out of it.
+# The build instructions set CARGO_TARGET_DIR elsewhere; this is the backstop
+# for anyone who just runs `cargo build` here.
+/target/

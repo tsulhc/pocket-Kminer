@@ -1,7 +1,7 @@
 # relayer.tilt - Relayer deployment (stateless, waits for miners)
 
 load("./ports.Tiltfile", "get_relayer_ports")
-load("./utils.Tiltfile", "deep_merge", "read_relayer_example_config", "get_redis_host", "apply_k8s_overrides_relayer")
+load("./utils.Tiltfile", "deep_merge", "read_relayer_example_config", "get_redis_host", "apply_k8s_overrides_relayer", "config_hash")
 
 def deploy_relayers(config):
     """Deploy relayer as a Deployment with N replicas"""
@@ -11,16 +11,18 @@ def deploy_relayers(config):
 
     print("Deploying relayer Deployment with {} replica(s)...".format(config["relayer"]["count"]))
 
+    # Render the config once: the ConfigMap carries it, and the Deployment
+    # carries its hash so a config edit actually rolls the pods.
+    relayer_config_yaml = str(encode_yaml(generate_relayer_config(config)))
+
     # Create relayer ConfigMap first
-    create_relayer_configmap(config)
+    create_relayer_configmap(relayer_config_yaml)
 
     # Deploy single relayer Deployment with replicas
-    deploy_relayer_deployment(config)
+    deploy_relayer_deployment(config, config_hash(relayer_config_yaml))
 
-def create_relayer_configmap(config):
+def create_relayer_configmap(relayer_config_yaml):
     """Create ConfigMap with relayer configuration"""
-    relayer_config_dict = generate_relayer_config(config)
-    relayer_config_yaml = str(encode_yaml(relayer_config_dict))
     relayer_config_indented = relayer_config_yaml.replace("\n", "\n    ")
 
     relayer_configmap = """
@@ -35,7 +37,7 @@ data:
 
     k8s_yaml(blob(relayer_configmap))
 
-def deploy_relayer_deployment(config):
+def deploy_relayer_deployment(config, relayer_config_hash):
     """Deploy relayer as a single Deployment with N replicas"""
 
     # Relayer Deployment with replicas + Service
@@ -47,7 +49,7 @@ metadata:
   labels:
     app: relayer
 spec:
-  replicas: {}
+  replicas: {replicas}
   selector:
     matchLabels:
       app: relayer
@@ -55,10 +57,126 @@ spec:
     metadata:
       labels:
         app: relayer
+      annotations:
+        # Hash of the rendered config. A mounted ConfigMap change does not roll
+        # pods on its own, and the relayer reads its config only at startup, so
+        # without this a config edit would update the ConfigMap and leave the
+        # running relayers on the old one.
+        pocket-relay-miner/config-hash: "{config_hash}"
     spec:
+      initContainers:
+      # Build a cosmos keyring from the SAME hex keys the keys_file holds, so the
+      # stack can be run against either source without changing what suppliers
+      # exist. The "test" backend needs no passphrase and stores to disk; pocketd
+      # writes /keyring/keyring-test/<name>.info, which is exactly what a
+      # KeyringProvider with backend "test" and dir /keyring reads.
+      #
+      # No curly braces below: this YAML is rendered through Starlark's
+      # .format(), which reads them as placeholders and fails the Tiltfile.
+      #
+      # An emptyDir, rebuilt on every pod start, on purpose: the keyring is
+      # DERIVED from the secret, so there is one source of truth for which keys
+      # exist and no second place to update.
+      - name: build-keyring
+        image: ghcr.io/pokt-network/pocketd:0.1.35
+        # As the SAME user the app container runs as, so the keyring files are
+        # born owned by it. The first attempt chowned them afterwards instead and
+        # failed with "Operation not permitted": this image does not run as root,
+        # so it could not hand ownership to anyone. Before that the files were
+        # simply unreadable to the app, which loaded ZERO keys.
+        securityContext:
+          runAsUser: 1000
+          runAsGroup: 1000
+        env:
+        # pocketd writes a client config under $HOME on startup, and as a
+        # non-root user in this image $HOME is not writable: it tried /.pocket
+        # and failed with "permission denied", which surfaced as a failed key
+        # import until the error stopped being swallowed.
+        - name: HOME
+          value: /tmp
+        command:
+        - sh
+        - -c
+        - |
+          set -eu
+          # Derived data, rebuilt from scratch. An emptyDir survives a container
+          # RESTART, and import-hex refuses a name that already exists, so a
+          # retry after any failure would die on supplier1 "already exists" --
+          # reporting the retry instead of the cause. Measured: that is exactly
+          # what a CrashLoopBackOff here looked like.
+          # The CONTENTS, not the directory: /keyring is the mount point and
+          # removing it fails with "Permission denied". Named explicitly rather
+          # than globbed, because these are the only two subdirectories cosmos-sdk
+          # creates and a glob would need a shell brace this YAML cannot carry.
+          rm -rf /keyring/keyring-file /keyring/keyring-test
+          mkdir -p /keyring
+          # Read the backend from the RENDERED config rather than taking it as a
+          # parameter: the keyring must be built in the same format the process
+          # will open, and reading the one file that decides that makes them
+          # agree by construction. No keyring block (keys_file mode) means the
+          # keyring is still built, in the default format, so switching source
+          # later is a config change and nothing else.
+          # No braces and no backslashes anywhere in this script. This YAML goes
+          # through Starlark's .format() (which reads a brace as a placeholder)
+          # inside a triple-quoted Starlark string (where a backslash-n becomes
+          # a REAL newline -- that one produced a YAML "unknown directive"
+          # because the fragment after it started with a percent sign). Two
+          # greps instead of awk or sed for exactly that reason.
+          # The two greps must not be allowed to fail the script: under set -e an
+          # assignment from a failing pipeline aborts immediately, and in
+          # keys_file mode there IS no backend line, so the init container died
+          # before printing anything and the fallback below never ran. Measured
+          # 2026-08-22, switching the fleet back to keys_file.
+          BACKEND=$(grep -oE 'backend: *"?(file|test)' /config/config.yaml | head -1 | grep -oE 'file|test' || true)
+          if [ -z "$BACKEND" ]; then BACKEND=test; fi
+          # The passphrase, twice, in a file: cosmos-sdk asks once and then a
+          # second time to confirm when it is CREATING the keyring (no keyhash
+          # file yet), so feeding two lines covers both cases. A file rather
+          # than a printf because printf would need a backslash-n.
+          PASS=$(cat /keyring-pass/passphrase)
+          echo "$PASS" > /tmp/pp
+          echo "$PASS" >> /tmp/pp
+          i=0
+          # The hex keys are one per line in the mounted secret. Selecting them by
+          # LENGTH instead of a regex quantifier keeps this free of a yq
+          # dependency in the pocketd image and free of curly braces, which the
+          # Starlark .format() that renders this YAML reads as placeholders.
+          for hex in $(grep -oiE '[0-9a-f]+' /keys/supplier-keys.yaml | awk 'length == 64'); do
+            i=$((i+1))
+            # The spare second line dies with the process; the test backend
+            # ignores stdin entirely. pocketd's own error is PRINTED, not
+            # swallowed: discarding it once already hid the real cause behind a
+            # generic failure line.
+            if ! pocketd keys import-hex "supplier$i" "$hex" \
+              --keyring-backend "$BACKEND" --keyring-dir /keyring < /tmp/pp >/dev/null; then
+              echo "failed to import supplier$i into the $BACKEND keyring (error above)" >&2
+              exit 1
+            fi
+          done
+          # No chown and no chmod: runAsUser above makes these files the app
+          # user's, and cosmos-sdk writes them 0600 already. Touching the mount
+          # point itself is not permitted to a non-root user anyway.
+          # Importing nothing is a failure, not a quiet success. When the
+          # supplier-keys Secret went missing this printed "imported 0 keys" and
+          # exited 0, and the problem only surfaced two layers down as the app
+          # refusing to start. Fail where the cause is.
+          if [ "$i" -eq 0 ]; then
+            echo "no 64-character hex keys in /keys/supplier-keys.yaml: the supplier-keys secret is missing or empty" >&2
+            exit 1
+          fi
+          echo "imported $i keys into the $BACKEND keyring at /keyring, owned by uid 1000"
+        volumeMounts:
+        - name: config
+          mountPath: /config
+        - name: keys
+          mountPath: /keys
+        - name: keyring
+          mountPath: /keyring
+        - name: keyring-pass
+          mountPath: /keyring-pass
       containers:
       - name: relayer
-        image: {}
+        image: {image}
         imagePullPolicy: Never
         command:
         - pocket-relay-miner
@@ -74,10 +192,39 @@ spec:
         - containerPort: 6060
           name: pprof
         env:
-        - name: GOMAXPROCS
-          value: "4"  # Match CPU limit - makes runtime.NumCPU() return 4
         - name: LOG_LEVEL
-          value: "{}"
+          value: "{log_level}"
+        # Soft limit for the Go runtime below the container limit, so the GC
+        # tightens before the kernel OOM-kills the pod. Same 7GiB/8Gi ratio the
+        # miner uses (miner.Tiltfile), which is why the miner survived the load
+        # of 2026-09-16 while Redis did not.
+        #
+        # NOTE: this is a SOFT limit -- GOMEMLIMIT makes the GC work harder, it
+        # does not refuse work. What refuses work is a cap, and there are two:
+        # the validation queue at maxValidationQueuedBytes = 256 MiB
+        # (proxy.go:2427), which answers 429 with Retry-After and counts
+        # rejectReasonValidationQueueFull; and an admission gate on the publish
+        # side at redis.batch_max_queued_mib (default 512 MiB, queueFull(),
+        # proxy.go:1097).
+        #
+        # MEASURED 2026-09-19 (run l3p, two miners), and it is why this limit is
+        # 8Gi rather than the sum of those caps: only the VALIDATION cap held.
+        # The relayer peaked at 6.793 GiB, 83% of this container, with the
+        # validation queue pinned at exactly 256,03 MiB and 1.965.145 relays
+        # refused -- that cap is what kept the pod alive. The publish gate never
+        # fired once (zero series for reason="publish_queue_full", against
+        # 1.965.145 for the validation one, so the query looked), because it
+        # reads batcher.QueuedBytes() -- the stage AFTER the publish worker pool
+        # -- while the backlog piles up BEFORE it: 2.214.146 tasks waiting in the
+        # publish subpool holding 1.324 MiB of bodies, which is 2,6x the gate's
+        # own threshold in a place the gate cannot see. Queue item 368.
+        #
+        # So do not size this container from "both caps held at once". The
+        # accounted payload at the peak was ~1,58 GiB and the working set was
+        # 6,79 GiB -- 4,3x, not the 2x rule of thumb, because a queued task costs
+        # far more than the body it is accounted for.
+        - name: GOMEMLIMIT
+          value: "7GiB"
         - name: POD_NAME
           valueFrom:
             fieldRef:
@@ -87,13 +234,21 @@ spec:
           mountPath: /config
         - name: keys
           mountPath: /keys
+        - name: keyring
+          mountPath: /keyring
+        - name: keyring-pass
+          mountPath: /keyring-pass
         resources:
           requests:
             cpu: "2000m"
             memory: "1Gi"
           limits:
-            cpu: "8000m"  # 8 cores - handles relay validation and signing at high RPS
-            memory: "4Gi"
+            # From relayer.cpu_cores. GOMAXPROCS is NOT set: automaxprocs
+            # (main.go:7) derives it from THIS limit, and a present env would make
+            # it return without touching anything (maxprocs.go:105-111). Handles
+            # relay validation and signing at high RPS.
+            cpu: "{cpu_limit}"
+            memory: "8Gi"
         readinessProbe:
           httpGet:
             path: /ready
@@ -114,6 +269,11 @@ spec:
         secret:
           secretName: supplier-keys
           optional: true
+      - name: keyring
+        emptyDir: {{}}
+      - name: keyring-pass
+        secret:
+          secretName: keyring-passphrase
 ---
 apiVersion: v1
 kind: Service
@@ -138,9 +298,11 @@ spec:
     targetPort: 6060
     name: pprof
 """.format(
-        config["relayer"]["count"],
-        config["global"]["image"],
-        "debug" if config["global"]["debug"] else "info"
+        replicas=config["relayer"]["count"],
+        config_hash=relayer_config_hash,
+        image=config["global"]["image"],
+        log_level="debug" if config["global"]["debug"] else "info",
+        cpu_limit="{}000m".format(config["relayer"]["cpu_cores"]),
     )
 
     k8s_yaml(blob(relayer_yaml))

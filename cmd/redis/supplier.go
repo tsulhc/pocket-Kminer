@@ -87,7 +87,7 @@ Examples:
 
 // getSupplierCacheState reads a supplier's state from the cache (ha:supplier:{address})
 func getSupplierCacheState(ctx context.Context, client *DebugRedisClient, address string) (*supplierCacheState, error) {
-	key := fmt.Sprintf("ha:supplier:%s", address)
+	key := client.KB().SupplierStateKey(address)
 	data, err := client.Get(ctx, key).Bytes()
 	if err != nil {
 		return nil, err
@@ -103,18 +103,16 @@ func getSupplierCacheState(ctx context.Context, client *DebugRedisClient, addres
 
 // getAllSupplierCacheStates reads all supplier states from cache
 func getAllSupplierCacheStates(ctx context.Context, client *DebugRedisClient) (map[string]*supplierCacheState, error) {
-	pattern := "ha:supplier:*"
-	keys, err := client.Keys(ctx, pattern).Result()
+	keys, err := clusterAwareScanAllKeys(ctx, client, client.KB().SupplierStatePattern())
 	if err != nil {
 		return nil, err
 	}
 
 	states := make(map[string]*supplierCacheState)
 	for _, key := range keys {
-		// Extract address from key (ha:supplier:{address})
-		addr := strings.TrimPrefix(key, "ha:supplier:")
-		if addr == key {
-			continue // Didn't match pattern
+		addr, ok := client.KB().SupplierStateAddress(key)
+		if !ok {
+			continue // not a supplier state key under this namespace
 		}
 
 		state, err := getSupplierCacheState(ctx, client, addr)
@@ -138,7 +136,7 @@ func listSupplierClaims(ctx context.Context, client *DebugRedisClient) error {
 
 	// Get all claim keys using pattern from KeyBuilder
 	claimPattern := kb.MinerClaimKey("*")
-	claimKeys, err := client.Keys(ctx, claimPattern).Result()
+	claimKeys, err := clusterAwareScanAllKeys(ctx, client, claimPattern)
 	if err != nil {
 		return fmt.Errorf("failed to get claim keys: %w", err)
 	}

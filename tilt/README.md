@@ -1,15 +1,13 @@
 # Pocket RelayMiner - Tilt Development Environments
 
-This directory contains Tilt-based development environments for Pocket RelayMiner.
-The local stack exercises the current RC architecture: stateless relayers,
-Redis-backed queues/session/SMST state, and primary/standby miner leases.
+This directory contains Tilt-based development environments for Pocket RelayMiner (HA mode).
 
 ## Directory Structure
 
 ```
+Tiltfile                    # Entry point, at the repository root
 tilt/
 ├── k8s/                    # Kubernetes Tilt environment
-│   ├── Tiltfile            # Main entry point for K8s
 │   ├── config.Tiltfile     # Config loading & validation
 │   ├── defaults.Tiltfile   # Default values
 │   ├── ports.Tiltfile      # Centralized port registry
@@ -19,45 +17,22 @@ tilt/
 │   ├── miner.Tiltfile      # Miner deployment
 │   ├── relayer.Tiltfile    # Relayer deployment
 │   ├── backend.Tiltfile    # Backend server
-│   ├── observability.Tiltfile  # Prometheus + Grafana
+│   ├── nginx-backend.Tiltfile  # Static JSON-RPC backend for load tests
+│   ├── observability.Tiltfile  # Prometheus, Grafana, Loki and Promtail
 │   ├── path.Tiltfile       # PATH gateway (optional)
-│   └── account-init.Tiltfile   # Account initialization
-├── docker/                 # Docker Compose environment
-│   ├── Tiltfile            # Main entry point for Docker
-│   ├── docker-compose.yaml # Docker Compose services
-│   ├── config/             # Docker-specific configs
-│   ├── scripts/            # Init scripts
-│   └── README.md           # Docker-specific docs
+│   ├── account-init.Tiltfile   # Account initialization
+│   └── accounts.star       # Accounts account-init initializes, derived from the genesis
 ├── config/                 # Shared configuration files
-│   ├── genesis.json        # Pocket Network genesis
+│   ├── genesis.json        # Localnet genesis: 50 suppliers, 5 applications per service
 │   ├── all-keys.yaml       # All account keys
-│   ├── supplier-keys.yaml  # Supplier signing keys
 │   ├── *.toml              # Validator configs
 │   └── *.json              # Validator keys
 ├── backend-server/         # Demo backend server
-├── grafana/                # Grafana dashboards
-│   ├── dashboards/         # JSON dashboard files
-│   └── provisioning/       # Grafana provisioning
+├── local-registry.sh       # Local image registry for kind
 └── README.md               # This file
 ```
 
 ## Quick Start
-
-### Option 1: Docker Compose (Simpler)
-
-```bash
-# From project root
-make tilt-up-docker
-
-# Or with streaming logs
-make tilt-up-docker ARGS="--stream"
-
-# Stop
-make tilt-down-docker
-make tilt-down-docker ARGS="-v"  # Remove volumes
-```
-
-### Option 2: Kubernetes (Production-like)
 
 ```bash
 # Prerequisites: kubectl, kind/minikube, tilt
@@ -84,39 +59,49 @@ Multi-protocol demo server for testing relay capabilities.
 
 ### Shared Config (`config/`)
 
-Configuration files used by both K8s and Docker environments:
+Configuration files for the K8s environment:
 
 | File | Description |
 |------|-------------|
 | `genesis.json` | Pocket Network genesis with apps, suppliers, gateway |
 | `all-keys.yaml` | All account keys (apps, suppliers, gateway) |
-| `supplier-keys.yaml` | Supplier signing keys for relayer/miner |
 | `config.toml` | Validator CometBFT config |
 | `app.toml` | Validator app config |
 
-### Grafana Dashboards (`grafana/`)
+### Grafana dashboards
 
-Pre-configured dashboards for monitoring:
-- Business Economics - Revenue and stake metrics
-- Operational Health - System health and errors
-- Service Performance - Latency and throughput
+Tilt provisions the 7 dashboards of
+[examples/observability/](../examples/observability/README.md), the same files
+the compose example runs; they are generated from the metrics the code defines
+by `scripts/dashboards/generate.py`.
 
 ## Services
 
-| Service | Docker Port | K8s Port | Description |
-|---------|-------------|----------|-------------|
-| Redis | 6379 | 6379 | RC queue, cache, coordination, and SMST state |
-| Validator RPC | 26657 | 26657 | Pocket node |
-| Validator gRPC | 9090 | 9090 | Pocket queries |
-| Backend HTTP | 8545 | 8545 | Demo backend |
-| Backend gRPC | 50051 | 50051 | Demo backend |
-| PATH Gateway | 3069 | 3069 | Relay routing |
-| Relayer HTTP | 8080 | 8180+ | Relay processing |
-| Miner Metrics | 9092 | 9092+ | Miner metrics |
-| Prometheus | 9091 | 9091 | Metrics |
-| Grafana | 3000 | 3000 | Dashboards |
+| Service | Port | Description |
+|---------|------|-------------|
+| Redis | 6379 | Shared state |
+| Validator RPC | 26657 | Pocket node |
+| Validator gRPC | 9090 | Pocket queries |
+| Backend HTTP | 8545 | Demo backend |
+| Backend gRPC | 50051 | Demo backend |
+| PATH Gateway | 3069 | Relay routing |
+| Relayer HTTP | 8180 | Relay processing |
+| Miner Metrics | 9092 | Miner metrics |
+| Prometheus | 9091 | Metrics |
+| Grafana | 3000 | Dashboards |
 
 ## Testing Relays
+
+The check that counts is a relay sent straight to the relayer, which verifies
+the signature and the backend's answer
+([docs/testing/DIRECT_CLI.md](../docs/testing/DIRECT_CLI.md)):
+
+```bash
+# Expect: Status: ✅ SUCCESS
+pocket-relay-miner relay jsonrpc --localnet --service develop-http
+```
+
+Through the gateway, which only confirms it is wired:
 
 ```bash
 # Send a test relay via PATH
@@ -147,10 +132,6 @@ go run main.go redis leader
 ### Logs
 
 ```bash
-# Docker Compose
-docker-compose -f tilt/docker/docker-compose.yaml logs -f relayer
-
-# Kubernetes
 kubectl logs -f -l app=relayer
 ```
 
@@ -176,24 +157,24 @@ Client → PATH Gateway → Relayer → Backend
               Miner → Validator (claims/proofs)
 ```
 
-### RC Miner Failover
+### HA Failover
 
 ```
 ┌─────────────┐     ┌─────────────┐
 │   Miner 1   │────▶│   Miner 2   │
-│ (Primary)   │     │  (Standby)  │
+│  (Leader)   │     │  (Standby)  │
 └─────────────┘     └─────────────┘
        │                   │
        └───────┬───────────┘
                ↓
-       Redis Leases
-      (Orphan Reclaim)
+         Redis Lock
+      (Leader Election)
 ```
 
 ## Performance Targets
 
 - **Relayer**: 1000+ RPS per replica
 - **Relay Validation**: <1ms average
-- **SMST Update**: <100µs target; current RC stores SMST in Redis, target design moves this hot path local
+- **SMST Update**: <100µs
 - **Cache L1 Hit**: <100ns
 - **Cache L2 Hit**: <2ms

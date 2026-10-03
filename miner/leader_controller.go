@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"runtime"
 	"sync"
+	"time"
 
 	"github.com/alitto/pond/v2"
 
@@ -14,6 +15,7 @@ import (
 	"github.com/pokt-network/pocket-relay-miner/leader"
 	"github.com/pokt-network/pocket-relay-miner/logging"
 	"github.com/pokt-network/pocket-relay-miner/query"
+	"github.com/pokt-network/pocket-relay-miner/transport/grpcconn"
 	redistransport "github.com/pokt-network/pocket-relay-miner/transport/redis"
 
 	apptypes "github.com/pokt-network/poktroll/x/application/types"
@@ -37,6 +39,20 @@ type LeaderControllerConfig struct {
 	QueryNodeGRPCUrl string
 	GRPCInsecure     bool
 	ChainID          string
+
+	// SharedSupplierCache, when set, is used instead of building a
+	// leader-local supplier cache.
+	//
+	// The SupplierWorker already owns one for the whole life of the process on
+	// every replica; a second instance here meant two L1 maps and two
+	// subscriptions to the same invalidation channel, so the leader did every
+	// invalidation twice (measured 2026-08-21: leader +204 over an idle window
+	// where a relayer saw +102, exactly 2x).
+	//
+	// Ownership stays with the worker: this controller must NOT Close a cache
+	// it did not create, or a demotion would tear down the cache the worker is
+	// still writing supplier state into.
+	SharedSupplierCache *cache.SupplierCache
 }
 
 // LeaderController manages all leader-only resources.
@@ -50,21 +66,21 @@ type LeaderController struct {
 	// Heavy resources (only created when leader)
 	queryClients          *query.Clients
 	blockSubscriber       *haclient.BlockSubscriber
-	redisBlockSubscriber  *cache.RedisBlockSubscriber
+	redisBlockPublisher   *cache.RedisBlockPublisher
 	blockPublisher        *cache.BlockPublisher
 	sharedParamsCache     cache.SingletonEntityCache[*sharedtypes.Params]
 	proofParamsCache      cache.SingletonEntityCache[*prooftypes.Params]
 	supplierParamsCache   *cache.RedisSupplierParamCache
+	ownsSupplierCache     bool // false when supplierCache came from the worker
 	applicationCache      cache.KeyedEntityCache[string, *apptypes.Application]
 	serviceCache          cache.KeyedEntityCache[string, *sharedtypes.Service]
 	supplierCache         *cache.SupplierCache
 	cacheOrchestrator     *cache.CacheOrchestrator
-	proofChecker          *ProofRequirementChecker
 	balanceMonitor        *BalanceMonitor
+	orphanStreamMonitor   *OrphanStreamMonitor
 	blockHealthMonitor    *BlockHealthMonitor
 	supplierRegistry      *SupplierRegistry
 	serviceFactorRegistry *ServiceFactorRegistry
-	settlementMonitor     *SettlementMonitor
 	masterPool            pond.Pool
 
 	// Lifecycle
@@ -119,6 +135,11 @@ func (c *LeaderController) Start(ctx context.Context) error {
 			GRPCEndpoint: c.config.QueryNodeGRPCUrl,
 			QueryTimeout: c.config.Config.GetQueryTimeout(),
 			UseTLS:       !c.config.GRPCInsecure,
+			// The miner runs this controller AND the supplier worker in one
+			// process, so both connections would report as conn="query" and
+			// their queueing would be summed. This one is mostly idle; the
+			// worker's is not.
+			ConnRole: grpcconn.RoleQueryLeader,
 		},
 	)
 	if err != nil {
@@ -147,18 +168,17 @@ func (c *LeaderController) Start(ctx context.Context) error {
 	}
 	c.logger.Info().Msg("block subscriber started (WebSocket)")
 
-	// Create a Redis block subscriber for publishing to relayers
-	// Uses KeyBuilder for namespace-aware channel names
-	c.redisBlockSubscriber = cache.NewRedisBlockSubscriber(
+	// Create the Redis block PUBLISHER for fanning blocks out to the fleet.
+	// Publish-only on purpose: this controller never reads block events off the
+	// channel (the supplier worker's own subscriber does that), and a
+	// RedisBlockSubscriber here would run a receive loop with zero consumers,
+	// counting every event this process publishes a second time. Uses
+	// KeyBuilder for namespace-aware channel names.
+	c.redisBlockPublisher = cache.NewRedisBlockPublisher(
 		c.logger,
 		c.config.RedisClient,
-		c.blockSubscriber,
 	)
-	if err = c.redisBlockSubscriber.Start(ctx); err != nil {
-		c.cleanup()
-		return fmt.Errorf("failed to start redis block subscriber: %w", err)
-	}
-	c.logger.Info().Msg("redis block subscriber started for publishing to Redis")
+	c.logger.Info().Msg("redis block publisher ready")
 
 	// Get block time
 	blockTimeSeconds := c.config.Config.GetBlockTimeSeconds()
@@ -195,11 +215,9 @@ func (c *LeaderController) Start(ctx context.Context) error {
 		c.config.RedisClient,
 		c.queryClients.Supplier(),
 		cache.CacheConfig{
-			CachePrefix:      c.config.RedisClient.KB().CachePrefix(),
 			TTLBlocks:        100,
 			BlockTimeSeconds: blockTimeSeconds,
-			LockTimeout:      5,
-			PubSubPrefix:     c.config.RedisClient.KB().EventsCachePrefix(),
+			LockTimeout:      5 * time.Second,
 		},
 	)
 	if err := c.supplierParamsCache.Start(ctx); err != nil {
@@ -227,20 +245,29 @@ func (c *LeaderController) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to start service cache: %w", err)
 	}
 
-	// Create supplier cache
-	c.supplierCache = cache.NewSupplierCache(
-		c.logger,
-		c.config.RedisClient,
-		cache.SupplierCacheConfig{
-			KeyPrefix: c.config.RedisClient.KB().SupplierKeyPrefix(),
-			FailOpen:  false,
-		},
-	)
-	if err := c.supplierCache.Start(ctx); err != nil {
-		c.cleanup()
-		return fmt.Errorf("failed to start supplier cache: %w", err)
+	// Supplier cache: share the worker's rather than build a second one.
+	//
+	// Both live in this same process, and both Start() subscribe to the same
+	// invalidation channel, so two instances meant two L1 maps and every
+	// invalidation handled twice. ownsSupplierCache records which case we are
+	// in so cleanup() only closes what it created.
+	if shared := c.config.SharedSupplierCache; shared != nil {
+		c.supplierCache = shared
+		c.ownsSupplierCache = false
+		c.logger.Info().Msg("reusing the supplier worker's supplier cache")
+	} else {
+		c.supplierCache = cache.NewSupplierCache(
+			c.logger,
+			c.config.RedisClient,
+			cache.SupplierCacheConfig{},
+		)
+		c.ownsSupplierCache = true
+		if err := c.supplierCache.Start(ctx); err != nil {
+			c.cleanup()
+			return fmt.Errorf("failed to start supplier cache: %w", err)
+		}
+		c.logger.Info().Msg("supplier cache initialized for state publishing")
 	}
-	c.logger.Info().Msg("supplier cache initialized for state publishing")
 
 	// Create block subscriber adapter for orchestrator
 	blockSubscriberAdapter := cache.NewBlockSubscriberAdapter(
@@ -264,7 +291,6 @@ func (c *LeaderController) Start(ctx context.Context) error {
 		c.applicationCache,
 		c.serviceCache,
 		c.supplierCache,
-		nil, // session cache placeholder
 		c.masterPool,
 	)
 	if err := c.cacheOrchestrator.Start(ctx); err != nil {
@@ -277,7 +303,7 @@ func (c *LeaderController) Start(ctx context.Context) error {
 	c.blockPublisher = cache.NewBlockPublisher(
 		c.logger,
 		c.blockSubscriber,
-		c.redisBlockSubscriber,
+		c.redisBlockPublisher,
 	)
 	if err = c.blockPublisher.Start(ctx); err != nil {
 		c.cleanup()
@@ -296,23 +322,12 @@ func (c *LeaderController) Start(ctx context.Context) error {
 		c.logger.Info().Str("chain_id", chainID).Msg("fetched chain ID from node")
 	}
 
-	// Create a proof checker
-	c.proofChecker = NewProofRequirementChecker(
-		c.logger,
-		c.queryClients.Proof(),
-		c.queryClients.Shared(),
-		c.queryClients.ServiceDifficulty(),
-	)
-	c.logger.Info().Msg("proof requirement checker initialized")
-
 	// Create supplier registry
 	c.supplierRegistry = NewSupplierRegistry(
 		c.logger,
 		c.config.RedisClient,
 		SupplierRegistryConfig{
-			KeyPrefix:    c.config.RedisClient.KB().SuppliersRegistryPrefix(),
-			IndexKey:     c.config.RedisClient.KB().SuppliersRegistryIndexKey(),
-			EventChannel: c.config.RedisClient.KB().SupplierUpdateChannel(),
+			IndexKey: c.config.RedisClient.KB().SuppliersRegistryIndexKey(),
 		},
 	)
 
@@ -325,10 +340,10 @@ func (c *LeaderController) Start(ctx context.Context) error {
 		ServiceFactorRegistryConfig{
 			DefaultServiceFactor: c.config.Config.DefaultServiceFactor,
 			ServiceFactors:       c.config.Config.ServiceFactors,
-			CacheTTL:             c.config.Config.GetCacheTTL(),
+			RepublishInterval:    c.config.Config.GetServiceFactorRepublishInterval(),
 		},
 	)
-	if err = c.serviceFactorRegistry.PublishServiceFactors(ctx); err != nil {
+	if err = c.serviceFactorRegistry.Start(ctx); err != nil {
 		c.cleanup()
 		return fmt.Errorf("failed to publish service factors: %w", err)
 	}
@@ -348,7 +363,7 @@ func (c *LeaderController) Start(ctx context.Context) error {
 	// it to SupplierManager; LeaderController has no consumer for it.
 
 	// Start block health monitor if enabled
-	if c.config.Config.BlockHealthMonitor.Enabled {
+	if c.config.Config.BlockHealthMonitorEnabled() {
 		c.blockHealthMonitor = NewBlockHealthMonitor(
 			c.logger,
 			c.blockSubscriber,
@@ -365,8 +380,7 @@ func (c *LeaderController) Start(ctx context.Context) error {
 		c.logger.Info().Msg("block health monitor started (leader-only)")
 	}
 
-	// Start balance monitor if enabled
-	if c.config.Config.GetBalanceMonitorEnabled() || c.config.Config.GetBalanceMonitorThreshold() > 0 {
+	if balanceMonitorWanted(c.config.Config) {
 		c.balanceMonitor = NewBalanceMonitor(
 			c.logger,
 			BalanceMonitorConfig{
@@ -389,40 +403,30 @@ func (c *LeaderController) Start(ctx context.Context) error {
 		c.logger.Info().Msg("balance monitor started")
 	}
 
-	// Start settlement monitor if enabled
-	if c.config.Config.GetSettlementMonitorEnabled() {
-		// Get supplier addresses to monitor
-		suppliersMap, err := c.supplierRegistry.GetAllSuppliers(ctx)
-		if err != nil {
-			c.cleanup()
-			return fmt.Errorf("failed to get suppliers for settlement monitor: %w", err)
-		}
-		supplierAddresses := make([]string, 0, len(suppliersMap))
-		for addr := range suppliersMap {
-			supplierAddresses = append(supplierAddresses, addr)
-		}
-
-		c.settlementMonitor = NewSettlementMonitor(
-			c.logger,
-			c.blockSubscriber,
-			c.blockSubscriber.GetRPCClient(),
-			supplierAddresses,
-			c.masterPool,
-			nil, // SessionStore not available in LeaderController (settlement metadata won't be updated)
-			c.config.Config.GetSettlementWorkers(),
-		)
-		if err := c.settlementMonitor.Start(ctx); err != nil {
-			c.cleanup()
-			return fmt.Errorf("failed to start settlement monitor: %w", err)
-		}
-		c.logger.Info().
-			Int("suppliers", len(supplierAddresses)).
-			Msg("settlement monitor started (tracking on-chain claim settlements)")
+	// Relay streams no longer expire, so a supplier decommissioned for good
+	// leaves its lane behind. This reports those lanes; it never deletes one.
+	c.orphanStreamMonitor = NewOrphanStreamMonitor(
+		c.logger,
+		c.config.RedisClient,
+		c.config.GlobalLeader,
+		0, // default sweep interval
+	)
+	if err := c.orphanStreamMonitor.Start(ctx); err != nil {
+		c.cleanup()
+		return fmt.Errorf("failed to start orphan stream monitor: %w", err)
 	}
 
 	c.active = true
 	c.logger.Info().Msg("leader controller started - all resources active")
 	return nil
+}
+
+// balanceMonitorWanted is the one decision to run the balance monitor:
+// balance_monitor.enabled alone. It used to also start whenever the balance
+// threshold was above 0, and the default threshold is 1 POKT, so enabled: false
+// never turned it off.
+func balanceMonitorWanted(cfg *Config) bool {
+	return cfg.GetBalanceMonitorEnabled()
 }
 
 // Close shuts down all leader-only resources.
@@ -446,9 +450,12 @@ func (c *LeaderController) Close() error {
 // Must be called with c.mu held.
 func (c *LeaderController) cleanup() {
 	// Close in reverse order of creation
-	if c.settlementMonitor != nil {
-		c.settlementMonitor.Close()
-		c.settlementMonitor = nil
+
+	if c.orphanStreamMonitor != nil {
+		if err := c.orphanStreamMonitor.Close(); err != nil {
+			c.logger.Error().Err(err).Msg("failed to close orphan stream monitor")
+		}
+		c.orphanStreamMonitor = nil
 	}
 
 	if c.balanceMonitor != nil {
@@ -465,9 +472,17 @@ func (c *LeaderController) cleanup() {
 		c.blockHealthMonitor = nil
 	}
 
-	// ServiceFactorRegistry doesn't have a Close method - it just holds config
-	// Keys will expire based on Redis TTL or stay until overwritten
-	c.serviceFactorRegistry = nil
+	// The registry runs a republish loop, and closing it is what stops this
+	// miner rewriting the manifest once it is no longer the leader. The keys it
+	// wrote stay in Redis until the next leader replaces them: they carry no
+	// TTL, because an expiring key is indistinguishable from one that was never
+	// published, which is the ambiguity the manifest exists to remove.
+	if c.serviceFactorRegistry != nil {
+		if err := c.serviceFactorRegistry.Close(); err != nil {
+			c.logger.Error().Err(err).Msg("failed to close service factor registry")
+		}
+		c.serviceFactorRegistry = nil
+	}
 
 	if c.blockPublisher != nil {
 		if err := c.blockPublisher.Close(); err != nil {
@@ -483,11 +498,17 @@ func (c *LeaderController) cleanup() {
 		c.cacheOrchestrator = nil
 	}
 
+	// Only close what this controller created. A shared cache belongs to the
+	// SupplierWorker, which keeps writing supplier state after a demotion --
+	// closing it here would kill the writer's cache on every leadership change.
 	if c.supplierCache != nil {
-		if err := c.supplierCache.Close(); err != nil {
-			c.logger.Error().Err(err).Msg("failed to close supplier cache")
+		if c.ownsSupplierCache {
+			if err := c.supplierCache.Close(); err != nil {
+				c.logger.Error().Err(err).Msg("failed to close supplier cache")
+			}
 		}
 		c.supplierCache = nil
+		c.ownsSupplierCache = false
 	}
 
 	if c.serviceCache != nil {
@@ -525,11 +546,11 @@ func (c *LeaderController) cleanup() {
 		c.sharedParamsCache = nil
 	}
 
-	if c.redisBlockSubscriber != nil {
-		if err := c.redisBlockSubscriber.Close(); err != nil {
-			c.logger.Error().Err(err).Msg("failed to close redis block subscriber")
+	if c.redisBlockPublisher != nil {
+		if err := c.redisBlockPublisher.Close(); err != nil {
+			c.logger.Error().Err(err).Msg("failed to close redis block publisher")
 		}
-		c.redisBlockSubscriber = nil
+		c.redisBlockPublisher = nil
 	}
 
 	if c.blockSubscriber != nil {

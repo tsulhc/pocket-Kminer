@@ -24,14 +24,23 @@ properties:
     properties:
       url:
         type: string
-        description: Redis connection URL (supports single, sentinel, cluster)
-        pattern: ^redis(s)?://
+        description: >-
+          Redis connection URL. The scheme selects the client: redis:// or
+          rediss:// (TLS) for a single Redis, redis-sentinel:// for Sentinel
+          (sentinel addresses, then the master name as the path), and
+          redis-cluster:// for a Cluster. A comma-separated host list under
+          redis:// is not a cluster. Redis must run with maxmemory set and
+          maxmemory-policy noeviction, or the relayer refuses to start.
+        pattern: ^(redis|rediss|redis-sentinel|redis-cluster)://
         examples:
           - redis://localhost:6379
-          - redis://node1:6379,node2:6379,node3:6379
+          - redis-sentinel://sentinel1:26379,sentinel2:26379/mymaster
+          - redis-cluster://node1:6379,node2:6379,node3:6379
       pool_size:
         type: integer
-        description: Maximum number of socket connections (0 = use default 20 × GOMAXPROCS)
+        description: >-
+          Maximum number of connections. 0 = sized from the relayer's worker
+          pools, about 7.2 x GOMAXPROCS + 20.
         default: 0
         minimum: 0
       min_idle_conns:
@@ -41,54 +50,55 @@ properties:
         minimum: 0
       pool_timeout_seconds:
         type: integer
-        description: Wait time for connection from pool in seconds (0 = use default 4s)
+        description: Seconds a caller waits for a pooled connection (0 = default, 6)
         default: 0
         minimum: 0
       conn_max_idle_time_seconds:
         type: integer
-        description: Close idle connections after this many seconds (0 = use default 300s)
+        description: >-
+          Close a connection idle for this many seconds (0 = the Redis client
+          library's default, 30 minutes)
         default: 0
         minimum: 0
+      batch_publish_interval_ms:
+        type: integer
+        description: >-
+          How often, in milliseconds, the relayer writes its batch of mined
+          relays with one MULTI/EXEC. The batch is always on; this sets only
+          its interval. 0 means the default, 1000. Any other value must be
+          between 500 and 10000. One batch wakes the miner's blocked reader
+          once instead of once per relay.
+        default: 1000
+        oneOf:
+          - const: 0
+          - minimum: 500
+            maximum: 10000
+      batch_max_queued_mib:
+        type: integer
+        description: >-
+          How many MiB of mined relays the batch may hold before the relayer
+          stops admitting new relays. Queued relays are never dropped. 0 means
+          the default, 512. Any other value must be between 64 and 8192.
+        default: 512
+        oneOf:
+          - const: 0
+          - minimum: 64
+            maximum: 8192
       namespace:
         type: object
-        description: Redis key namespace configuration (must match miner configuration)
+        description: >-
+          Redis key namespace. Only base_prefix is configurable; every segment
+          below it is fixed in code so miner and relayer cannot drift, and no
+          family's SCAN pattern can match another family's keys.
         properties:
           base_prefix:
             type: string
-            description: Root prefix for all Redis keys
+            description: >-
+              Root prefix for all Redis keys. Two base prefixes are two disjoint
+              keyspaces. Must not contain ':', whitespace, or * ? [ ]. Must be
+              the same in the miner and every relayer of one fleet.
+            pattern: "^[^:*?\\[\\]\\s]+$"
             default: ha
-          cache_prefix:
-            type: string
-            description: "Cache data prefix (full key: {base_prefix}:{cache_prefix}:*)"
-            default: cache
-          events_prefix:
-            type: string
-            description: "Pub/sub channels prefix (full key: {base_prefix}:{events_prefix}:*)"
-            default: events
-          streams_prefix:
-            type: string
-            description: "Relay streams prefix (full key: {base_prefix}:{streams_prefix}:*)"
-            default: relays
-          miner_prefix:
-            type: string
-            description: "Miner state prefix (full key: {base_prefix}:{miner_prefix}:*)"
-            default: miner
-          supplier_prefix:
-            type: string
-            description: "Supplier data prefix (full key: {base_prefix}:{supplier_prefix}:*)"
-            default: supplier
-          meter_prefix:
-            type: string
-            description: "Metering data prefix (full key: {base_prefix}:{meter_prefix}:*)"
-            default: meter
-          params_prefix:
-            type: string
-            description: "Cached params prefix (full key: {base_prefix}:{params_prefix}:*)"
-            default: params
-          consumer_group_prefix:
-            type: string
-            description: "Consumer group name suffix (full name: {base_prefix}-{consumer_group_prefix})"
-            default: miners
 
   pocket_node:
     type: object
@@ -110,14 +120,23 @@ properties:
 
   keys:
     type: object
-    description: Supplier signing key configuration
+    description: >-
+      Supplier signing key configuration. Full reference: docs/SUPPLIER_KEYS.md. keys_file and keyring are MUTUALLY
+      EXCLUSIVE: setting both is a startup error, so that nothing has to decide
+      at runtime which source wins a duplicate or what a single unreadable
+      source means.
     properties:
       keys_file:
         type: string
         description: Path to YAML file with hex-encoded private keys
-      keys_dir:
-        type: string
-        description: Directory containing individual key files
+      hot_reload_enabled:
+        type: boolean
+        description: >-
+          Reload signing keys while the relayer runs, so a key added or pulled
+          takes effect on a running relayer instead of only on restart. Covers
+          every key source: keys_file is watched and reacts at once, a keyring
+          cannot be watched and is picked up by the reload timer within 30s.
+        default: true
       keyring:
         type: object
         description: Cosmos SDK keyring configuration
@@ -126,17 +145,40 @@ properties:
             type: string
             enum:
               - file
-              - os
               - test
-              - memory
-            description: Keyring backend type
+            description: >-
+              Keyring backend. Only backends whose behaviour can be guaranteed
+              for a long-running signer: "file" is passphrase-protected (piped
+              in, cached for the whole keyring) and "test" uses a fixed
+              password. "memory" starts empty and nothing writes to it, and "os"
+              depends on whether a system keychain is reachable -- both are
+              rejected at startup. The interactive CLI rejects them too.
           dir:
             type: string
-            description: Directory for keyring (file backend only)
+            description: >-
+              Directory CONTAINING the keyring, not the keyring itself: the file
+              backend reads <dir>/keyring-file.
           app_name:
             type: string
             description: Application name for keyring
             default: pocket
+          passphrase_file:
+            type: string
+            description: >-
+              Path to a file holding the keyring passphrase ("file" backend
+              only). A REFERENCE, not the secret: mount a Kubernetes or compose
+              secret and point at it, the same way keys_file points at a file of
+              private keys. Preferred over passphrase_env, since an environment
+              variable is readable from /proc/<pid>/environ and tends to reach
+              crash dumps and process listings. With neither set the passphrase
+              is read from stdin, which suits a pipe or a terminal but not a
+              container (its stdin is /dev/null).
+          passphrase_env:
+            type: string
+            description: >-
+              NAME of an environment variable holding the keyring passphrase
+              ("file" backend only) -- not the passphrase itself. Mutually
+              exclusive with passphrase_file.
           key_names:
             type: array
             description: Specific key names to load (empty = load all)
@@ -175,8 +217,33 @@ properties:
             - high
         max_body_size_bytes:
           type: integer
-          description: Max request/response body size (bytes)
+          description: >-
+            Max request/response body size (bytes) for this service. Kept for
+            configs written before the two directions were split; it is the
+            fallback max_request_body_size_bytes resolves through.
           minimum: 1024
+        max_request_body_size_bytes:
+          type: integer
+          description: >-
+            Max RELAY REQUEST body size (bytes) for this service. Falls back to
+            this service's max_body_size_bytes, then to the root defaults.
+          minimum: 1024
+        max_response_body_size_bytes:
+          type: integer
+          description: >-
+            Max BACKEND RESPONSE body size (bytes) for this service. Falls back
+            to this service's max_body_size_bytes, then to the root defaults.
+          minimum: 1024
+        validation_queue_max_mib:
+          type: integer
+          description: >-
+            Overrides default_validation_queue_max_mib for this service.
+            0 means "use the default", never unlimited. Any other value must be
+            between 64 and 8192.
+          oneOf:
+            - const: 0
+            - minimum: 64
+              maximum: 8192
         default_backend:
           type: string
           enum:
@@ -189,8 +256,20 @@ properties:
           default: jsonrpc
         backends:
           type: object
-          description: Backend configurations per RPC type
+          description: >-
+            Backend configurations, keyed by transport type. The key MUST be one
+            of the five transport types below -- a relay is routed to a backend
+            by exact type match with no fallback, so any other key (e.g. "ws"
+            instead of "websocket") configures a backend nothing will route to,
+            and its relays are rejected at request time.
           minProperties: 1
+          propertyNames:
+            enum:
+              - jsonrpc
+              - rest
+              - websocket
+              - grpc
+              - cometbft
           additionalProperties:
             type: object
             description: Configuration for a specific RPC type backend. Use either url (single backend) or urls (multi-backend pool) -- they are mutually exclusive.
@@ -218,15 +297,34 @@ properties:
                           description: Backend endpoint URL
               base_path:
                 type: string
-                description: "Optional path prefix the backend expects on every request (e.g. /ext/bc/C/rpc for AvalancheGo). The proxy prepends it to client requests that do not already start with it, avoiding duplication when PATH sends either / or the full prefix. Takes precedence over any path component in url/urls."
+                description: "Optional path prefix the backend expects on every request (e.g. /ext/bc/C/rpc). The relayer prepends it to a request path that does not already start with it, so a caller sending either / or the full prefix reaches the same path. Takes precedence over any path component in url/urls. A health check with no endpoint probes this path."
                 pattern: ^/
               load_balancing:
                 type: string
                 enum:
+                  - first_healthy
                   - round_robin
-                  - least_conn
-                  - app_hash
-                description: Load balancing strategy for this backend pool. Phase 1 uses first_healthy (default), round_robin added in Phase 2, others in Phase 10.
+                description: >-
+                  Load balancing strategy for this backend pool. "first_healthy"
+                  always routes to the first healthy endpoint; "round_robin"
+                  distributes across healthy endpoints. These are the only
+                  values the relayer accepts. Unset: round_robin when the pool
+                  has two or more endpoints, first_healthy when it has one.
+              max_retries:
+                type: integer
+                description: Retries of a failed backend request. Explicit 0 disables retries.
+                default: 1
+                minimum: 0
+                maximum: 3
+              recovery_timeout_seconds:
+                type: integer
+                description: >-
+                  Seconds after which an endpoint tripped by the circuit breaker
+                  is tried again, so a pool with no active health checks cannot
+                  stay down forever. 0 disables it: only an active health check
+                  can then bring an endpoint back.
+                default: 30
+                minimum: 0
               headers:
                 type: object
                 description: Additional headers for backend requests
@@ -258,7 +356,7 @@ properties:
                     default: false
                   endpoint:
                     type: string
-                    description: Health check endpoint path (e.g., /health)
+                    description: Health check endpoint path (e.g., /health). Required when enabled, unless base_path is set (the probe then uses base_path).
                   interval_seconds:
                     type: integer
                     description: How often to check health (seconds)
@@ -275,6 +373,34 @@ properties:
                     type: integer
                     description: Successes before marking healthy
                     minimum: 1
+                  method:
+                    type: string
+                    description: HTTP method of the probe. Use POST for a JSON-RPC probe.
+                    default: GET
+                  request_body:
+                    type: string
+                    description: Body sent with the probe (e.g. a JSON-RPC request). Unset sends no body.
+                  content_type:
+                    type: string
+                    description: Content-Type of the probe. Unset defaults to application/json when request_body starts with { or [.
+                  expected_body:
+                    type: string
+                    description: Substring the probe's response body must contain. Unset checks the status code only.
+                  expected_status:
+                    type: array
+                    description: Status codes accepted as healthy. Unset accepts any 2xx.
+                    items:
+                      type: integer
+                  headers:
+                    type: object
+                    description: >-
+                      Headers applied only to health check probe requests.
+                      Merged on top of the pool-level backend headers; a key
+                      here overrides the same key from the pool for the probe
+                      only. Use for probe-specific headers (e.g. a health-check
+                      auth token) not sent on real relay traffic.
+                    additionalProperties:
+                      type: string
 
   default_validation_mode:
     type: string
@@ -286,21 +412,53 @@ properties:
 
   default_request_timeout_seconds:
     type: integer
-    description: Default backend request timeout (seconds)
+    description: >-
+      Fallback request timeout (seconds) for a service whose timeout profile
+      sets request_timeout_seconds to 0. Also takes part in sizing the relayer's
+      HTTP server read timeout (the largest timeout of any service). A service
+      normally takes its timeout from its timeout profile.
     default: 30
     minimum: 1
 
   default_max_body_size_bytes:
     type: integer
-    description: Default max body size for requests/responses (bytes)
+    description: >-
+      Default max body size for requests/responses (bytes). It is the fallback
+      both directions resolve through, so a config naming only this key keeps
+      the behaviour it had before the split.
     default: 10485760
     minimum: 1024
 
-  grace_period_extra_blocks:
+  default_max_request_body_size_bytes:
     type: integer
-    description: Additional grace period blocks beyond on-chain config
-    default: 2
-    minimum: 0
+    description: >-
+      Default max RELAY REQUEST body size (bytes). Unset inherits
+      default_max_body_size_bytes. The request direction is the expensive one:
+      the body is held for the whole validation queue and then again in the SMST
+      leaf until the claim, roughly forty blocks later.
+    minimum: 1024
+
+  default_max_response_body_size_bytes:
+    type: integer
+    description: >-
+      Max BACKEND RESPONSE body size (bytes) for every service that does not
+      override it. Unset inherits default_max_body_size_bytes.
+    minimum: 1024
+
+  default_validation_queue_max_mib:
+    type: integer
+    description: >-
+      How many MiB of request and response bodies EACH service's optimistic
+      relays may hold between being served and being validated. Applies to
+      every service that does not set its own validation_queue_max_mib.
+      0 means the default, 128 -- NOT unlimited. Any other value must be
+      between 64 and 8192, and is raised automatically when it falls below
+      what one relay of that service can retain.
+    default: 128
+    oneOf:
+      - const: 0
+      - minimum: 64
+        maximum: 8192
 
   metrics:
     type: object
@@ -324,8 +482,8 @@ properties:
         default: true
       addr:
         type: string
-        description: Pprof HTTP server address (use localhost for security in production)
-        default: "0.0.0.0:6060"
+        description: Pprof HTTP server address. Loopback by default; reaching it from outside the host or container takes an explicit address such as 0.0.0.0:6060
+        default: "127.0.0.1:6060"
         pattern: ^.*:[0-9]+$
 
   health_check:
@@ -371,7 +529,6 @@ properties:
       level:
         type: string
         enum:
-          - trace
           - debug
           - info
           - warn
@@ -383,19 +540,37 @@ properties:
           - json
           - text
         default: json
-      output:
-        type: string
-        description: Log output destination
-        default: stdout
       async:
         type: boolean
-        description: Enable async logging for better performance
-        default: true
+        description: >-
+          Non-blocking logging through a ring buffer (recommended). The relayer
+          applies no logging defaults to fields left out of the logging block,
+          so without async: true it logs synchronously.
+        default: false
       async_buffer_size:
         type: integer
-        description: Async log buffer size
+        description: Async ring buffer size, in log messages (not bytes)
         default: 100000
         minimum: 1000
+      async_poll_interval:
+        type: integer
+        description: How often the async writer flushes buffered log lines (milliseconds). Lower = less latency, more CPU; higher = batches more. 10-50 for high-throughput production.
+        default: 100
+        minimum: 1
+      sampling:
+        type: boolean
+        description: Enable log sampling to cap volume under extreme throughput. GLOBAL - samples every component and level equally, state-change logs included. Leave off unless log volume is a measured problem.
+        default: false
+      sampling_initial:
+        type: integer
+        description: With sampling on, number of log lines always written before sampling kicks in
+        default: 100
+        minimum: 1
+      sampling_thereafter:
+        type: integer
+        description: With sampling on, write 1 in N log lines after the initial burst
+        default: 10
+        minimum: 1
       enable_caller:
         type: boolean
         description: "Add caller file:line to log events. Useful for debugging but adds ~14% allocation overhead under high throughput. Disable in production."
@@ -405,24 +580,12 @@ properties:
     type: object
     description: Relay metering and rate limiting configuration
     properties:
-      enabled:
-        type: boolean
-        description: Enable metering and rate limiting
-        default: true
-      redis_key_prefix:
-        type: string
-        description: Prefix for Redis keys used by relay meter
-        default: ha
-      fail_behavior:
-        type: string
-        enum:
-          - open
-          - closed
-        description: Behavior when Redis unavailable (open=allow, closed=reject)
-        default: open
       cache_ttl:
         type: string
-        description: TTL for all cached Redis data (streams, params, app stakes, meters). Redis TTL handles automatic expiration.
+        description: >-
+          TTL of the relay meter's per-session keys in Redis (metering metadata,
+          consumed-stake counters, active-session markers). Redis expiry cleans
+          them up.
         default: 2h
         pattern: ^[0-9]+(ns|us|µs|ms|s|m|h)$
 
@@ -480,9 +643,31 @@ properties:
         description: Don't modify content encoding (required for relay protocol)
         default: true
 
+  response_compression:
+    type: object
+    description: >-
+      gzip of the signed relay responses the relayer returns. Off by default,
+      because gzip costs a measurable share of relayer CPU. When enabled it runs
+      only when the client sent Accept-Encoding gzip and the response is at
+      least min_size_bytes long.
+    properties:
+      enabled:
+        type: boolean
+        default: false
+      min_size_bytes:
+        type: integer
+        description: Smallest response worth compressing; below it gzip makes the output larger.
+        default: 1024
+        minimum: 0
+
   timeout_profiles:
     type: object
-    description: Timeout profiles for different service types. Each profile defines request timeout and HTTP client timeouts. Services select a profile via timeout_profile field. Auto-populated with "fast" and "streaming" defaults if not specified.
+    description: >-
+      Timeout profiles. Each defines a request timeout and HTTP client timeouts;
+      services select one via timeout_profile. "fast" and "streaming" are built
+      in; a profile defined here is added to them, and redefining a built-in
+      name replaces it. Unset dial and TLS timeouts fall back to
+      http_transport.
     additionalProperties:
       type: object
       description: A timeout profile defining all timeout settings for a service
@@ -510,7 +695,13 @@ properties:
 
   pool_profiles:
     type: object
-    description: Per-service HTTP connection pool profiles. Each profile overrides a subset of http_transport pool knobs. Services reference them via pool_profile. Auto-populated with "low" / "medium" / "high" defaults if not specified. Tier values come from sweep-optimal loadtest; re-run on your own infra to retune.
+    description: >-
+      Per-service HTTP connection pool profiles. Each profile overrides a subset
+      of the http_transport pool settings; services reference them via
+      pool_profile. "low", "medium" and "high" are built in; a profile defined
+      here is added to them, and redefining a built-in name replaces it. The
+      built-in tiers were sized for a p99 of 100 ms or less; measure your own
+      backends to retune them.
     additionalProperties:
       type: object
       description: A pool profile defining per-service HTTP connection pool sizing
@@ -527,3 +718,76 @@ properties:
           type: integer
           description: How long an idle connection is retained before being closed (0 inherits global default)
           minimum: 0
+
+  simulation:
+    type: object
+    description: >-
+      Simulated-relay configuration. Serves synthetic relays for pinned
+      (application, gateway-ring) identities, verified against
+      config-pinned public keys instead of an on-chain session. Disabled
+      by default. SECURITY: app_pubkey_hex and every gateway_pubkeys_hex
+      entry are rejected at load time if they match the deterministic ring
+      placeholder key, since its private half is publicly derivable.
+    properties:
+      enabled:
+        type: boolean
+        description: Enable the simulated-relay feature
+        default: false
+      max_concurrent:
+        type: integer
+        description: Max simulated relays in flight across all identities
+        default: 32
+        minimum: 1
+      freshness_window_seconds:
+        type: integer
+        description: How old a simulated relay request's timestamp may be before it's rejected as stale (seconds)
+        default: 30
+        minimum: 1
+      identities:
+        type: array
+        description: >-
+          Pinned simulated-relay identities. May be empty (or omitted)
+          only while enabled is false; enabling the feature with nothing
+          pinned is rejected at load, since it would boot cleanly and then
+          reject every simulated relay as an unknown key_id.
+        items:
+          type: object
+          required:
+            - key_id
+            - app_pubkey_hex
+            - gateway_pubkeys_hex
+          properties:
+            key_id:
+              type: string
+              description: Unique identifier for this identity within the simulation config
+            enabled:
+              type: boolean
+              description: >-
+                Activates this identity. An identity is served ONLY when
+                this is explicitly true; omitted/false keeps it inactive
+                (fail-closed). Not defaulted to true.
+              default: false
+            not_after:
+              type: string
+              description: Optional RFC3339 timestamp after which this identity is no longer valid
+            max_rps:
+              type: integer
+              description: Per-identity simulated relay rate
+              default: 5
+              minimum: 1
+            app_pubkey_hex:
+              type: string
+              description: Compressed secp256k1 pubkey (hex, 66 chars) of the simulated application. Must not be the ring placeholder key.
+              pattern: ^[0-9a-fA-F]{66}$
+            gateway_pubkeys_hex:
+              type: array
+              description: Compressed secp256k1 pubkeys (hex) of the simulated gateway ring members. At least one required; none may be the ring placeholder key.
+              minItems: 1
+              items:
+                type: string
+                pattern: ^[0-9a-fA-F]{66}$
+            allowed_services:
+              type: array
+              description: Restricts this identity to the listed service IDs. Empty/omitted means all configured services are allowed.
+              items:
+                type: string

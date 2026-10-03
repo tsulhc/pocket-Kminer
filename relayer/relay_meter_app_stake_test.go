@@ -5,16 +5,15 @@ package relayer
 import (
 	"context"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"testing"
 
 	sdkmath "cosmossdk.io/math"
-	"github.com/alicebob/miniredis/v2"
 	cosmostypes "github.com/cosmos/cosmos-sdk/types"
 	"github.com/stretchr/testify/require"
 
 	"github.com/pokt-network/pocket-relay-miner/logging"
-	redisutil "github.com/pokt-network/pocket-relay-miner/transport/redis"
 	apptypes "github.com/pokt-network/poktroll/x/application/types"
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 )
@@ -47,14 +46,36 @@ func (f *fakeAppClient) GetParams(_ context.Context) (*apptypes.Params, error) {
 	return nil, nil
 }
 
-type fakeSharedParamCache struct{ params *sharedtypes.Params }
+// fakeSharedParamCache serves shared params. params is the live/latest value;
+// byHeight optionally models a params epoch change so a test can prove a
+// session is evaluated under the epoch it belongs to rather than the live one.
+// gotHeights records every at-height lookup.
+type fakeSharedParamCache struct {
+	mu         sync.Mutex
+	params     *sharedtypes.Params
+	byHeight   map[int64]*sharedtypes.Params
+	gotHeights []int64
+}
 
 func (f *fakeSharedParamCache) GetLatestSharedParams(_ context.Context) (*sharedtypes.Params, error) {
 	return f.params, nil
 }
 
-func (f *fakeSharedParamCache) GetSharedParams(_ context.Context, _ int64) (*sharedtypes.Params, error) {
+func (f *fakeSharedParamCache) GetSharedParams(_ context.Context, height int64) (*sharedtypes.Params, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.gotHeights = append(f.gotHeights, height)
+	if p, ok := f.byHeight[height]; ok {
+		return p, nil
+	}
 	return f.params, nil
+}
+
+// heightsQueried returns a copy of the recorded at-height lookups.
+func (f *fakeSharedParamCache) heightsQueried() []int64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]int64(nil), f.gotHeights...)
 }
 
 // TestGetOrCreateSessionMeter_RecomputesMaxStake_WhenAppStakeChanges is the
@@ -68,16 +89,9 @@ func (f *fakeSharedParamCache) GetSharedParams(_ context.Context, _ int64) (*sha
 // and zero invalidation. This test drives the meter through a stake change
 // and asserts the recomputed meta reflects the new value.
 func TestGetOrCreateSessionMeter_RecomputesMaxStake_WhenAppStakeChanges(t *testing.T) {
-	mr, err := miniredis.Run()
-	require.NoError(t, err)
-	defer mr.Close()
 	ctx := context.Background()
 
-	redisClient, err := redisutil.NewClient(ctx, redisutil.ClientConfig{
-		URL: fmt.Sprintf("redis://%s", mr.Addr()),
-	})
-	require.NoError(t, err)
-	defer func() { _ = redisClient.Close() }()
+	redisClient, _ := newTestRedis(t)
 
 	appAddr := "pokt1app_under_test"
 	app := &fakeAppClient{addr: appAddr}
@@ -101,7 +115,7 @@ func TestGetOrCreateSessionMeter_RecomputesMaxStake_WhenAppStakeChanges(t *testi
 		&fakeSharedParamCache{params: sharedParams},
 		nil, // serviceCache (unused in getOrCreateSessionMeter path)
 		nil, // serviceFactorProvider → baseLimit path
-		RelayMeterConfig{RedisKeyPrefix: "ha"},
+		RelayMeterConfig{},
 	)
 	require.NoError(t, meter.Start(ctx))
 	defer func() { _ = meter.Close() }()

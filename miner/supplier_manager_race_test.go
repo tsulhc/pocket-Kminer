@@ -8,15 +8,18 @@ import (
 	"testing"
 	"time"
 
+	"github.com/puzpuzpuz/xsync/v4"
+
 	"github.com/pokt-network/pocket-relay-miner/logging"
 )
 
 // TestSupplierState_StatusRace reproduces the data race between
 // consumeForSupplier reading state.Status (for the "processing relay
 // during drain" debug log) and removeSupplier writing state.Status =
-// SupplierStatusDraining under suppliersMu. The existing test suite
-// does not hit this window, so the race detector does not flag it
-// today, but the read/write pair is unsynchronized by inspection.
+// SupplierStatusDraining concurrently. The existing test suite does
+// not hit this window, so the race detector does not flag it today,
+// but the read/write pair was unsynchronized by inspection before the
+// atomic promotion.
 //
 // Under -race, this test MUST NOT flag a DATA RACE once Status is
 // promoted to atomic.Int32 and all call sites use LoadStatus /
@@ -88,7 +91,7 @@ func TestSupplierManager_OnKeyChangeCtxRace(t *testing.T) {
 	mgr := &SupplierManager{
 		logger:    logging.NewLoggerFromConfig(logging.DefaultConfig()),
 		config:    SupplierManagerConfig{MinerID: "race-test"},
-		suppliers: make(map[string]*SupplierState),
+		suppliers: xsync.NewMap[string, *SupplierState](),
 	}
 	// Pre-seed a context so the first onKeyChange call does not see nil
 	// before Start() runs. The race we reproduce is the concurrent

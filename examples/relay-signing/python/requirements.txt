@@ -1,0 +1,20 @@
+# No dependencies. sign.py is pure Python 3 stdlib, and that is deliberate:
+# this is example code meant to be copied into an agent or a script without
+# dragging a build toolchain along with it.
+#
+#   python3 verify_against_oracle.py     # needs nothing but Python 3.8+ and Go
+#                                        # (Go only to build the test oracle)
+#
+# Two notes if you are tempted to add something anyway:
+#
+#   * Hashing: use the stdlib. hashlib.sha3_256/sha3_512 are FIPS-202 SHA3,
+#     which is what this scheme needs. The `pysha3` and `pycryptodome` "keccak"
+#     functions are Ethereum's pre-standard Keccak — a different function with
+#     the same nickname. Swapping one in produces signatures that never verify,
+#     and nothing in the error will mention hashing.
+#
+#   * Curve arithmetic: `coincurve` (libsecp256k1) is much faster than the
+#     integer arithmetic in sign.py and is a reasonable swap if you sign at
+#     volume. Keep hash_to_scalar and hash_to_curve exactly as they are —
+#     they are not standard constructions, and the quirk in hash_to_scalar is
+#     load-bearing. Re-run verify_against_oracle.py after any such change.

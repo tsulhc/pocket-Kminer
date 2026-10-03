@@ -13,6 +13,7 @@ import (
 	"github.com/pokt-network/pocket-relay-miner/client/relay_client"
 	"github.com/pokt-network/pocket-relay-miner/logging"
 	servicetypes "github.com/pokt-network/poktroll/x/service/types"
+	sdktypes "github.com/pokt-network/shannon-sdk/types"
 )
 
 const (
@@ -22,8 +23,10 @@ const (
 
 // runStreamMode sends streaming relay requests to the relayer.
 func RunStreamMode(ctx context.Context, logger logging.Logger, relayClient *relay_client.RelayClient) error {
-	// Build payload (eth_blockNumber by default)
-	payloadBz, err := buildJSONRPCPayload()
+	// Build payload (eth_blockNumber by default). When --batches is set, the demo
+	// backend is asked to emit that many SSE batches and then close the stream;
+	// unset means "receive everything until the server closes" (mainnet-style).
+	payloadBz, err := buildStreamPayload(RelayBatches)
 	if err != nil {
 		return fmt.Errorf("failed to build payload: %w", err)
 	}
@@ -41,7 +44,7 @@ func RunStreamMode(ctx context.Context, logger logging.Logger, relayClient *rela
 func runStreamDiagnostic(ctx context.Context, logger logging.Logger, relayClient *relay_client.RelayClient, payloadBz []byte) error {
 	// Build and sign relay request
 	buildStart := time.Now()
-	relayRequest, relayRequestBz, err := relayClient.BuildRelayRequest(ctx, RelayServiceID, RelaySupplierAddr, payloadBz)
+	relayRequest, relayRequestBz, err := buildRelayRequest(ctx, relayClient, RelayServiceID, RelaySupplierAddr, payloadBz)
 	if err != nil {
 		return fmt.Errorf("failed to build relay request: %w", err)
 	}
@@ -107,7 +110,7 @@ func runStreamDiagnostic(ctx context.Context, logger logging.Logger, relayClient
 		// Try to pretty-print JSON
 		var payloadData interface{}
 		if err := json.Unmarshal(combinedPayload, &payloadData); err == nil {
-			prettyJSON, _ := json.MarshalIndent(payloadData, "", "  ")
+			prettyJSON, _ := json.MarshalIndent(payloadData, "", "  ") //nolint:errcheck // Marshal fails only on channels, funcs, complex, NaN/Inf or cycles (encoding/json); none is reachable from this value
 			fmt.Printf("Payload:\n%s\n", string(prettyJSON))
 		} else {
 			fmt.Printf("Payload: %s\n", string(combinedPayload))
@@ -135,6 +138,12 @@ func sendStreamingRelay(ctx context.Context, relayRequestBz []byte) ([][]byte, e
 	// Backend maps REST to http://backend:8545/stream/sse (tilt_config.yaml:156)
 	req.Header.Set("Rpc-Type", "4") // REST = 4
 
+	// Pocket-Simulation-Key-Id: tells the relayer this is a simulated relay.
+	// Absent unless --simulate is set.
+	if key, val, ok := simulationHTTPHeader(); ok {
+		req.Header.Set(key, val)
+	}
+
 	// Send request
 	client := &http.Client{
 		Timeout: time.Duration(RelayTimeout) * time.Second,
@@ -147,15 +156,94 @@ func sendStreamingRelay(ctx context.Context, relayRequestBz []byte) ([][]byte, e
 
 	// Check status code
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(resp.Body) //nolint:errcheck // the body only enriches an error that is returned either way; on failure it is empty and the status still names the failure
 		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
 	}
 
-	// Read streaming response
+	// Read the streaming response until the server closes it (EOF) or the client
+	// --timeout fires. On mainnet/beta the client cannot know how many batches a
+	// service emits, so it collects everything the server sends. On localnet, the
+	// demo backend honors the --batches count in the request body and closes after
+	// emitting that many, so this returns promptly with exactly that many batches.
 	return readStreamingBatches(resp.Body)
 }
 
-// readStreamingBatches reads streaming batches from the response body and returns raw bytes.
+// buildStreamPayload creates a serialized POKTHTTPRequest for stream mode.
+//
+// When batches <= 0 (the mainnet/real-backend path) it forwards the payload
+// verbatim via buildJSONRPCPayload — the exact --payload bytes, or the default
+// eth_blockNumber body — so nothing is re-encoded. This matters: parsing a
+// request into a generic map and re-marshalling would reorder keys and coerce
+// integers to float64 (corrupting e.g. a large JSON-RPC id), which a real service
+// may reject.
+//
+// When batches > 0 (the localnet demo path) it must add a "batches" control field
+// so the demo backend emits exactly that many SSE batches and then closes. That
+// requires parsing the body into a JSON object; a non-object (array/scalar/null)
+// payload cannot carry the field and is rejected up front rather than silently
+// dropped. The map round-trip is confined to this demo-only path.
+func buildStreamPayload(batches int) ([]byte, error) {
+	if batches <= 0 {
+		return buildJSONRPCPayload()
+	}
+
+	var body map[string]any
+	if RelayPayloadJSON != "" {
+		if err := json.Unmarshal([]byte(RelayPayloadJSON), &body); err != nil {
+			return nil, fmt.Errorf("stream --payload must be a JSON object to carry --batches: %w", err)
+		}
+		// A JSON "null" unmarshals into a nil map without error; injecting into it
+		// would panic. Reject it as a non-object, same as an array/scalar payload.
+		if body == nil {
+			return nil, fmt.Errorf("stream --payload must be a JSON object to carry --batches, got null")
+		}
+	} else {
+		body = map[string]any{
+			"jsonrpc": "2.0",
+			"method":  "eth_blockNumber",
+			"params":  []any{},
+			"id":      1,
+		}
+	}
+
+	body["batches"] = batches
+
+	jsonPayload, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal stream payload: %w", err)
+	}
+
+	httpReq, err := http.NewRequest("POST", "/", bytes.NewReader(jsonPayload))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create HTTP request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	_, poktHTTPRequestBz, err := sdktypes.SerializeHTTPRequest(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("failed to serialize POKTHTTPRequest: %w", err)
+	}
+
+	return poktHTTPRequestBz, nil
+}
+
+// readStreamingBatches reads every non-empty signed batch from the response body
+// and returns their raw bytes. It scans until the server closes the stream (EOF)
+// or the reader fails (e.g. the HTTP client --timeout fires). Batches collected
+// before a mid-stream reader error are returned with a nil error — they are
+// complete and independently signature-verified by the caller — so a timeout on a
+// long-lived stream never discards the data already received. The reader error is
+// surfaced only when nothing at all was collected.
+//
+// The relayer suffixes the "||POKT_STREAM||" delimiter after every COMPLETE batch,
+// so a batch terminated by a delimiter is whole. A timeout/reset that lands
+// mid-write leaves a trailing batch with no delimiter; that partial is a truncated
+// protobuf that would fail the caller's signature check and abort the whole run,
+// discarding the valid batches before it. To honor the "never discards received
+// data" contract, a non-delimiter-terminated trailing batch is dropped when — and
+// only when — the stream ended on a reader error. On a clean EOF the same trailing
+// token is a complete final batch (the server finished writing, then closed) and
+// is kept.
 func readStreamingBatches(body io.Reader) ([][]byte, error) {
 	var batches [][]byte
 	scanner := bufio.NewScanner(body)
@@ -164,6 +252,11 @@ func readStreamingBatches(body io.Reader) ([][]byte, error) {
 	const maxScanTokenSize = 256 * 1024 // 256KB
 	buf := make([]byte, maxScanTokenSize)
 	scanner.Buffer(buf, maxScanTokenSize)
+
+	// tokenWasLeftover records whether the token the scanner just returned came
+	// from the atEOF "leftover" path (no trailing delimiter) rather than a
+	// delimiter boundary. Written by the split func, read in the scan loop.
+	tokenWasLeftover := false
 
 	// Custom split function to split on the delimiter
 	scanner.Split(func(data []byte, atEOF bool) (advance int, token []byte, err error) {
@@ -174,11 +267,13 @@ func readStreamingBatches(body io.Reader) ([][]byte, error) {
 		// Look for delimiter
 		if i := bytes.Index(data, []byte(streamDelimiter)); i >= 0 {
 			// Return the data up to (but not including) the delimiter
+			tokenWasLeftover = false
 			return i + len(streamDelimiter), data[0:i], nil
 		}
 
 		// If we're at EOF, return remaining data as last token
 		if atEOF {
+			tokenWasLeftover = true
 			return len(data), data, nil
 		}
 
@@ -186,7 +281,10 @@ func readStreamingBatches(body io.Reader) ([][]byte, error) {
 		return 0, nil, nil
 	})
 
-	// Scan batches
+	// Scan every batch until the server closes the stream (EOF) or the reader
+	// fails (client --timeout). Termination is by server-close, so the client
+	// collects everything the service chose to send.
+	lastAppendedWasLeftover := false
 	for scanner.Scan() {
 		batchData := scanner.Bytes()
 		if len(batchData) == 0 {
@@ -198,14 +296,26 @@ func readStreamingBatches(body io.Reader) ([][]byte, error) {
 		batchCopy := make([]byte, len(batchData))
 		copy(batchCopy, batchData)
 		batches = append(batches, batchCopy)
+		lastAppendedWasLeftover = tokenWasLeftover
 	}
 
+	// A scanner error after we already have batches is expected on a long-lived
+	// stream: the HTTP client timeout fires once the server stops sending. Those
+	// batches are complete and are independently signature-verified by the caller,
+	// so hand them back and swallow the error. Only surface the error when we
+	// collected nothing to return.
 	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("error reading stream: %w", err)
+		// Ended on a reader error, not a clean EOF: a non-delimiter-terminated
+		// trailing batch is truncated (server was mid-write). Drop it so it does
+		// not fail verification and abort the run, discarding the complete batches
+		// received before it.
+		if lastAppendedWasLeftover && len(batches) > 0 {
+			batches = batches[:len(batches)-1]
+		}
+		if len(batches) == 0 {
+			return nil, fmt.Errorf("error reading stream: %w", err)
+		}
 	}
 
 	return batches, nil
 }
-
-// Reuse buildJSONRPCPayload from relay_http.go
-// (it's already defined in that file, so we can call it)

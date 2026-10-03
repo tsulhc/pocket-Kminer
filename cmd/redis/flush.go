@@ -31,13 +31,13 @@ Options:
 
 Examples:
   # Delete all SMST trees
-  redis-debug flush --pattern "ha:smst:*"
+  pocket-relay-miner redis flush --pattern "ha:smst:*"
 
   # Delete all session data for a supplier
-  redis-debug flush --pattern "ha:miner:sessions:pokt1abc*"
+  pocket-relay-miner redis flush --pattern "ha:miner:sessions:pokt1abc*"
 
   # Delete everything (DANGEROUS)
-  redis-debug flush --all
+  pocket-relay-miner redis flush --all
 
 Safety:
   - Without --force, you will be prompted to confirm
@@ -52,7 +52,7 @@ Safety:
 			defer func() { _ = client.Close() }()
 
 			if flushAll {
-				pattern = "ha:*"
+				pattern = client.KB().AllKeysPattern()
 			}
 
 			if pattern == "" {
@@ -71,24 +71,13 @@ Safety:
 }
 
 func flushKeys(ctx context.Context, client *DebugRedisClient, pattern string, force bool) error {
-	// First, scan to see what will be deleted
-	var cursor uint64
-	var keys []string
-
+	// First, scan to see what will be deleted (cluster-aware: a plain SCAN
+	// on Redis Cluster hits a single node and silently misses the rest).
 	fmt.Printf("Scanning for keys matching: %s\n", pattern)
 
-	for {
-		scanKeys, newCursor, err := client.Scan(ctx, cursor, pattern, 1000).Result()
-		if err != nil {
-			return fmt.Errorf("failed to scan keys: %w", err)
-		}
-
-		keys = append(keys, scanKeys...)
-		cursor = newCursor
-
-		if cursor == 0 {
-			break
-		}
+	keys, err := clusterAwareScanAllKeys(ctx, client, pattern)
+	if err != nil {
+		return fmt.Errorf("failed to scan keys: %w", err)
 	}
 
 	if len(keys) == 0 {
@@ -122,24 +111,24 @@ func flushKeys(ctx context.Context, client *DebugRedisClient, pattern string, fo
 		fmt.Printf("⚠️  This operation is IRREVERSIBLE!\n\n")
 
 		// Risk assessment
-		if pattern == "ha:*" || pattern == "*" {
+		if pattern == client.KB().AllKeysPattern() || pattern == "*" {
 			fmt.Printf("🚨 CRITICAL: You are about to delete ALL data!\n")
 			fmt.Printf("🚨 This will cause:\n")
 			fmt.Printf("   - Loss of all session state\n")
 			fmt.Printf("   - Loss of all SMST trees\n")
 			fmt.Printf("   - Loss of all cached data\n")
 			fmt.Printf("   - Disruption to all running instances\n\n")
-		} else if strings.HasPrefix(pattern, "ha:smst:") {
+		} else if strings.HasPrefix(pattern, client.KB().SMSTNodesPrefix()) {
 			fmt.Printf("⚠️  This will delete SMST tree data\n")
 			fmt.Printf("⚠️  May cause proof submission failures\n\n")
-		} else if strings.HasPrefix(pattern, "ha:miner:sessions:") {
+		} else if strings.HasPrefix(pattern, fmt.Sprintf("%s:", client.KB().MinerSessionsPrefix())) {
 			fmt.Printf("⚠️  This will delete session metadata\n")
 			fmt.Printf("⚠️  May cause claim/proof tracking issues\n\n")
 		}
 
 		fmt.Printf("To confirm, type 'DELETE' (all caps): ")
 		reader := bufio.NewReader(os.Stdin)
-		confirmation, _ := reader.ReadString('\n')
+		confirmation, _ := reader.ReadString('\n') //nolint:errcheck // bufio.ReadString returns an error IF AND ONLY IF the data does not end in the delimiter, so a piped answer without a trailing newline is valid data plus io.EOF; TrimSpace normalises both and an empty read fails the comparison below
 		confirmation = strings.TrimSpace(confirmation)
 
 		if confirmation != "DELETE" {
@@ -148,26 +137,15 @@ func flushKeys(ctx context.Context, client *DebugRedisClient, pattern string, fo
 		}
 	}
 
-	// Perform deletion in batches
+	// Perform deletion: single-key DELs inside pipelines, so Redis Cluster
+	// deployments don't fail with CROSSSLOT on multi-key commands.
 	fmt.Printf("\nDeleting %d keys...\n", len(keys))
 
-	batchSize := 100
-	deleted := 0
-
-	for i := 0; i < len(keys); i += batchSize {
-		end := i + batchSize
-		if end > len(keys) {
-			end = len(keys)
-		}
-
-		batch := keys[i:end]
-		err := client.Del(ctx, batch...).Err()
-		if err != nil {
-			return fmt.Errorf("failed to delete batch: %w", err)
-		}
-
-		deleted += len(batch)
-		fmt.Printf("  Deleted %d / %d keys\n", deleted, len(keys))
+	deleted, err := pipelinedDelete(ctx, client, keys, 100, func(deleted, total int) {
+		fmt.Printf("  Deleted %d / %d keys\n", deleted, total)
+	})
+	if err != nil {
+		return fmt.Errorf("failed to delete keys (deleted %d): %w", deleted, err)
 	}
 
 	fmt.Printf("\n✅ Successfully deleted %d keys\n", deleted)

@@ -5,12 +5,14 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/spf13/cobra"
 
-	configpkg "github.com/pokt-network/pocket-relay-miner/config"
+	"github.com/pokt-network/pocket-relay-miner/internal/memlimit"
 	"github.com/pokt-network/pocket-relay-miner/keys"
 	"github.com/pokt-network/pocket-relay-miner/leader"
 	"github.com/pokt-network/pocket-relay-miner/logging"
@@ -19,34 +21,33 @@ import (
 	redistransport "github.com/pokt-network/pocket-relay-miner/transport/redis"
 )
 
+// minerShutdownTimeout bounds the graceful shutdown of the supplier worker.
+// Mirrors the relayer's GracefulShutdownTimeout rather than introducing a
+// second number. NOT calibrated against the deployment's own grace period --
+// that manifest is not in this tree -- but any finite ceiling beats a wait
+// with none.
+const minerShutdownTimeout = 30 * time.Second
+
 const (
-	flagMinerConfig    = "config"
-	flagKeysFile       = "keys-file"
-	flagKeysDir        = "keys-dir"
-	flagKeyringBackend = "keyring-backend"
-	flagKeyringDir     = "keyring-dir"
-	flagConsumerName   = "consumer-name"
-	flagHotReload      = "hot-reload"
-	flagSessionTTL     = "session-ttl"
+	flagMinerConfig  = "config"
+	flagConsumerName = "consumer-name"
+	flagHotReload    = "hot-reload"
+	flagSessionTTL   = "session-ttl"
 )
 
-// MinerCmd returns the command for starting the HA Miner component.
+// MinerCmd returns the command for starting the Miner component.
 func MinerCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "miner",
-		Short: "Start the HA Miner (SMST builder and claim/proof submitter)",
-		Long: `Start the High-Availability Miner component.
+		Short: "Start the Miner (SMST builder and claim/proof submitter)",
+		Long: `Start the Miner component.
 
-The HA Miner consumes mined relays from Redis Streams and builds SMST trees.
+The relayers and miners of a deployment share one Redis. The Miner consumes mined relays from Redis Streams and builds SMST trees.
 It supports multiple suppliers and dynamically adds/removes them based on key changes.
 
 Configuration:
-  --config: Path to miner config YAML file (recommended)
+  --config: Path to miner config YAML file (required)
 
-Legacy Key Sources (if not using config file):
-  --keys-file: Path to supplier.yaml containing hex-encoded private keys
-  --keys-dir: Directory containing individual key files (YAML/JSON)
-  --keyring-backend/--keyring-dir: Cosmos keyring integration
 
 Features:
 - Multi-supplier support (one consumer per supplier)
@@ -58,30 +59,88 @@ Features:
 - Prometheus metrics at /metrics
 
 Example:
-  pocketd relayminer ha miner --config /path/to/miner-config.yaml
-  pocketd relayminer ha miner --keys-file /path/to/supplier.yaml --redis-url redis://localhost:6379
+  pocket-relay-miner miner --config /path/to/miner.yaml
+
 `,
 		RunE: runHAMiner,
 	}
 
-	// Config file (recommended approach)
-	cmd.Flags().String(flagMinerConfig, "", "Path to miner config YAML file")
-
-	// Legacy key source flags (for backwards compatibility)
-	cmd.Flags().String(flagKeysFile, "", "Path to supplier.yaml with hex-encoded private keys")
-	cmd.Flags().String(flagKeysDir, "", "Directory containing individual key files (YAML/JSON)")
-	cmd.Flags().String(flagKeyringBackend, "", "Cosmos keyring backend: file, os, test")
-	cmd.Flags().String(flagKeyringDir, "", "Cosmos keyring directory")
+	cmd.Flags().String(flagMinerConfig, "", "Path to miner config YAML file (required)")
+	cmd.Flags().Bool(flagStrictConfig, false, "Refuse to start when the config carries keys this binary does not understand (default: warn and start)")
 
 	// Redis flags (can override config)
 	cmd.Flags().String(flagRedisURL, "", "Redis connection URL (overrides config)")
-	cmd.Flags().String(flagConsumerName, "", "Consumer name (defaults to hostname)")
+	cmd.Flags().String(flagConsumerName, "", "Consumer name PREFIX; -<hostname>-<pid> is always appended (default \"miner\")")
 
 	// Configuration flags (can override config)
 	cmd.Flags().Bool(flagHotReload, true, "Enable hot-reload of keys")
 	cmd.Flags().Duration(flagSessionTTL, 0, "Session data TTL (default: same as cache_ttl to prevent orphaned sessions)")
 
+	cmd.AddCommand(minerValidateCmd())
+
 	return cmd
+}
+
+// minerValidateCmd runs the exact config checks the miner runs at startup —
+// load + validateMinerConfig — without starting anything, and exits non-zero on
+// the first error. Run it before deploying a config change: a config the miner
+// rejects will not boot.
+func minerValidateCmd() *cobra.Command {
+	c := &cobra.Command{
+		Use:   "validate",
+		Short: "Validate a miner config without starting the miner",
+		Long: `Validate a miner config against the same checks the miner runs at startup.
+
+Exits 0 if the config would boot, non-zero with the first error otherwise.
+Run this before rolling out a config change.
+
+Example:
+  pocket-relay-miner miner validate --config /path/to/miner.yaml`,
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			config, err := loadMinerConfig(cmd)
+			if err != nil {
+				return fmt.Errorf("config is INVALID: %w", err)
+			}
+			if err := validateMinerConfig(config); err != nil {
+				return fmt.Errorf("config is INVALID: %w", err)
+			}
+
+			// Validating IS this command's job, so a key the miner does not
+			// understand is a failure here, with no flag involved. The serving
+			// binary makes the friendlier choice (warn and start, unless
+			// --strict-config); this is the door an operator walks through
+			// deliberately, before the rollout, to be told everything at once.
+			//
+			// Returned rather than printed: cobra renders it and sets a non-zero
+			// exit, which is what a pipeline reads.
+			if unknown := config.Warnings(); len(unknown) > 0 {
+				return fmt.Errorf(
+					"config is INVALID: %d key(s) this miner does not understand:\n  %s",
+					len(unknown), strings.Join(unknown, "\n  "))
+			}
+
+			// Not a failure and deliberately NOT part of Warnings(), which exits
+			// non-zero: the config is fine, the ENVIRONMENT is degraded, and a
+			// config check should not go red for that. Reported because this
+			// command's job is pre-flight -- staying silent would hand back a
+			// green for a deployment whose process identity will fall back.
+			//
+			// The limit, so nobody reads this as a guarantee: run on a laptop,
+			// this reproduces the laptop's hostname, not the pod's. It catches
+			// the case where the host cannot be read HERE, not there.
+			if miner.ProcessIdentityUsedFallback() {
+				fmt.Printf("NOTE: hostname unavailable here; process identity would fall back to a random discriminator\n")
+			}
+
+			configPath, _ := cmd.Flags().GetString(flagMinerConfig)
+			fmt.Printf("config OK: %s would start\n", configPath)
+			return nil
+		},
+	}
+	c.Flags().String(flagMinerConfig, "", "Path to miner config YAML file (required)")
+	_ = c.MarkFlagRequired(flagMinerConfig)
+	return c
 }
 
 func runHAMiner(cmd *cobra.Command, _ []string) (err error) {
@@ -103,6 +162,31 @@ func runHAMiner(cmd *cobra.Command, _ []string) (err error) {
 
 	// Set up logger from config
 	logger := logging.NewLoggerFromConfig(config.Logging)
+	memlimit.Apply(logger)
+
+	// Keys the file carries that this binary does not understand.
+	//
+	// Warn and start, by default and on purpose: the ConfigMap and the binary
+	// roll out separately, so a new binary landing beside an older config is the
+	// NORMAL case of a rolling deploy, not an anomaly. Refusing to boot there
+	// converts a stale key into an outage. Loading a config is a state change,
+	// not a per-request event, so Warn is the right level.
+	//
+	// The miner had no channel for this at all until now, which is why the
+	// retired top-level hot_reload_enabled had to be a hard boot failure: with
+	// only "fail" and "say nothing" on offer, failing was correct. It now has
+	// the same three doors as the relayer.
+	unknownConfigKeys := config.Warnings()
+	for _, w := range unknownConfigKeys {
+		logger.Warn().Msg(w)
+	}
+	if len(unknownConfigKeys) > 0 {
+		if strict, _ := cmd.Flags().GetBool(flagStrictConfig); strict {
+			return fmt.Errorf(
+				"--strict-config: refusing to start, %d key(s) this miner does not understand (listed above)",
+				len(unknownConfigKeys))
+		}
+	}
 
 	// Validate configuration before starting components
 	if err := validateMinerConfig(config); err != nil {
@@ -129,7 +213,7 @@ func runHAMiner(cmd *cobra.Command, _ []string) (err error) {
 		if err := obsServer.Start(ctx); err != nil {
 			return fmt.Errorf("failed to start observability server: %w", err)
 		}
-		defer func() { _ = obsServer.Stop() }()
+		defer func() { _ = obsServer.Stop() }() //nolint:errcheck // Stop logs every shutdown failure at Error before returning the last one; this deferred caller has nobody to hand it to
 		logger.Info().Str("addr", config.Metrics.Addr).Msg("observability server started")
 
 		// Start runtime metrics collector (not started automatically when using custom registry)
@@ -158,14 +242,45 @@ func runHAMiner(cmd *cobra.Command, _ []string) (err error) {
 		return fmt.Errorf("failed to create Redis client: %w", err)
 	}
 	defer func() {
-		if err = redisClient.Close(); err != nil {
-			logger.Error().Err(err).Msg("failed to close Redis client")
+		// closeErr, NOT err: runHAMiner has a NAMED result, so assigning to
+		// err here overwrites whatever the function returned — a nil Close
+		// would mask the leader-controller failure below and exit 0.
+		if closeErr := redisClient.Close(); closeErr != nil {
+			logger.Error().Err(closeErr).Msg("failed to close Redis client")
 		}
 	}()
 	logger.Info().
 		Str("redis_url", config.Redis.URL).
 		Str("consumer_name", config.Redis.ConsumerName).
 		Msg("connected to Redis")
+
+	// Redis pool statistics. Registered HERE and not in NewClient: fifteen test
+	// files and the redis CLI build clients, and a repeated MustRegister panics.
+	// The collector is also the registry of pools, so a client per supplier can
+	// be added and removed as suppliers are adopted and released.
+	//
+	// The miner is where this is most needed: checkPoolSize only WARNS about a
+	// short pool, once, at startup -- and that warning sat in Loki through a
+	// whole load run with nobody reading it.
+	// See the relayer for why this is a hook and not go-redis's own wait
+	// callback: the callback has the same survivorship bias as the pool's
+	// counters, and a hook sits outside the retry loop so it sees the whole cost.
+	redisClient.AddHook(redistransport.NewCommandLatencyHook("miner"))
+
+	// Whether Redis can take writes, answered once for the whole miner; the same
+	// component the relayer uses.
+	storeHealth := redistransport.NewStoreHealth(logger, redisClient.UniversalClient, "miner", redistransport.StoreGateIngestion)
+	redisClient.AddHook(storeHealth.Hook())
+	// A Redis with no memory limit, or one that evicts, is refused here: the
+	// miner would serve relays it cannot claim, and find out at the settlement.
+	if err := storeHealth.Start(ctx); err != nil {
+		return fmt.Errorf("redis is not configured for this miner: %w", err)
+	}
+	miner.RecordStoreMemoryOnClose(ctx, logger, redisClient, storeHealth)
+
+	redisPools := redistransport.NewPoolCollector("miner")
+	redisPools.Add("shared", redisClient)
+	observability.SharedRegistry.MustRegister(redisPools)
 
 	// Set readiness check to verify Redis connectivity via PING
 	if obsServer != nil {
@@ -181,47 +296,41 @@ func runHAMiner(cmd *cobra.Command, _ []string) (err error) {
 	}
 	defer func() { _ = redisHealthMonitor.Close() }()
 
-	// Create key providers from config
-	providers, err := createKeyProviders(logger, config)
+	// One shared sequence for both binaries: build the providers the config
+	// names, put a key manager over them, load once, arm the watch and the
+	// reload timer, and refuse to continue with no keys. See keys.OpenManager
+	// for why that lives there and not here.
+	keyManager, err := keys.OpenManager(
+		ctx, logger,
+		config.Keys.KeysFile,
+		keyringSettings(config.Keys.Keyring),
+		config.Keys.HotReloadEnabled,
+	)
 	if err != nil {
 		return err
 	}
-
-	if len(providers) == 0 {
-		return fmt.Errorf("no key providers configured")
-	}
-
-	// Create a key manager
-	keyManager := keys.NewMultiProviderKeyManager(
-		logger,
-		providers,
-		keys.KeyManagerConfig{
-			HotReloadEnabled: config.HotReloadEnabled,
-		},
-	)
 	defer func() { _ = keyManager.Close() }()
 
-	// Start key manager
-	if err = keyManager.Start(ctx); err != nil {
-		return fmt.Errorf("failed to start key manager: %w", err)
-	}
-
-	// Check if any keys were loaded - FAIL FAST if no keys
-	// This prevents the miner from silently running with no keys and doing nothing.
-	// Users with invalid key files will see clear error messages instead of exit 0.
-	suppliers := keyManager.ListSuppliers()
-	if len(suppliers) == 0 {
-		return fmt.Errorf("no supplier keys loaded at startup - cannot proceed. " +
-			"Check your key file configuration and ensure at least one valid key is provided. " +
-			"Key file errors are logged above with details about what's wrong")
-	}
 	logger.Info().
-		Int("count", len(suppliers)).
+		Int("count", len(keyManager.ListSuppliers())).
 		Msg("loaded supplier keys")
 
-	// Generate unique instance ID for global leader election
-	hostname, _ := os.Hostname()
-	instanceID := fmt.Sprintf("%s-%d", hostname, os.Getpid())
+	// The leader-lock value and the Redis consumer name are the SAME identity,
+	// computed once in miner.ProcessIdentity(). The hostname used to be read
+	// here with its error discarded, which mattered because the renew script is
+	// "extend only if the value is still mine": two replicas with equal values
+	// renew against each other's key and neither learns it lost the lease.
+	instanceID := miner.ProcessIdentity()
+	if miner.ProcessIdentityUsedFallback() {
+		// Warn, not Error: it happens once at startup and the process is
+		// correct afterwards -- the random fallback is what makes the
+		// degradation safe. It is reported because a degradation that leaves no
+		// trace is one nobody can act on; the identity itself carries the
+		// marker, this says why.
+		logger.Warn().
+			Str("instance_id", instanceID).
+			Msg("hostname unavailable: process identity fell back to a random discriminator")
+	}
 
 	// Create global leader elector FIRST to determine replica status before other components start
 	leaderConfig := leader.GlobalLeaderElectorConfig{
@@ -243,11 +352,8 @@ func runHAMiner(cmd *cobra.Command, _ []string) (err error) {
 		instanceID,
 		leaderConfig,
 	)
-	if err = globalLeader.Start(ctx); err != nil {
-		return fmt.Errorf("failed to start global leader elector: %w", err)
-	}
-	defer func() { globalLeader.Close() }()
-
+	// NOT started yet: the election loop must not be able to fire OnElected
+	// before registerLeaderCallbacks has wired it. See where Start now lives.
 	// Use dynamic logger that evaluates replica status at log time
 	// The replica field will automatically reflect leader election changes
 	logger = logging.ForMinerDynamic(logger, instanceID, globalLeader)
@@ -273,6 +379,7 @@ func runHAMiner(cmd *cobra.Command, _ []string) (err error) {
 	supplierWorker := miner.NewSupplierWorker(miner.SupplierWorkerConfig{
 		Logger:           logger,
 		RedisClient:      redisClient,
+		StoreHealth:      storeHealth,
 		KeyManager:       keyManager,
 		Config:           config,
 		QueryNodeRPCUrl:  config.PocketNode.QueryNodeRPCUrl,
@@ -285,13 +392,31 @@ func runHAMiner(cmd *cobra.Command, _ []string) (err error) {
 		return fmt.Errorf("failed to start supplier worker: %w", err)
 	}
 	defer func() {
-		if closeErr := supplierWorker.Close(); closeErr != nil {
-			logger.Error().Err(closeErr).Msg("failed to close supplier worker")
+		// Bounded, because Close() now quiesces: it waits for every in-flight
+		// broadcast before the transaction connection goes. That wait is what
+		// keeps a claim from being cut off mid-flight, and it is also what
+		// makes an unbounded shutdown dangerous -- if the supervisor's SIGKILL
+		// arrives first, the broadcast Close() was protecting is lost anyway.
+		// The relayer already bounds its own shutdown; this mirrors it.
+		done := make(chan error, 1)
+		go logging.RecoverGoRoutine(logger, "miner_shutdown", func(context.Context) {
+			done <- supplierWorker.Close()
+		})(context.Background())
+
+		select {
+		case closeErr := <-done:
+			if closeErr != nil {
+				logger.Error().Err(closeErr).Msg("failed to close supplier worker")
+			}
+		case <-time.After(minerShutdownTimeout):
+			logger.Error().
+				Dur("timeout", minerShutdownTimeout).
+				Msg("supplier worker did not shut down in time; in-flight transactions may be lost")
 		}
 	}()
 
 	logger.Info().
-		Int("suppliers", len(suppliers)).
+		Int("suppliers", len(keyManager.ListSuppliers())).
 		Msg("SupplierWorker started - claiming suppliers")
 
 	// Create leader controller for leader-only resources (cache refresh + block publishing)
@@ -310,65 +435,65 @@ func runHAMiner(cmd *cobra.Command, _ []string) (err error) {
 		QueryNodeGRPCUrl: config.PocketNode.QueryNodeGRPCUrl,
 		GRPCInsecure:     config.PocketNode.GRPCInsecure,
 		ChainID:          config.GetChainID(), // Get from config (defaults to "pocket" if not set)
+
+		// Share the worker's supplier cache instead of letting the leader build
+		// a second one in this same process. Safe to read here: the worker's
+		// Start() above already constructed it, and the worker outlives every
+		// leadership change, so the controller borrows and never closes it.
+		SharedSupplierCache: supplierWorker.GetSupplierCache(),
 	})
 
-	// Register leader election callbacks
-	// On elected: Start all leader-only resources
-	globalLeader.OnElected(func(ctx context.Context) {
-		logger.Info().Msg("starting leader controller (became leader)")
-		if err = leaderController.Start(ctx); err != nil {
-			logger.Fatal().Err(err).Msg("failed to start leader controller - exiting process")
-		}
-	})
+	// Register leader election callbacks. They run in goroutines, so failures
+	// are propagated to the main goroutine via this channel instead of
+	// logger.Fatal (os.Exit would skip every deferred cleanup).
+	leaderErrCh := make(chan error, 1)
+	registerLeaderCallbacks(logger, globalLeader, leaderController, leaderErrCh)
 
-	// On lost: Clean up all resources
-	globalLeader.OnLost(func(ctx context.Context) {
-		logger.Info().Msg("stopping leader controller (lost leadership)")
-		if err = leaderController.Close(); err != nil {
-			logger.Fatal().Err(err).Msg("failed to close leader controller")
-		}
-	})
-
-	// If already a leader at startup, start immediately
-	if globalLeader.IsLeader() {
-		logger.Info().Msg("starting leader controller (already leader at startup)")
-		if err = leaderController.Start(ctx); err != nil {
-			return fmt.Errorf("failed to start leader controller: %w", err)
-		}
-	} else {
-		logger.Info().Msg("leader controller in standby mode (not leader)")
+	// The election loop starts HERE, once its callbacks exist, and the callback
+	// is the ONLY thing that starts the leader controller.
+	//
+	// Before this, Start ran ~80 lines earlier and main also started the
+	// controller behind an IsLeader() check. Acquiring the lock in that window
+	// meant the elector's goroutine and main both called
+	// LeaderController.Start; the loser got "leader controller already active",
+	// which the error channel added in this stack then reported as a leader
+	// failure -- shutting the miner down right after a successful start.
+	// invokeOnElectedCallbacks fires on the FIRST acquisition too, so nothing
+	// is lost by dropping the manual branch: one owner, no window.
+	if err = globalLeader.Start(ctx); err != nil {
+		return fmt.Errorf("failed to start global leader elector: %w", err)
 	}
+	defer func() { globalLeader.Close() }()
+	logger.Info().Msg("leader election started; the controller starts on election")
 	defer func() {
-		if err = leaderController.Close(); err != nil {
-			logger.Error().Err(err).Msg("failed to close leader controller")
+		// closeErr, NOT err: see the Redis defer above — assigning to the
+		// named result here discarded the error this function returns.
+		if closeErr := leaderController.Close(); closeErr != nil {
+			logger.Error().Err(closeErr).Msg("failed to close leader controller")
 		}
 	}()
 
 	logger.Info().
 		Str("consumer_name", config.Redis.ConsumerName).
-		Bool("hot_reload", config.HotReloadEnabled).
+		Bool("hot_reload", config.Keys.HotReloadEnabled).
 		Msg("HA Miner started")
 
 	// Set up signal handling
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
-	// Wait for a shutdown signal
-	<-sigCh
-	logger.Info().Msg("shutdown signal received, stopping HA Miner...")
+	// Wait for a shutdown signal or a leader-controller failure
+	var runErr error
+	select {
+	case <-sigCh:
+		logger.Info().Msg("shutdown signal received, stopping HA Miner...")
+	case runErr = <-leaderErrCh:
+		logger.Error().Err(runErr).Msg("leader controller failed, stopping HA Miner so a standby can take over...")
+	}
 
-	// Release global leader lock BEFORE draining supplier claims.
-	// The leaderLoop's ctx.Done handler atomically releases the lock
-	// and wg.Wait() ensures the goroutine has exited. Closing first
-	// prevents a split-brain window where supplier claims are released
-	// (another instance claims them) while this instance still holds
-	// the global leader lock (block publisher, stalling claim/proof).
-	logger.Info().Msg("releasing global leadership before supplier drain")
-	globalLeader.Close()
-
-	// Deferring handles graceful shutdown of remaining resources
+	// Deferring handles graceful shutdown
 	logger.Info().Msg("HA Miner stopped")
-	return nil
+	return runErr
 }
 
 // loadMinerConfig loads the miner configuration from a file or flags.
@@ -378,47 +503,26 @@ func loadMinerConfig(cmd *cobra.Command) (*miner.Config, error) {
 	var config *miner.Config
 	var err error
 
-	if configPath != "" {
-		// Load from a config file
-		config, err = miner.LoadConfig(configPath)
-		if err != nil {
-			return nil, fmt.Errorf("failed to load config: %w", err)
-		}
-	} else {
-		// Build config from flags (legacy mode)
-		config = miner.DefaultConfig()
-
-		// Key sources
-		keysFile, _ := cmd.Flags().GetString(flagKeysFile)
-		keysDir, _ := cmd.Flags().GetString(flagKeysDir)
-		keyringBackend, _ := cmd.Flags().GetString(flagKeyringBackend)
-		keyringDir, _ := cmd.Flags().GetString(flagKeyringDir)
-
-		config.Keys.KeysFile = keysFile
-		config.Keys.KeysDir = keysDir
-		if keyringBackend != "" {
-			if keyringDir == "" {
-				keyringDir = os.ExpandEnv("$HOME/.pocket")
-			}
-			config.Keys.Keyring = &configpkg.KeyringConfig{
-				Backend: keyringBackend,
-				Dir:     keyringDir,
-			}
-		}
-
-		// Validate key sources
-		if !config.HasKeySource() {
-			return nil, fmt.Errorf("at least one key source must be specified: --config, --keys-file, --keys-dir, or --keyring-backend")
-		}
+	if configPath == "" {
+		// The flags-only legacy mode duplicated the whole config assembly and
+		// had zero tracked invocations; a config file is the one way to start.
+		return nil, fmt.Errorf("--config is required")
+	}
+	config, err = miner.LoadConfig(configPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load config: %w", err)
 	}
 
 	// Apply flag overrides (flags take precedence over config file)
 	applyFlagOverrides(cmd, config)
 
-	// Generate consumer name from hostname if not set
-	if config.Redis.ConsumerName == "" {
-		hostname, _ := os.Hostname()
-		config.Redis.ConsumerName = fmt.Sprintf("miner-%s-%d", hostname, os.Getpid())
+	// LoadConfig already ran the name through miner.UniqueConsumerName, so it
+	// is re-derived ONLY when the flag overrode it. Doing it unconditionally
+	// appends the host and pid twice ("relay-a-host-1234-host-1234"), which is
+	// still unique but makes the schema's "-<hostname>-<pid> is appended" a
+	// lie and the name in XINFO CONSUMERS unreadable.
+	if cmd.Flags().Changed(flagConsumerName) {
+		config.Redis.ConsumerName = miner.UniqueConsumerName(config.Redis.ConsumerName)
 	}
 
 	return config, nil
@@ -433,57 +537,13 @@ func applyFlagOverrides(cmd *cobra.Command, config *miner.Config) {
 		config.Redis.ConsumerName, _ = cmd.Flags().GetString(flagConsumerName)
 	}
 	if cmd.Flags().Changed(flagHotReload) {
-		config.HotReloadEnabled, _ = cmd.Flags().GetBool(flagHotReload)
+		// The flag drives the same field the config file does; there is one
+		// hot-reload switch per process, not one per surface.
+		config.Keys.HotReloadEnabled, _ = cmd.Flags().GetBool(flagHotReload)
 	}
 	if cmd.Flags().Changed(flagSessionTTL) {
 		config.SessionTTL, _ = cmd.Flags().GetDuration(flagSessionTTL)
 	}
-}
-
-// createKeyProviders creates key providers based on the config.
-func createKeyProviders(logger logging.Logger, config *miner.Config) ([]keys.KeyProvider, error) {
-	var providers []keys.KeyProvider
-
-	if config.Keys.KeysFile != "" {
-		provider, err := keys.NewSupplierKeysFileProvider(logger, config.Keys.KeysFile)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create supplier keys file provider: %w", err)
-		}
-		providers = append(providers, provider)
-		logger.Info().Str("file", config.Keys.KeysFile).Msg("added supplier keys file provider")
-	}
-
-	if config.Keys.KeysDir != "" {
-		provider, err := keys.NewFileKeyProvider(logger, config.Keys.KeysDir)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create file key provider: %w", err)
-		}
-		providers = append(providers, provider)
-		logger.Info().Str("dir", config.Keys.KeysDir).Msg("added file key provider")
-	}
-
-	if config.Keys.Keyring != nil && config.Keys.Keyring.Backend != "" {
-		keyringDir := config.Keys.Keyring.Dir
-		if keyringDir == "" {
-			keyringDir = os.ExpandEnv("$HOME/.pocket")
-		}
-		provider, err := keys.NewKeyringProvider(logger, keys.KeyringProviderConfig{
-			Backend:  config.Keys.Keyring.Backend,
-			Dir:      keyringDir,
-			AppName:  config.Keys.Keyring.AppName,
-			KeyNames: config.Keys.Keyring.KeyNames,
-		})
-		if err != nil {
-			return nil, fmt.Errorf("failed to create keyring provider: %w", err)
-		}
-		providers = append(providers, provider)
-		logger.Info().
-			Str("backend", config.Keys.Keyring.Backend).
-			Str("dir", keyringDir).
-			Msg("added keyring provider")
-	}
-
-	return providers, nil
 }
 
 // validateMinerConfig performs upfront validation of configuration
@@ -505,10 +565,11 @@ func validateMinerConfig(config *miner.Config) error {
 		return fmt.Errorf("pocket_node.query_node_grpc_url is required")
 	}
 
-	// Validate key sources
-	if !config.HasKeySource() {
-		return fmt.Errorf("at least one key source must be configured (keys_file, keys_dir, or keyring)")
-	}
+	// Key sources are NOT validated here. miner.LoadConfig calls
+	// Config.Validate, which enforces exactly one source -- this function does
+	// not, so a caller that builds a miner.Config in memory and calls only this
+	// gets no key-source check at all. Every caller goes through LoadConfig
+	// today; anyone adding one that does not must call Config.Validate itself.
 
 	// Note: SessionTTL = 0 means use CacheTTL (default 2h), so it doesn't need validation
 

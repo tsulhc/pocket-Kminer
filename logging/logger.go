@@ -1,6 +1,7 @@
 package logging
 
 import (
+	"fmt"
 	"io"
 	"os"
 	"strings"
@@ -29,9 +30,9 @@ type Config struct {
 	// Default: true
 	Async bool `yaml:"async"`
 
-	// AsyncBufferSize is the size of the async ring buffer (in bytes).
-	// Larger buffer = more buffering capacity but more memory usage.
-	// Default: 100000 (100KB)
+	// AsyncBufferSize is the number of log messages the async ring buffer holds.
+	// A larger buffer drops fewer messages under a burst and uses more memory.
+	// Default: 100000 messages
 	AsyncBufferSize int `yaml:"async_buffer_size"`
 
 	// AsyncPollInterval is how often the async writer polls for messages (in milliseconds).
@@ -68,13 +69,52 @@ func DefaultConfig() Config {
 		Level:              "info",
 		Format:             "json",
 		Async:              true,   // Enable async by default for performance
-		AsyncBufferSize:    100000, // 100KB buffer
+		AsyncBufferSize:    100000, // 100000 messages buffer
 		AsyncPollInterval:  100,    // 100ms poll interval - balances latency vs CPU
 		Sampling:           false,  // Disabled by default, enable for extreme throughput
 		SamplingInitial:    100,    // First 100 messages always logged
 		SamplingThereafter: 10,     // Then 1 in 10
 		EnableCaller:       false,  // Disabled by default for production performance
 	}
+}
+
+// Validate rejects configuration values the logger would otherwise silence:
+// parseLevel falls back to Info on anything it does not recognise, so a
+// typo'd level ("warning", "trace") must fail at config load, not run the
+// process at the wrong verbosity without a word.
+func (c Config) Validate() error {
+	switch level := strings.ToLower(c.Level); level {
+	case "", "debug", "info", "warn", "error":
+	default:
+		// Until this validation existed an unknown level fell back to info in
+		// silence, so a config carrying one of these BOOTED -- just not at the
+		// verbosity it asked for. Now it refuses to start, which is the point,
+		// but an operator hitting that on upgrade deserves the replacement
+		// rather than a list to guess from at 3am.
+		if nearest, ok := map[string]string{
+			"trace":    "debug",
+			"warning":  "warn",
+			"fatal":    "error",
+			"panic":    "error",
+			"critical": "error",
+			"disabled": "error",
+			"off":      "error",
+			"none":     "error",
+		}[level]; ok {
+			return fmt.Errorf(
+				"logging.level %q is not one of debug|info|warn|error -- use %q. "+
+					"Earlier versions accepted this and silently logged at info instead",
+				c.Level, nearest,
+			)
+		}
+		return fmt.Errorf("logging.level %q is not one of debug|info|warn|error", c.Level)
+	}
+	switch strings.ToLower(c.Format) {
+	case "", "json", "text":
+	default:
+		return fmt.Errorf("logging.format %q is not one of json|text", c.Format)
+	}
+	return nil
 }
 
 // NewLoggerFromConfig creates a high-performance logger from configuration.
@@ -126,7 +166,7 @@ func NewLoggerFromConfig(config Config) Logger {
 	if config.Async {
 		bufferSize := config.AsyncBufferSize
 		if bufferSize <= 0 {
-			bufferSize = 100000 // Default 100KB
+			bufferSize = 100000 // Default 100000 messages
 		}
 
 		pollInterval := config.AsyncPollInterval
@@ -139,8 +179,11 @@ func NewLoggerFromConfig(config Config) Logger {
 		output = diode.NewWriter(output, bufferSize, time.Duration(pollInterval)*time.Millisecond, func(missed int) {
 			// This callback is rarely hit in practice, only when buffer overflows
 			// We can't use the logger here (recursion), so write directly to stderr
+			// AND count the loss where Prometheus can see it — stderr alone
+			// makes dropped logs invisible to alerting.
 			if missed > 0 {
-				_, _ = os.Stderr.WriteString("WARN: dropped log messages due to full buffer\n")
+				LogMessagesDroppedTotal.Add(float64(missed))
+				_, _ = os.Stderr.WriteString("WARN: dropped log messages due to full buffer\n") //nolint:errcheck // last-resort output: the logger cannot be used here (recursion) and the loss is ALREADY counted in LogMessagesDroppedTotal on the line above, so discarding this does not make it silent
 			}
 		})
 	}
@@ -196,19 +239,9 @@ func WithComponent(logger Logger, component string) Logger {
 	return logger.With().Str(FieldComponent, component).Logger()
 }
 
-// WithSupplier returns a child logger with the supplier field set.
-func WithSupplier(logger Logger, supplierAddr string) Logger {
-	return logger.With().Str(FieldSupplier, supplierAddr).Logger()
-}
-
 // WithSession returns a child logger with the session_id field set.
 func WithSession(logger Logger, sessionID string) Logger {
 	return logger.With().Str(FieldSessionID, sessionID).Logger()
-}
-
-// WithService returns a child logger with the service_id field set.
-func WithService(logger Logger, serviceID string) Logger {
-	return logger.With().Str(FieldServiceID, serviceID).Logger()
 }
 
 // ForComponent returns a logger configured for a specific component.
@@ -222,40 +255,6 @@ func ForSupplierComponent(logger Logger, component, supplierAddr string) Logger 
 	return logger.With().
 		Str(FieldComponent, component).
 		Str(FieldSupplier, supplierAddr).
-		Logger()
-}
-
-// ForServiceComponent returns a logger configured for a service-specific component.
-func ForServiceComponent(logger Logger, component, serviceID string) Logger {
-	return logger.With().
-		Str(FieldComponent, component).
-		Str(FieldServiceID, serviceID).
-		Logger()
-}
-
-// ForSessionOperation returns a logger configured for session-specific operations.
-func ForSessionOperation(logger Logger, sessionID string) Logger {
-	return WithSession(logger, sessionID)
-}
-
-// WithMinerID returns a logger with the miner_id field set.
-// This should be called early in miner startup to set the context for all logs.
-func WithMinerID(logger Logger, minerID string) Logger {
-	return logger.With().Str(FieldMinerID, minerID).Logger()
-}
-
-// WithReplica returns a logger with the replica role field set.
-// Use ReplicaLeader or ReplicaStandby constants.
-func WithReplica(logger Logger, role string) Logger {
-	return logger.With().Str(FieldReplica, role).Logger()
-}
-
-// ForMiner returns a logger configured with miner_id and replica role.
-// This is the preferred way to create the top-level miner logger.
-func ForMiner(logger Logger, minerID, replica string) Logger {
-	return logger.With().
-		Str(FieldMinerID, minerID).
-		Str(FieldReplica, replica).
 		Logger()
 }
 

@@ -5,22 +5,23 @@ package miner
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	sdkmath "cosmossdk.io/math"
-	"github.com/alicebob/miniredis/v2"
 	"github.com/alitto/pond/v2"
+	"github.com/cosmos/cosmos-sdk/crypto/keys/secp256k1"
 	cryptotypes "github.com/cosmos/cosmos-sdk/crypto/types"
 	cosmostypes "github.com/cosmos/cosmos-sdk/types"
+	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	"github.com/pokt-network/pocket-relay-miner/keys"
 	"github.com/pokt-network/pocket-relay-miner/logging"
-	redisutil "github.com/pokt-network/pocket-relay-miner/transport/redis"
 
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 	suppliertypes "github.com/pokt-network/poktroll/x/supplier/types"
@@ -33,8 +34,16 @@ type fakeKeyManager struct{ addrs []string }
 
 func (f *fakeKeyManager) ListSuppliers() []string              { return f.addrs }
 func (f *fakeKeyManager) OnKeyChange(_ keys.KeyChangeCallback) {}
-func (f *fakeKeyManager) GetSigner(string) (cryptotypes.PrivKey, error) {
-	return nil, fmt.Errorf("n/a")
+
+// GetSigner agrees with ListSuppliers: an address this fake holds resolves, and
+// anything else errors the way the real manager does for a key it does not have.
+// teardownCanFinishWork asks exactly this question.
+func (f *fakeKeyManager) GetSigner(operatorAddr string) (cryptotypes.PrivKey, error) {
+	if slices.Contains(f.addrs, operatorAddr) {
+		return secp256k1.GenPrivKey(), nil
+	}
+
+	return nil, fmt.Errorf("no key for %s", operatorAddr)
 }
 func (f *fakeKeyManager) HasKey(string) bool                       { return false }
 func (f *fakeKeyManager) AddKey(string, cryptotypes.PrivKey) error { return nil }
@@ -80,17 +89,10 @@ func (t *toggleableSupplierQueryClient) InvalidateSupplier(string) {}
 // After the fix, the periodic reconcile observes the stake transition and
 // pushes the supplier into the claimer.
 func TestSupplierManager_Reconcile_PicksUpStakedAfterStart(t *testing.T) {
-	mr, err := miniredis.Run()
-	require.NoError(t, err)
-	defer mr.Close()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	redisClient, err := redisutil.NewClient(ctx, redisutil.ClientConfig{
-		URL: fmt.Sprintf("redis://%s", mr.Addr()),
-	})
-	require.NoError(t, err)
-	defer func() { _ = redisClient.Close() }()
+	redisClient, _ := newTestRedis(t)
 
 	supplierAddr := "pokt1supplier_under_test"
 	km := &fakeKeyManager{addrs: []string{supplierAddr}}
@@ -163,17 +165,10 @@ func TestSupplierManager_Reconcile_PicksUpStakedAfterStart(t *testing.T) {
 //  5. Session transitions to a terminal state (proved).
 //  6. reconcile now removes the supplier — the pipeline can be torn down.
 func TestSupplierManager_Reconcile_DefersRemovalWhilePendingSessions(t *testing.T) {
-	mr, err := miniredis.Run()
-	require.NoError(t, err)
-	defer mr.Close()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	redisClient, err := redisutil.NewClient(ctx, redisutil.ClientConfig{
-		URL: fmt.Sprintf("redis://%s", mr.Addr()),
-	})
-	require.NoError(t, err)
-	defer func() { _ = redisClient.Close() }()
+	redisClient, _ := newTestRedis(t)
 
 	supplierAddr := "pokt1supplier_pending_drain"
 	km := &fakeKeyManager{addrs: []string{supplierAddr}}
@@ -212,7 +207,6 @@ func TestSupplierManager_Reconcile_DefersRemovalWhilePendingSessions(t *testing.
 		logging.NewLoggerFromConfig(logging.DefaultConfig()),
 		redisClient,
 		SessionStoreConfig{
-			KeyPrefix:       redisClient.KB().MinerSessionsPrefix(),
 			SupplierAddress: supplierAddr,
 			SessionTTL:      time.Hour,
 		},
@@ -244,15 +238,182 @@ func TestSupplierManager_Reconcile_DefersRemovalWhilePendingSessions(t *testing.
 
 	mgr.reconcile(ctx)
 	require.NotContains(t, claimedSuppliersSnapshot(mgr.claimer), supplierAddr,
-		"once every session is terminal, the unstaked supplier must be dropped so the pipeline can be torn down")
+		"once every session is terminal, the unstaked supplier must be dropped from the configured list")
 }
 
-// claimedSuppliersSnapshot returns a copy of the claimer's configured
-// supplier list. Reads allSuppliers under its mutex.
+// TestSupplierManager_Reconcile_ReleasesLeaseOnceUnconfigured proves the step the
+// test above does NOT cover, and which nothing covered before.
+//
+// Dropping out of the configured list only rewrites a slice. Until
+// releaseUnconfigured existed, nothing compared that slice against the set of
+// suppliers this instance actually holds a LEASE on, so the lease was renewed
+// forever and the supplier's pipeline — stream consumer, SMST manager, lifecycle
+// manager — kept running for an address that is no longer staked.
+//
+// The distinction is exact and was the reason the older assertion proved nothing:
+// claimedSuppliersSnapshot reads allSuppliers (what we are CONFIGURED to mine),
+// while ClaimedSuppliers reads claimed (what we have LEASED). This test asserts on
+// the second, plus the Redis claim key, which is the state another miner reads to
+// decide whether the supplier is free.
+func TestSupplierManager_Reconcile_ReleasesLeaseOnceUnconfigured(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	redisClient, _ := newTestRedis(t)
+
+	supplierAddr := "pokt1supplier_release_on_drop"
+	km := &fakeKeyManager{addrs: []string{supplierAddr}}
+	qc := &toggleableSupplierQueryClient{addr: supplierAddr}
+	qc.staked.Store(true)
+
+	registry := NewSupplierRegistry(
+		logging.NewLoggerFromConfig(logging.DefaultConfig()),
+		redisClient,
+		SupplierRegistryConfig{},
+	)
+
+	pool := pond.NewPool(4)
+	defer pool.StopAndWait()
+
+	mgr := NewSupplierManager(
+		logging.NewLoggerFromConfig(logging.DefaultConfig()),
+		km,
+		registry,
+		SupplierManagerConfig{
+			RedisClient:               redisClient,
+			MinerID:                   "test-miner",
+			SupplierQueryClient:       qc,
+			WorkerPool:                pool,
+			SessionTTL:                time.Hour,
+			SupplierReconcileInterval: 0,
+		},
+	)
+
+	require.NoError(t, mgr.Start(ctx))
+	defer func() { _ = mgr.Close() }()
+
+	mgr.reconcile(ctx)
+	require.Contains(t, claimedSuppliersSnapshot(mgr.claimer), supplierAddr,
+		"premise: while staked, the supplier is in the configured list")
+
+	// Establish the LEASE directly. mgr.Start does attempt an initial claim, but in
+	// this fixture the claim callback cannot complete, so the supplier ends up
+	// configured and not leased — which would make every assertion below vacuous.
+	// That failed claim is released, and its drain must end first: until then the
+	// supplier is draining, and nothing in production claims it again.
+	mgr.waitDrains()
+	// Seeding claimed + the Redis key is the precondition the production rebalance
+	// would have produced, stated explicitly so the test cannot silently test nothing.
+	claimKey := redisClient.KB().MinerClaimKey(supplierAddr)
+	require.NoError(t, redisClient.Set(ctx, claimKey, mgr.claimer.instanceID, time.Hour).Err())
+	mgr.claimer.claimedMu.Lock()
+	mgr.claimer.claimed[supplierAddr] = time.Now()
+	mgr.claimer.claimedMu.Unlock()
+
+	require.Contains(t, mgr.claimer.ClaimedSuppliers(), supplierAddr,
+		"premise: the lease is held before the supplier is dropped")
+
+	// The supplier unstakes and has no pending work, so the filter drops it.
+	qc.staked.Store(false)
+	mgr.reconcile(ctx)
+
+	require.NotContains(t, mgr.claimer.ClaimedSuppliers(), supplierAddr,
+		"a supplier that is no longer staked or configured must have its LEASE released, not merely "+
+			"be dropped from the configured list: the lease is what keeps its pipeline alive and what "+
+			"stops another miner from taking over")
+
+	// The key goes when the drain the release started ends.
+	mgr.waitDrains()
+	owner, err := redisClient.Get(ctx, claimKey).Result()
+	require.ErrorIs(t, err, redis.Nil,
+		"the Redis claim key must be deleted so another miner can claim the supplier; it currently reads %q", owner)
+}
+
+// claimedSuppliersSnapshot returns a copy of the claimer's CONFIGURED
+// supplier list (allSuppliers) — NOT the leased set. Reads allSuppliers under
+// its mutex.
+//
+// The difference matters: a supplier can be dropped from the configured list
+// while this instance still holds its lease and runs its whole pipeline. Assert
+// on SupplierClaimer.ClaimedSuppliers when the claim is about teardown.
 func claimedSuppliersSnapshot(c *SupplierClaimer) []string {
 	c.allSuppliersMu.Lock()
 	defer c.allSuppliersMu.Unlock()
 	out := make([]string, len(c.allSuppliers))
 	copy(out, c.allSuppliers)
 	return out
+}
+
+// TestSupplierManager_KeyRemoval_ReleasesTheLease covers the hot-reload path an
+// operator triggers by deleting a signing key.
+//
+// That path used to call removeSupplier directly, which tears the pipeline down
+// but never touches the LEASE. renewAllClaims iterates the leased set, so the
+// miner went on EXPIREing ha:miner:claim:{addr} forever for a supplier it no
+// longer had any state for -- and while that key kept being renewed, no other
+// instance could take the supplier over. The pipeline looked gone and the claim
+// looked alive.
+//
+// The assertion is on the Redis claim key, because that key is what another
+// miner reads to decide whether the supplier is free; the in-memory set is only
+// this process's opinion.
+func TestSupplierManager_KeyRemoval_ReleasesTheLease(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	redisClient, _ := newTestRedis(t)
+
+	supplierAddr := "pokt1supplier_key_removed"
+	km := &fakeKeyManager{addrs: []string{supplierAddr}}
+	qc := &toggleableSupplierQueryClient{addr: supplierAddr}
+	qc.staked.Store(true)
+
+	registry := NewSupplierRegistry(
+		logging.NewLoggerFromConfig(logging.DefaultConfig()),
+		redisClient,
+		SupplierRegistryConfig{},
+	)
+
+	pool := pond.NewPool(4)
+	defer pool.StopAndWait()
+
+	mgr := NewSupplierManager(
+		logging.NewLoggerFromConfig(logging.DefaultConfig()),
+		km,
+		registry,
+		SupplierManagerConfig{
+			RedisClient:               redisClient,
+			MinerID:                   "test-miner",
+			SupplierQueryClient:       qc,
+			WorkerPool:                pool,
+			SessionTTL:                time.Hour,
+			SupplierReconcileInterval: 0,
+		},
+	)
+
+	require.NoError(t, mgr.Start(ctx))
+	defer func() { _ = mgr.Close() }()
+
+	// Seed the lease this instance holds, which is the precondition the
+	// production rebalance would have produced -- once the drain of Start's
+	// failed initial claim is over, as it would be.
+	mgr.waitDrains()
+	claimKey := redisClient.KB().MinerClaimKey(supplierAddr)
+	require.NoError(t, redisClient.Set(ctx, claimKey, mgr.claimer.instanceID, time.Hour).Err())
+	mgr.claimer.claimedMu.Lock()
+	mgr.claimer.claimed[supplierAddr] = time.Now()
+	mgr.claimer.claimedMu.Unlock()
+	require.Contains(t, mgr.claimer.ClaimedSuppliers(), supplierAddr, "premise: the lease is held")
+
+	// The operator removes the signing key. The key goes when the drain the
+	// release started ends.
+	mgr.handleKeyChange(ctx, supplierAddr, false)
+	mgr.waitDrains()
+
+	owner, err := redisClient.Get(ctx, claimKey).Result()
+	require.ErrorIs(t, err, redis.Nil,
+		"removing the key must release the lease, not just tear the pipeline down: while the claim "+
+			"key survives, this miner keeps renewing it and no other instance can take the supplier "+
+			"over. It currently reads %q", owner)
+	require.NotContains(t, mgr.claimer.ClaimedSuppliers(), supplierAddr)
 }

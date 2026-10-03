@@ -1,0 +1,16 @@
+[package]
+name = "pocket-relay-signing"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "bLSAG ring signer for Pocket Network relays, verified against the Go oracle"
+
+[dependencies]
+k256 = { version = "0.14", default-features = false, features = ["arithmetic", "std"] }
+# FIPS-202 SHA-3. This crate exposes both `Sha3_256`/`Sha3_512` (FIPS-202) and
+# `Keccak256`/`Keccak512` (the original, pre-standardisation padding). This
+# scheme uses the FIPS-202 ones. They are NOT interchangeable -- see lib.rs.
+sha3 = "0.12.0"
+getrandom = "0.4.3"
+thiserror = "2.0.18"
+hex = "0.4.3"

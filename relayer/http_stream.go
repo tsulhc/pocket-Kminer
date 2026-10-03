@@ -6,7 +6,6 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/pokt-network/pocket-relay-miner/logging"
@@ -182,7 +181,7 @@ func (h *StreamingResponseHandler) HandleStreamingResponse(
 	// Check if writer supports flushing (required for streaming)
 	flusher, canFlush := w.(http.Flusher)
 	if !canFlush {
-		h.logger.Warn().Msg("ResponseWriter does not support flushing, streaming may have high latency")
+		h.logger.Debug().Msg("ResponseWriter does not support flushing, streaming may have high latency")
 	}
 
 	// Buffer to collect full response for relay publishing
@@ -211,7 +210,7 @@ func (h *StreamingResponseHandler) HandleStreamingResponse(
 			if batch.totalChunks > 0 {
 				size, err := h.flushBatch(batch, resp.StatusCode, w, flusher)
 				if err != nil {
-					h.logger.Error().Err(err).Msg("failed to flush final batch on context cancellation")
+					h.logger.Debug().Err(err).Msg("failed to flush final batch on context cancellation")
 				}
 				totalResponseSize += size
 			}
@@ -367,37 +366,6 @@ func (h *StreamingResponseHandler) signBatch(payload []byte, statusCode int) ([]
 		Msg("signed streaming batch")
 
 	return signedBatch, nil
-}
-
-// ScanStreamEvents is a bufio.SplitFunc that splits streaming data by the POKT stream delimiter.
-// This is used by clients to parse the signed relay response batches from the stream.
-//
-// Usage:
-//
-//	scanner := bufio.NewScanner(responseBody)
-//	scanner.Split(ScanStreamEvents)
-//	for scanner.Scan() {
-//	    signedBatch := scanner.Bytes()
-//	    // Unmarshal as RelayResponse...
-//	}
-func ScanStreamEvents(data []byte, atEOF bool) (advance int, token []byte, err error) {
-	if atEOF && len(data) == 0 {
-		return 0, nil, nil
-	}
-
-	// Look for the POKT_STREAM delimiter
-	if i := strings.Index(string(data), streamDelimiter); i >= 0 {
-		// Return chunk without the delimiter
-		return i + len(streamDelimiter), data[0:i], nil
-	}
-
-	// If we're at EOF, return whatever we have
-	if atEOF {
-		return len(data), data, nil
-	}
-
-	// Request more data
-	return 0, nil, nil
 }
 
 // handleStreamingResponseWithSigning is a helper method on ProxyServer that uses

@@ -10,6 +10,13 @@ import (
 	redisutil "github.com/pokt-network/pocket-relay-miner/transport/redis"
 )
 
+// subscribeReadyTimeout bounds how long SubscribeToInvalidations waits for the
+// initial SUBSCRIBE to be confirmed by the server. Redis pub/sub has no
+// replay: an invalidation published before the subscription is registered is
+// silently dropped, so callers must not proceed (and start populating L1)
+// until the subscription is live. If Redis is unreachable at startup the wait
+// gives up after this timeout and the reconnection loop keeps retrying in the
+// background — the pre-existing degraded-boot behavior is preserved.
 var subscribeReadyTimeout = 10 * time.Second
 
 // SubscribeToInvalidations subscribes to cache invalidation events for a specific cache type.
@@ -41,11 +48,10 @@ func SubscribeToInvalidations(
 		Str("channel", channel).
 		Msg("starting cache invalidation subscription with reconnection")
 
+	// Closed once, when the first SUBSCRIBE is confirmed by the server.
 	ready := make(chan struct{})
 	var readyOnce sync.Once
-	signalReady := func() {
-		readyOnce.Do(func() { close(ready) })
-	}
+	signalReady := func() { readyOnce.Do(func() { close(ready) }) }
 
 	// Spawn goroutine with reconnection handling
 	go func() {
@@ -65,21 +71,21 @@ func SubscribeToInvalidations(
 		reconnectLoop.Run(ctx)
 	}()
 
-	timer := time.NewTimer(subscribeReadyTimeout)
-	defer timer.Stop()
-
+	// Do not return before the subscription is registered on the server:
+	// callers start serving (and populating L1) as soon as Start() returns, and
+	// an invalidation published before SUBSCRIBE lands is dropped forever.
 	select {
 	case <-ready:
-		return nil
 	case <-ctx.Done():
 		return ctx.Err()
-	case <-timer.C:
+	case <-time.After(subscribeReadyTimeout):
 		logger.Warn().
 			Str(logging.FieldCacheType, cacheType).
 			Dur("waited", subscribeReadyTimeout).
 			Msg("invalidation subscription not confirmed yet; reconnection loop continues in background")
-		return nil
 	}
+
+	return nil
 }
 
 // runPubSubLoop runs the pub/sub listener until disconnect or error.

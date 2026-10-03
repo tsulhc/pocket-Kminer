@@ -1,5 +1,5 @@
-.PHONY: build test clean install help docker-build docker-push build-backend proto-backend \
-	tilt-up-docker tilt-down-docker tilt-up-k8s tilt-down-k8s
+.PHONY: build test clean install help docker-build docker-push build-backend proto-backend proto-transport \
+	tilt-up-k8s tilt-down-k8s
 
 # Binary name
 BINARY_NAME=pocket-relay-miner
@@ -49,32 +49,19 @@ install: ## Install the binary to $GOPATH/bin
 	@echo "Install complete"
 
 test: ## Run tests (PKG=package_name for specific package, VERBOSE=1 for verbose output)
-	@echo "Running tests..."
-	@if [ -n "$(PKG)" ]; then \
-		if [ "$(PKG)" = "cache" ]; then \
-			echo "Running cache tests sequentially (143 tests with shared miniredis)..."; \
-			go test $(if $(VERBOSE),-v) -tags test -p 1 -parallel 1 ./$(PKG)/...; \
-		else \
-			go test $(if $(VERBOSE),-v) -tags test -p 4 -parallel 4 ./$(PKG)/...; \
-		fi; \
-	else \
-		go test $(if $(VERBOSE),-v) -tags test -p 4 -parallel 4 ./...; \
-	fi
+	@./scripts/gates/tests.sh
 
 test_miner: ## Run miner tests exclusively with race detection (Rule #1: no flakes, no races, no mocks)
-	@echo "Running miner tests with race detection..."
-	@echo "Rule #1: No flaky tests, no race conditions, no timeout weird tests, no mocks"
-	@go test -v -tags test -race -count=1 -p 1 -parallel 1 ./miner/...
+	@PKG=miner ./scripts/gates/race.sh
+
+race: ## Run the whole tree under the race detector (Rule #1; PKG=package to narrow)
+	@./scripts/gates/race.sh
+
+gate: ## Run the quality gates (LEVEL=1 static, 2 +tests/race/coverage, 3 +live)
+	@./scripts/gates/all.sh --level $(or $(LEVEL),2)
 
 test-coverage: ## Run tests with coverage (use PKG=package for specific package)
-	@echo "Running tests with coverage..."
-ifdef PKG
-	@go test -v -tags test -p 4 -parallel 4 -coverprofile=coverage.out ./$(PKG)/...
-else
-	@go test -v -tags test -p 4 -parallel 4 -coverprofile=coverage.out ./...
-endif
-	@go tool cover -html=coverage.out -o coverage.html
-	@echo "Coverage report generated: coverage.html"
+	@COVERAGE_HTML=1 ./scripts/gates/coverage.sh
 
 clean: ## Clean build artifacts
 	@echo "Cleaning build artifacts..."
@@ -99,12 +86,33 @@ lint: ## Run golangci-lint
 	@golangci-lint run
 	@cd $(BACKEND_DIR) && golangci-lint run
 
-install-hooks: ## Install git pre-commit hooks
+lint-blank: ## Report discarded errors (`_ = f()`); informational, never fails the build
+	@echo "Reporting discarded errors..."
+	@golangci-lint run --config .golangci-blank.yml --issues-exit-code=0
+	@cd $(BACKEND_DIR) && golangci-lint run --config ../../.golangci-blank.yml --issues-exit-code=0
+
+check-tracked-files: ## Verify no local-only files (planning docs, IDE config, secrets) are tracked
+	@./scripts/check-tracked-files.sh
+
+install-hooks: ## Point git at the versioned hooks in scripts/hooks/
 	@echo "Installing git hooks..."
-	@ln -sf ../../scripts/pre-commit-hook.sh .git/hooks/pre-commit
-	@chmod +x .git/hooks/pre-commit
-	@echo "Pre-commit hook installed successfully"
-	@echo "The hook will run 'make fmt' and 'make lint' before each commit"
+	@chmod +x scripts/hooks/*
+	@git config core.hooksPath scripts/hooks
+	@# The pre-hooksPath layout symlinked .git/hooks/pre-commit at a script this
+	@# repo no longer has. core.hooksPath makes git ignore .git/hooks entirely, so
+	@# the stale link is harmless HERE -- but a checkout that never re-runs this
+	@# target keeps it, and git skips an unexecutable hook in SILENCE: every commit
+	@# then passes with zero checks and no message. Remove it while we are here.
+	@if [ -L .git/hooks/pre-commit ] && [ ! -e .git/hooks/pre-commit ]; then \
+		rm -f .git/hooks/pre-commit; \
+		echo "removed a dangling .git/hooks/pre-commit left by the old layout"; \
+	fi
+	@echo "core.hooksPath -> scripts/hooks"
+	@echo "  pre-commit: gofmt, build, vet, tracked files, lint, gate self-tests, unreachable functions."
+	@echo "  pre-push:   level 2 -- suite, race detector, coverage. Minutes, not seconds."
+	@echo "They report problems rather than fixing them; bypass once with --no-verify."
+	@echo "NOTE: hooks now live IN THE REPO. A hook added later reaches you with a pull,"
+	@echo "      instead of needing a new symlink per hook under .git/hooks (not versioned)."
 
 docker-build: ## Build Docker image (override with DOCKER_IMAGE env var)
 	@echo "Building Docker image: $(DOCKER_IMAGE)..."
@@ -121,6 +129,14 @@ proto-backend: ## Generate protobuf code for backend server
 	@cd $(BACKEND_DIR) && protoc --go_out=. --go_opt=paths=source_relative --go-grpc_out=. --go-grpc_opt=paths=source_relative pb/demo.proto
 	@echo "Protobuf generation complete"
 
+# The descriptor keeps the file name pocket/ha/mined_relay.proto and the go_package it was
+# first generated with, so an unchanged .proto regenerates the committed file byte for byte.
+proto-transport: ## Regenerate transport/mined_relay.pb.go from proto/pocket/ha/mined_relay.proto
+	@tmp=$$(mktemp -d) && gogo=$$(go list -m -f '{{.Dir}}' github.com/cosmos/gogoproto) && \
+		protoc -I proto -I $$gogo -I $$gogo/protobuf --gocosmos_out=paths=source_relative:$$tmp proto/pocket/ha/mined_relay.proto && \
+		sed 's/^package ha$$/package transport/' $$tmp/pocket/ha/mined_relay.pb.go | goimports > transport/mined_relay.pb.go; \
+		status=$$?; rm -rf $$tmp; exit $$status
+
 build-backend: proto-backend ## Build the backend test server
 	@echo "Building backend test server..."
 	@cd $(BACKEND_DIR) && go mod tidy && go build -o backend main.go
@@ -129,16 +145,9 @@ build-backend: proto-backend ## Build the backend test server
 # =============================================================================
 # Tilt Development Environments
 # =============================================================================
-# Pass additional tilt args via ARGS, e.g.: make tilt-up-docker ARGS="--stream"
+# Pass additional tilt args via ARGS, e.g.: make tilt-up-k8s ARGS="--stream"
 
-tilt-up-docker: ## Start Docker Compose dev environment with Tilt
-	@echo "Starting Docker Compose Tilt environment..."
-	tilt up -f tilt/docker/Tiltfile $(ARGS)
 
-tilt-down-docker: ## Stop Docker Compose dev environment
-	@echo "Stopping Docker Compose Tilt environment..."
-	-tilt down -f tilt/docker/Tiltfile
-	cd tilt/docker && docker-compose down $(ARGS)
 
 tilt-up-k8s: ## Start Kubernetes dev environment with Tilt
 	@echo "Starting Kubernetes Tilt environment..."

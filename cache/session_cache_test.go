@@ -75,7 +75,7 @@ func (s *stubBlockClient) LastBlock(_ context.Context) client.Block {
 // frozen for the process lifetime — never aged out by any invalidation path,
 // which could mask an L2/L3 correction for the same height key. The fix ages L1
 // entries out after sessionCacheL1TTL so GetSession falls through to L2/L3. This
-// test drives that change against the REAL session cache with miniredis.
+// test drives that change against the REAL session cache on a real Redis.
 func TestSessionCache_L1RefreshesAfterTTL(t *testing.T) {
 	const (
 		appAddr   = "pokt1app"
@@ -122,7 +122,7 @@ func TestSessionCache_L1RefreshesAfterTTL(t *testing.T) {
 	// The chain now returns a different session for the same height, and the L2
 	// entry is removed so a stale-L1 re-read would have to fall through to L3.
 	sq.frozenID = "session-B"
-	key := sc.keys.Session(appAddr, serviceID, height)
+	key := redisClient.KB().SessionCacheKey(appAddr, serviceID, height)
 	require.NoError(t, redisClient.Del(ctx, key).Err())
 
 	// Within the (huge) L1 TTL: GetSession must still serve the cached session,

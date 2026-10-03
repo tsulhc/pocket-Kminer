@@ -15,43 +15,46 @@ import (
 //
 // This is the single source of truth for relay processing.
 type RelayPipeline struct {
-	validator      RelayValidator
-	relayMeter     *RelayMeter
-	responseSigner *ResponseSigner
-	relayProcessor RelayProcessor
-	logger         logging.Logger
-	metricRecorder *MetricRecorder
-	config         *Config
+	validator  RelayValidator
+	relayMeter *RelayMeter
+	logger     logging.Logger
 }
 
 // NewRelayPipeline creates a new relay processing pipeline.
 func NewRelayPipeline(
 	validator RelayValidator,
 	relayMeter *RelayMeter,
-	responseSigner *ResponseSigner,
-	relayProcessor RelayProcessor,
 	logger logging.Logger,
-	metricRecorder *MetricRecorder,
-	config *Config,
 ) *RelayPipeline {
 	return &RelayPipeline{
-		validator:      validator,
-		relayMeter:     relayMeter,
-		responseSigner: responseSigner,
-		relayProcessor: relayProcessor,
-		logger:         logging.ForComponent(logger, logging.ComponentRelayPipeline),
-		metricRecorder: metricRecorder,
-		config:         config,
+		validator:  validator,
+		relayMeter: relayMeter,
+		logger:     logging.ForComponent(logger, logging.ComponentRelayPipeline),
 	}
+}
+
+// Priced reports whether the pipeline knows what to charge.
+//
+// The gRPC and WebSocket transports reach the meter only through this pipeline,
+// so this is how their admission checks ask the same question the HTTP path asks
+// the meter directly.
+//
+// It is also the ONLY method here that tolerates a nil meter, and that is a
+// fact about the code rather than a courtesy: MeterRelay and AdmitRelay both
+// dereference p.relayMeter with no guard, and RelayMeter has 37 pointer-receiver methods of
+// which none checks m == nil -- admit takes m.mu.RLock() on its first executable
+// line. So a pipeline built without a meter does not serve relays free of
+// charge: it panics as soon as one reaches that path. A caller passing a nil
+// meter is declaring those paths unreachable for itself, which is exactly what
+// the session-expired and simulation fixtures state in their own comments.
+func (p *RelayPipeline) Priced() bool {
+	return p.relayMeter != nil && p.relayMeter.Priced()
 }
 
 // RelayContext contains all information needed to process a relay.
 type RelayContext struct {
 	// Request is the relay request from the gateway client
 	Request *servicev1.RelayRequest
-
-	// Response is the relay response from the backend (to be signed)
-	Response *servicev1.RelayResponse
 
 	// ServiceID is the service identifier
 	ServiceID string
@@ -62,47 +65,9 @@ type RelayContext struct {
 	// SessionID is the session identifier
 	SessionID string
 
-	// Payload is the backend response payload
-	Payload []byte
-
-	// ComputeUnits is the compute units for this relay
-	ComputeUnits uint64
-
 	// ArrivalBlockHeight is the block height when the relay arrived
 	ArrivalBlockHeight int64
 }
-
-// ProcessingResult contains the outcome of relay processing.
-type ProcessingResult struct {
-	// Allowed indicates if the relay passed validation and metering checks
-	Allowed bool
-
-	// ValidationErr contains validation error (signature/session)
-	ValidationErr error
-
-	// MeteringErr contains metering error (stake check)
-	MeteringErr error
-
-	// SigningErr contains response signing error
-	SigningErr error
-
-	// PublishingErr contains publishing error (Redis)
-	PublishingErr error
-
-	// SignedResponse is the signed relay response (if signing succeeded)
-	SignedResponse *servicev1.RelayResponse
-}
-
-// ProcessingMode determines the relay processing behavior.
-type ProcessingMode int
-
-const (
-	// ModeEager validates and meters BEFORE serving the relay
-	ModeEager ProcessingMode = iota
-
-	// ModeOptimistic serves the relay first, validates/meters in background
-	ModeOptimistic
-)
 
 // ValidateRelay validates the relay request (ring signature + session).
 func (p *RelayPipeline) ValidateRelay(
@@ -115,9 +80,20 @@ func (p *RelayPipeline) ValidateRelay(
 		Str("supplier", relayCtx.SupplierAddress).
 		Msg("validating relay request")
 
-	// Validate relay request (ring signature + session)
-	if err := p.validator.ValidateRelayRequest(ctx, relayCtx.Request); err != nil {
-		p.logger.Warn().
+	// Validate relay request (ring signature + session) at the height THIS relay
+	// arrived at.
+	//
+	// This handover is the whole of the defect it replaced: the arrival height
+	// was already in RelayContext and was never passed on, so the two transports
+	// that reach the validator ONLY through here -- WebSocket (websocket.go) and
+	// gRPC (relay_grpc_service.go) -- had it judge every relay against whatever
+	// the last HTTP relay left in a shared field, or against 0, which
+	// getTargetSessionBlockHeight reads as "session active". The grace period was
+	// therefore never evaluated on either transport: relays long past their grace
+	// window validated as live, were served, and were mined into claims the chain
+	// does not pay.
+	if err := p.validator.ValidateRelayRequest(ctx, relayCtx.Request, relayCtx.ArrivalBlockHeight); err != nil {
+		p.logger.Debug().
 			Err(err).
 			Str("service_id", relayCtx.ServiceID).
 			Str("session_id", relayCtx.SessionID).
@@ -133,8 +109,8 @@ func (p *RelayPipeline) ValidateRelay(
 	return nil
 }
 
-// MeterRelay checks and consumes relay stake (rate limiting).
-// Returns (allowed, error).
+// MeterRelay checks a relay against its budget without reserving or charging
+// anything. Returns (allowed, error).
 func (p *RelayPipeline) MeterRelay(
 	ctx context.Context,
 	relayCtx *RelayContext,
@@ -153,8 +129,8 @@ func (p *RelayPipeline) MeterRelay(
 	sessionStartHeight := sessionHeader.SessionStartBlockHeight
 	sessionEndHeight := sessionHeader.SessionEndBlockHeight
 
-	// Check and consume relay stake
-	allowed, err := p.relayMeter.CheckAndConsumeRelay(
+	// Check the relay stake, reserving and charging nothing
+	allowed, err := p.relayMeter.CheckBudget(
 		ctx,
 		sessionID,
 		appAddress,
@@ -164,18 +140,23 @@ func (p *RelayPipeline) MeterRelay(
 		sessionEndHeight,
 		relayCtx.ArrivalBlockHeight,
 	)
-
 	if err != nil {
-		p.logger.Warn().
+		p.logger.Debug().
 			Err(err).
 			Str("service_id", relayCtx.ServiceID).
 			Str("session_id", relayCtx.SessionID).
 			Msg("relay metering failed")
-		return false, fmt.Errorf("metering failed: %w", err)
+		// allowed is PROPAGATED, not flattened to false. The meter answers
+		// (false, err) when its own store is unreadable -- admission refuses --
+		// and (true, err) when a chain query it depends on blinked, which is
+		// served and left for the miner to arbitrate. Returning false here
+		// collapsed the two, so every WebSocket and gRPC caller treated a chain
+		// blip as a refusal: connections closed, subscriptions dropped.
+		return allowed, fmt.Errorf("metering failed: %w", err)
 	}
 
 	if !allowed {
-		p.logger.Warn().
+		p.logger.Debug().
 			Str("service_id", relayCtx.ServiceID).
 			Str("session_id", relayCtx.SessionID).
 			Msg("relay not allowed (stake limit exceeded)")
@@ -184,295 +165,59 @@ func (p *RelayPipeline) MeterRelay(
 	return allowed, nil
 }
 
-// SignResponse signs the relay response with the supplier's private key.
-func (p *RelayPipeline) SignResponse(
+// AdmitRelay reserves a relay's cost before it is served. The caller must
+// SettleRelay the reservation once the relay is served and ReleaseRelay it on
+// every other exit. Errors carry the same allowed as MeterRelay.
+func (p *RelayPipeline) AdmitRelay(
 	ctx context.Context,
 	relayCtx *RelayContext,
-) (*servicev1.RelayResponse, error) {
-	p.logger.Debug().
-		Str("service_id", relayCtx.ServiceID).
-		Str("session_id", relayCtx.SessionID).
-		Str("supplier", relayCtx.SupplierAddress).
-		Msg("signing relay response")
-
-	// Sign the response
-	if err := p.responseSigner.SignRelayResponse(
-		relayCtx.Response,
-		relayCtx.SupplierAddress,
-	); err != nil {
-		p.logger.Error().
-			Err(err).
-			Str("service_id", relayCtx.ServiceID).
-			Str("session_id", relayCtx.SessionID).
-			Str("supplier", relayCtx.SupplierAddress).
-			Msg("failed to sign relay response")
-		return nil, fmt.Errorf("signing failed: %w", err)
-	}
-
-	p.logger.Debug().
-		Str("service_id", relayCtx.ServiceID).
-		Str("session_id", relayCtx.SessionID).
-		Msg("relay response signed successfully")
-	return relayCtx.Response, nil
-}
-
-// PublishRelay publishes the relay to Redis Streams for mining.
-// Only publishes if the relay is allowed.
-func (p *RelayPipeline) PublishRelay(
-	ctx context.Context,
-	relayCtx *RelayContext,
-	result *ProcessingResult,
-) error {
-	// Don't publish if not allowed
-	if !result.Allowed {
-		p.logger.Debug().
-			Bool("allowed", result.Allowed).
-			Str("service_id", relayCtx.ServiceID).
-			Str("session_id", relayCtx.SessionID).
-			Msg("skipping relay publishing (not allowed)")
-		return nil
-	}
-
-	p.logger.Debug().
-		Str("service_id", relayCtx.ServiceID).
-		Str("session_id", relayCtx.SessionID).
-		Msg("publishing relay to Redis")
-
-	// Serialize relay request
-	relayRequestBz, err := relayCtx.Request.Marshal()
-	if err != nil {
-		p.logger.Error().
-			Err(err).
-			Str("service_id", relayCtx.ServiceID).
-			Str("session_id", relayCtx.SessionID).
-			Msg("failed to marshal relay request")
-		return fmt.Errorf("marshal request failed: %w", err)
-	}
-
-	// Process relay (hashing, difficulty check, mining)
-	_, err = p.relayProcessor.ProcessRelay(
+) (Reservation, bool, error) {
+	sessionHeader := relayCtx.Request.Meta.SessionHeader
+	reservation, allowed, err := p.relayMeter.Admit(
 		ctx,
-		relayRequestBz,
-		relayCtx.Payload,
-		relayCtx.SupplierAddress,
+		sessionHeader.SessionId,
+		sessionHeader.ApplicationAddress,
 		relayCtx.ServiceID,
+		relayCtx.SupplierAddress,
+		sessionHeader.SessionStartBlockHeight,
+		sessionHeader.SessionEndBlockHeight,
 		relayCtx.ArrivalBlockHeight,
 	)
 	if err != nil {
-		p.logger.Warn().
+		p.logger.Debug().
 			Err(err).
 			Str("service_id", relayCtx.ServiceID).
 			Str("session_id", relayCtx.SessionID).
-			Msg("relay processing failed (may not meet difficulty)")
-		return fmt.Errorf("processing failed: %w", err)
+			Msg("relay metering failed")
+		return reservation, allowed, fmt.Errorf("metering failed: %w", err)
 	}
-
-	p.logger.Debug().
-		Str("service_id", relayCtx.ServiceID).
-		Str("session_id", relayCtx.SessionID).
-		Msg("relay published successfully")
-	return nil
+	return reservation, allowed, nil
 }
 
-// ProcessRelayEager processes a relay in eager mode:
-// 1. Validate (ring signature + session)
-// 2. Meter (check stake before serving)
-// 3. Backend call happens OUTSIDE this function
-// 4. Sign response (after backend call)
-// 5. Publish to Redis (async)
-//
-// Returns ProcessingResult with validation/metering outcomes.
-func (p *RelayPipeline) ProcessRelayEager(
-	ctx context.Context,
-	relayCtx *RelayContext,
-) *ProcessingResult {
-	result := &ProcessingResult{
-		Allowed: true,
-	}
-
-	p.logger.Debug().
-		Str("service_id", relayCtx.ServiceID).
-		Str("session_id", relayCtx.SessionID).
-		Str("supplier", relayCtx.SupplierAddress).
-		Str("mode", "eager").
-		Msg("processing relay (eager mode)")
-
-	// Step 1: Validate relay request
-	if err := p.ValidateRelay(ctx, relayCtx); err != nil {
-		result.Allowed = false
-		result.ValidationErr = err
-		validationFailures.WithLabelValues(relayCtx.ServiceID, "signature_or_session").Inc()
-		return result
-	}
-
-	// Step 2: Meter relay (check stake)
-	allowed, err := p.MeterRelay(ctx, relayCtx)
-	if err != nil {
-		result.MeteringErr = err
-		// Fail-open: allow relay on metering error (log error)
-		p.logger.Warn().
-			Err(err).
-			Str("service_id", relayCtx.ServiceID).
-			Str("session_id", relayCtx.SessionID).
-			Msg("metering error (fail-open: allowing relay)")
-	} else {
-		result.Allowed = allowed
-
-		if !allowed {
-			relaysRejected.WithLabelValues(relayCtx.ServiceID, "stake_limit_exceeded").Inc()
-			return result
-		}
-	}
-
-	// Step 3: Backend call happens in caller
-	// Step 4: Signing happens in SignAndPublishResponse()
-
-	p.logger.Debug().
-		Str("service_id", relayCtx.ServiceID).
-		Str("session_id", relayCtx.SessionID).
-		Msg("relay validation and metering complete (eager mode)")
-	return result
+// SettleRelay charges a served relay's reservation.
+func (p *RelayPipeline) SettleRelay(reservation Reservation) {
+	p.relayMeter.Settle(reservation)
 }
 
-// SignAndPublishResponse signs the response and publishes the relay.
-// This should be called AFTER the backend response is received.
-// Publishing happens asynchronously via worker pool.
-func (p *RelayPipeline) SignAndPublishResponse(
-	ctx context.Context,
-	relayCtx *RelayContext,
-	result *ProcessingResult,
-) (*servicev1.RelayResponse, error) {
-	// Step 1: Sign response
-	signedResponse, err := p.SignResponse(ctx, relayCtx)
-	if err != nil {
-		result.SigningErr = err
-		relaysRejected.WithLabelValues(relayCtx.ServiceID, "signing_failed").Inc()
-		return nil, err
-	}
-
-	result.SignedResponse = signedResponse
-
-	// Step 2: Publish relay (async via worker pool if available)
-	// Note: We don't return the error here as publishing is best-effort
-	if err := p.PublishRelay(ctx, relayCtx, result); err != nil {
-		result.PublishingErr = err
-		p.logger.Warn().
-			Err(err).
-			Str("service_id", relayCtx.ServiceID).
-			Str("session_id", relayCtx.SessionID).
-			Msg("relay publishing failed (best-effort)")
-	}
-
-	p.logger.Debug().
-		Str("service_id", relayCtx.ServiceID).
-		Str("session_id", relayCtx.SessionID).
-		Msg("relay response signed and published")
-	return signedResponse, nil
+// ReleaseRelay gives back the reservation of a relay that was not served.
+func (p *RelayPipeline) ReleaseRelay(reservation Reservation) {
+	p.relayMeter.Release(reservation)
 }
 
-// ProcessRelayOptimistic processes a relay in optimistic mode:
-// 1. Backend call happens OUTSIDE this function
-// 2. Sign response
-// 3. Validate (async, after response sent)
-// 4. Meter (async, after response sent)
-// 5. Publish (async, only if validation/metering passed)
-//
-// Returns signed response immediately (validation/metering happen in background).
-func (p *RelayPipeline) ProcessRelayOptimistic(
+// ChargeServedRelay charges a relay served without an admission of its own and
+// reports whether its pair is now at or over the budget.
+func (p *RelayPipeline) ChargeServedRelay(
 	ctx context.Context,
-	relayCtx *RelayContext,
-) (*servicev1.RelayResponse, *ProcessingResult) {
-	result := &ProcessingResult{
-		Allowed: true,
-	}
-
-	p.logger.Debug().
-		Str("service_id", relayCtx.ServiceID).
-		Str("session_id", relayCtx.SessionID).
-		Str("supplier", relayCtx.SupplierAddress).
-		Str("mode", "optimistic").
-		Msg("processing relay (optimistic mode)")
-
-	// Step 1: Backend call happens in caller
-	// Step 2: Sign response immediately
-	signedResponse, err := p.SignResponse(ctx, relayCtx)
-	if err != nil {
-		result.SigningErr = err
-		result.Allowed = false
-		relaysRejected.WithLabelValues(relayCtx.ServiceID, "signing_failed").Inc()
-		return nil, result
-	}
-
-	result.SignedResponse = signedResponse
-
-	// Step 3 & 4: Validation and metering happen in background (caller's responsibility)
-	// The caller should spawn goroutine to call ValidateAndMeterAsync()
-
-	p.logger.Debug().
-		Str("service_id", relayCtx.ServiceID).
-		Str("session_id", relayCtx.SessionID).
-		Msg("relay response signed (validation/metering will happen async)")
-	return signedResponse, result
+	sessionID string,
+	serviceID string,
+	supplierAddress string,
+	sessionStartHeight int64,
+) (bool, error) {
+	return p.relayMeter.ChargeServed(ctx, sessionID, serviceID, supplierAddress, sessionStartHeight)
 }
 
-// ValidateAndMeterAsync performs validation and metering asynchronously.
-// Should be called in a goroutine after serving the relay in optimistic mode.
-// Returns updated ProcessingResult.
-func (p *RelayPipeline) ValidateAndMeterAsync(
-	ctx context.Context,
-	relayCtx *RelayContext,
-	result *ProcessingResult,
-) *ProcessingResult {
-	p.logger.Debug().
-		Str("service_id", relayCtx.ServiceID).
-		Str("session_id", relayCtx.SessionID).
-		Str("supplier", relayCtx.SupplierAddress).
-		Str("mode", "optimistic_async").
-		Msg("async validation and metering started")
-
-	// Step 1: Validate
-	if err := p.ValidateRelay(ctx, relayCtx); err != nil {
-		result.Allowed = false
-		result.ValidationErr = err
-		validationFailures.WithLabelValues(relayCtx.ServiceID, "signature_or_session").Inc()
-		relaysDropped.WithLabelValues(relayCtx.ServiceID, "validation_failed").Inc()
-		return result
-	}
-
-	// Step 2: Meter
-	allowed, err := p.MeterRelay(ctx, relayCtx)
-	if err != nil {
-		result.MeteringErr = err
-		// Fail-open: allow relay on metering error
-		p.logger.Warn().
-			Err(err).
-			Str("service_id", relayCtx.ServiceID).
-			Str("session_id", relayCtx.SessionID).
-			Msg("metering error (fail-open: allowing relay)")
-	} else {
-		result.Allowed = allowed
-
-		if !allowed {
-			relaysDropped.WithLabelValues(relayCtx.ServiceID, "meter_rejected").Inc()
-			return result
-		}
-	}
-
-	// Step 3: Publish if allowed
-	if err := p.PublishRelay(ctx, relayCtx, result); err != nil {
-		result.PublishingErr = err
-		p.logger.Warn().
-			Err(err).
-			Str("service_id", relayCtx.ServiceID).
-			Str("session_id", relayCtx.SessionID).
-			Msg("relay publishing failed (best-effort)")
-	}
-
-	p.logger.Debug().
-		Bool("allowed", result.Allowed).
-		Str("service_id", relayCtx.ServiceID).
-		Str("session_id", relayCtx.SessionID).
-		Msg("async validation and metering complete")
-
-	return result
+// DispatcherHealthy reports whether a relay served now would be charged, and
+// why not when it would not.
+func (p *RelayPipeline) DispatcherHealthy() (bool, error) {
+	return p.relayMeter.DispatcherHealthy()
 }

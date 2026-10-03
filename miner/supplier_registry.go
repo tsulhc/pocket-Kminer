@@ -2,12 +2,9 @@ package miner
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"time"
 
 	redisutil "github.com/pokt-network/pocket-relay-miner/transport/redis"
-	"github.com/redis/go-redis/v9"
 
 	"github.com/pokt-network/pocket-relay-miner/logging"
 )
@@ -16,45 +13,24 @@ import (
 type SupplierUpdateAction string
 
 const (
-	SupplierUpdateActionAdd      SupplierUpdateAction = "add"
-	SupplierUpdateActionUpdate   SupplierUpdateAction = "update"
-	SupplierUpdateActionDraining SupplierUpdateAction = "draining"
-	SupplierUpdateActionRemove   SupplierUpdateAction = "remove"
+	SupplierUpdateActionAdd    SupplierUpdateAction = "add"
+	SupplierUpdateActionRemove SupplierUpdateAction = "remove"
 )
-
-// SupplierRegistryData is the data stored in Redis for each supplier.
-type SupplierRegistryData struct {
-	OperatorAddr string   `json:"operator_addr"`
-	Services     []string `json:"services"`
-	Status       string   `json:"status"` // "active", "draining"
-	UpdatedAt    int64    `json:"updated_at"`
-}
-
-// SupplierUpdateEvent is published to the Redis channel when suppliers change.
-type SupplierUpdateEvent struct {
-	Action       SupplierUpdateAction `json:"action"`
-	OperatorAddr string               `json:"operator_addr"`
-	Services     []string             `json:"services,omitempty"`
-	Reason       string               `json:"reason,omitempty"`
-}
 
 // SupplierRegistryConfig contains configuration for the SupplierRegistry.
 type SupplierRegistryConfig struct {
-	// KeyPrefix is the prefix for supplier registry keys.
-	// Default: "ha:suppliers"
-	KeyPrefix string
 
 	// IndexKey is the key for the supplier index set.
 	// Default: "ha:suppliers:index"
 	IndexKey string
-
-	// EventChannel is the Redis channel for supplier updates.
-	// Default: "ha:events:supplier_update"
-	EventChannel string
 }
 
-// SupplierRegistry manages supplier registration in Redis.
-// It allows relayers to discover available suppliers and their services.
+// SupplierRegistry tracks which suppliers THIS FLEET handles, as a Redis set.
+//
+// It is membership only: the set answers "does this fleet handle that address",
+// and nothing else. The supplier's network state — staked, status, services,
+// declared endpoints — is the supplier CACHE's job (ha:supplier:{addr},
+// singular), which the relayer reads to decide whether to serve a relay.
 type SupplierRegistry struct {
 	logger      logging.Logger
 	redisClient *redisutil.Client
@@ -67,14 +43,8 @@ func NewSupplierRegistry(
 	redisClient *redisutil.Client,
 	config SupplierRegistryConfig,
 ) *SupplierRegistry {
-	if config.KeyPrefix == "" {
-		config.KeyPrefix = "ha:suppliers"
-	}
 	if config.IndexKey == "" {
-		config.IndexKey = "ha:suppliers:index"
-	}
-	if config.EventChannel == "" {
-		config.EventChannel = "ha:events:supplier_update"
+		config.IndexKey = redisClient.KB().SuppliersRegistryIndexKey()
 	}
 
 	return &SupplierRegistry{
@@ -84,111 +54,73 @@ func NewSupplierRegistry(
 	}
 }
 
-// PublishSupplierUpdate publishes a supplier update to Redis.
-// It updates the supplier data and publishes an event.
+// PublishSupplierUpdate adds or removes an address from the fleet's supplier
+// index.
+//
+// It used to also write a per-supplier JSON value at ha:suppliers:{addr}. That
+// value had ZERO readers: GetSupplier/GetAllSuppliers had no production callers,
+// its Services field was always nil because every call site passed nil, and the
+// relayer reads the supplier cache instead — verified by grepping the key's
+// LITERAL through relayer/ and miner/, not just the method names, so a reader
+// building the key by hand would have shown up too.
+//
+// Keeping it also kept a latent collision: back when each family took its segment
+// from config, SupplierStateKey read ns.SupplierPrefix while the registry key
+// hardcoded "suppliers",
+// so an operator setting supplier_prefix: "suppliers" made the two collide on
+// one key with two different structs writing it — and because they shared the
+// "status" and "services" JSON fields the cross-read did not even fail, it
+// returned a half-populated struct (no "staked" -> IsActive() false -> relays
+// refused). Deleting the value removes that EXACT-key collision by construction
+// instead of by validation. A glob collision survives under the same setting --
+// SupplierStatePattern() is "ha:suppliers:*" and matches the index key -- so "by
+// construction" covers equality, not pattern overlap.
+//
+// The index is what has readers: balance_monitor (ListSuppliers) and
+// KnownSupplierAddresses (orphan-stream detection).
+//
+// The services argument is accepted and ignored: every caller passes nil, and
+// the service list belongs to the cache entry, which derives it from the chain.
 func (r *SupplierRegistry) PublishSupplierUpdate(
 	ctx context.Context,
 	action SupplierUpdateAction,
 	operatorAddr string,
-	services []string,
+	_ []string,
 ) error {
-	key := fmt.Sprintf("%s:%s", r.config.KeyPrefix, operatorAddr)
-
 	switch action {
-	case SupplierUpdateActionAdd, SupplierUpdateActionUpdate:
-		// Set supplier data
-		data := SupplierRegistryData{
-			OperatorAddr: operatorAddr,
-			Services:     services,
-			Status:       "active",
-			UpdatedAt:    time.Now().Unix(),
-		}
-		jsonData, err := json.Marshal(data)
-		if err != nil {
-			return fmt.Errorf("failed to marshal supplier data: %w", err)
-		}
-
-		if err := r.redisClient.Set(ctx, key, jsonData, 0).Err(); err != nil {
-			return fmt.Errorf("failed to set supplier data: %w", err)
-		}
-
-		// Add to index
+	case SupplierUpdateActionAdd:
 		if err := r.redisClient.SAdd(ctx, r.config.IndexKey, operatorAddr).Err(); err != nil {
 			return fmt.Errorf("failed to add to supplier index: %w", err)
 		}
 
-	case SupplierUpdateActionDraining:
-		// Update status to draining
-		data := SupplierRegistryData{
-			OperatorAddr: operatorAddr,
-			Services:     services,
-			Status:       "draining",
-			UpdatedAt:    time.Now().Unix(),
-		}
-		jsonData, err := json.Marshal(data)
-		if err != nil {
-			return fmt.Errorf("failed to marshal supplier data: %w", err)
-		}
-
-		if err := r.redisClient.Set(ctx, key, jsonData, 0).Err(); err != nil {
-			return fmt.Errorf("failed to set supplier data: %w", err)
-		}
-
 	case SupplierUpdateActionRemove:
-		// Remove supplier data
-		if err := r.redisClient.Del(ctx, key).Err(); err != nil {
-			return fmt.Errorf("failed to delete supplier data: %w", err)
-		}
-
-		// Remove from index
 		if err := r.redisClient.SRem(ctx, r.config.IndexKey, operatorAddr).Err(); err != nil {
 			return fmt.Errorf("failed to remove from supplier index: %w", err)
 		}
-	}
 
-	// Publish event
-	event := SupplierUpdateEvent{
-		Action:       action,
-		OperatorAddr: operatorAddr,
-		Services:     services,
+	default:
+		// No silent no-op. The switch used to fall through for an unrecognised
+		// action: nothing was written, the counter was still incremented with
+		// that action as its label, and nil came back -- so the caller believed
+		// the registry had been updated and the metric agreed with it. Failing
+		// here also keeps the label bounded to the constants above, which is
+		// what stops an arbitrary string from becoming a Prometheus series.
+		return fmt.Errorf("unknown supplier update action %q", action)
 	}
-	eventData, err := json.Marshal(event)
-	if err != nil {
-		return fmt.Errorf("failed to marshal event: %w", err)
-	}
-
-	if err := r.redisClient.Publish(ctx, r.config.EventChannel, eventData).Err(); err != nil {
-		return fmt.Errorf("failed to publish event: %w", err)
-	}
-
-	r.logger.Debug().
-		Str("action", string(action)).
-		Str("operator", operatorAddr).
-		Msg("published supplier update")
 
 	supplierRegistryUpdatesTotal.WithLabelValues(string(action)).Inc()
 
+	// A membership change is a fleet state change, not a per-request event: it
+	// fires once when a supplier joins or leaves THIS fleet, and it is what an
+	// operator reads when asking why an address is unmonitored or its streams
+	// look orphaned. Until now only the failure was logged, so the successful
+	// change -- the one that actually moved the index -- left no trace.
+	r.logger.Info().
+		Str(logging.FieldSupplier, operatorAddr).
+		Str("action", string(action)).
+		Msg("fleet supplier index updated")
+
 	return nil
-}
-
-// GetSupplier retrieves supplier data from Redis.
-func (r *SupplierRegistry) GetSupplier(ctx context.Context, operatorAddr string) (*SupplierRegistryData, error) {
-	key := fmt.Sprintf("%s:%s", r.config.KeyPrefix, operatorAddr)
-
-	data, err := r.redisClient.Get(ctx, key).Bytes()
-	if err != nil {
-		if err == redis.Nil {
-			return nil, nil // Not found
-		}
-		return nil, fmt.Errorf("failed to get supplier data: %w", err)
-	}
-
-	var supplierData SupplierRegistryData
-	if err := json.Unmarshal(data, &supplierData); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal supplier data: %w", err)
-	}
-
-	return &supplierData, nil
 }
 
 // ListSuppliers returns all registered supplier addresses.
@@ -199,47 +131,4 @@ func (r *SupplierRegistry) ListSuppliers(ctx context.Context) ([]string, error) 
 	}
 
 	return suppliers, nil
-}
-
-// GetAllSuppliers retrieves data for all registered suppliers.
-func (r *SupplierRegistry) GetAllSuppliers(ctx context.Context) (map[string]*SupplierRegistryData, error) {
-	suppliers, err := r.ListSuppliers(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	result := make(map[string]*SupplierRegistryData)
-	for _, addr := range suppliers {
-		data, err := r.GetSupplier(ctx, addr)
-		if err != nil {
-			r.logger.Warn().
-				Err(err).
-				Str("operator", addr).
-				Msg("failed to get supplier data")
-			continue
-		}
-		if data != nil {
-			result[addr] = data
-		}
-	}
-
-	return result, nil
-}
-
-// ClearAll removes all supplier data from Redis.
-// Used primarily for testing.
-func (r *SupplierRegistry) ClearAll(ctx context.Context) error {
-	suppliers, err := r.ListSuppliers(ctx)
-	if err != nil {
-		return err
-	}
-
-	for _, addr := range suppliers {
-		key := fmt.Sprintf("%s:%s", r.config.KeyPrefix, addr)
-		r.redisClient.Del(ctx, key)
-	}
-
-	r.redisClient.Del(ctx, r.config.IndexKey)
-
-	return nil
 }

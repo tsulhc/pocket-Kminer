@@ -3,11 +3,14 @@ package cache
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 
 	"github.com/pokt-network/pocket-relay-miner/logging"
 	redisutil "github.com/pokt-network/pocket-relay-miner/transport/redis"
@@ -150,12 +153,26 @@ func (s *RedisBlockSubscriber) runBlockPubSubLoop(ctx context.Context) error {
 
 			var event BlockEvent
 			if err := json.Unmarshal([]byte(msg.Payload), &event); err != nil {
-				s.logger.Error().Err(err).Str("payload", msg.Payload).Msg("invalid block event")
+				s.logger.Warn().Err(err).Int("payload_bytes", len(msg.Payload)).Msg("invalid block event")
 				continue
 			}
 
 			s.handleBlockEvent(event)
 		}
+	}
+}
+
+// advanceClock moves the current height and block time to event's when it is
+// newer. It is the chain clock the tx client anchors timeouts on, so the
+// adapter's latest-height poll moves it too: a silent pub/sub channel must not
+// leave transactions signed against a stale block time.
+func (s *RedisBlockSubscriber) advanceClock(event BlockEvent) {
+	s.heightMu.Lock()
+	defer s.heightMu.Unlock()
+	if event.Height > s.currentHeight {
+		s.currentHeight = event.Height
+		s.currentTime = event.Timestamp
+		currentBlockHeight.Set(float64(s.currentHeight))
 	}
 }
 
@@ -165,13 +182,7 @@ func (s *RedisBlockSubscriber) handleBlockEvent(event BlockEvent) {
 	// on strictly-newer heights so out-of-order events (e.g. duplicate
 	// pub/sub deliveries or a late retry) can't rewind the observed
 	// block time that downstream tx-timeout anchoring depends on.
-	s.heightMu.Lock()
-	if event.Height > s.currentHeight {
-		s.currentHeight = event.Height
-		s.currentTime = event.Timestamp
-		currentBlockHeight.Set(float64(s.currentHeight))
-	}
-	s.heightMu.Unlock()
+	s.advanceClock(event)
 
 	blockEventsReceived.Inc()
 
@@ -266,25 +277,147 @@ func (s *RedisBlockSubscriber) PublishBlockHeight(ctx context.Context, event Blo
 	}
 	s.mu.RUnlock()
 
+	return publishBlockEvent(ctx, s.logger, s.redisClient, event)
+}
+
+// publishBlockEvent writes one block event onto the shared channel. It is the
+// single implementation of the block-event wire format: both the subscriber
+// (which can also publish) and the publish-only RedisBlockPublisher go through
+// here, so the channel name, the JSON shape and the counter cannot drift apart
+// between the two.
+func publishBlockEvent(
+	ctx context.Context,
+	logger logging.Logger,
+	redisClient *redisutil.Client,
+	event BlockEvent,
+) error {
 	// Set the timestamp if not set
 	if event.Timestamp.IsZero() {
 		event.Timestamp = time.Now()
 	}
 
-	channel := s.redisClient.KB().BlockEventChannel()
-
+	kb := redisClient.KB()
 	data, err := json.Marshal(event)
 	if err != nil {
 		return fmt.Errorf("failed to marshal block event: %w", err)
 	}
 
-	if err = s.redisClient.Publish(ctx, channel, data).Err(); err != nil {
+	// The record and the latest height are written BEFORE the event, on one
+	// connection, so a consumer woken by the event finds the hash whenever its
+	// write landed. Not a MULTI: with Redis at maxmemory under noeviction a
+	// MULTI holding a SET is aborted whole, and the event must go out even
+	// then -- it is what moves claims and proofs, which free the memory. A
+	// consumer that finds no record reads the hash from its own node.
+	var setRecord, setLatest *redis.StatusCmd
+	var publish *redis.IntCmd
+	_, _ = redisClient.Pipelined(ctx, func(pipe redis.Pipeliner) error { //nolint:errcheck // each command's error is read below
+		setRecord = pipe.Set(ctx, kb.BlockHashAtHeightKey(event.Height), data, blockRecordTTL)
+		setLatest = pipe.Set(ctx, kb.BlockLatestHeightKey(), event.Height, blockRecordTTL)
+		publish = pipe.Publish(ctx, kb.BlockEventChannel(), data)
+		return nil
+	})
+	if err = publish.Err(); err != nil {
 		return fmt.Errorf("failed to publish block event: %w", err)
+	}
+	for _, cmd := range []*redis.StatusCmd{setRecord, setLatest} {
+		if cmd.Err() != nil {
+			logger.Warn().Err(cmd.Err()).Int64("height", event.Height).
+				Msg("failed to record the published block; consumers will read its hash from their own node")
+		}
 	}
 
 	blockEventsPublished.Inc()
 
-	s.logger.Debug().Int64("height", event.Height).Msg("published block event")
+	logger.Debug().Int64("height", event.Height).Msg("published block event")
+	return nil
+}
+
+// blockRecordTTL is how long a published block's record lives. A day is far
+// longer than any claim or proof window a consumer can still be waiting on, and
+// one small key per block is cheap.
+const blockRecordTTL = 24 * time.Hour
+
+// readBlockRecord reads the leader's record of the block at height. found is
+// false when the leader has not published that height (yet).
+func readBlockRecord(ctx context.Context, redisClient *redisutil.Client, height int64) (event BlockEvent, found bool, err error) {
+	data, err := redisClient.Get(ctx, redisClient.KB().BlockHashAtHeightKey(height)).Bytes()
+	if errors.Is(err, redis.Nil) {
+		return BlockEvent{}, false, nil
+	}
+	if err != nil {
+		return BlockEvent{}, false, fmt.Errorf("failed to read block record at height %d: %w", height, err)
+	}
+	if err = json.Unmarshal(data, &event); err != nil {
+		return BlockEvent{}, false, fmt.Errorf("failed to decode block record at height %d: %w", height, err)
+	}
+	return event, true, nil
+}
+
+// readLatestPublishedHeight reads the highest height the leader has published.
+// found is false when nothing has been published.
+func readLatestPublishedHeight(ctx context.Context, redisClient *redisutil.Client) (height int64, found bool, err error) {
+	height, err = redisClient.Get(ctx, redisClient.KB().BlockLatestHeightKey()).Int64()
+	if errors.Is(err, redis.Nil) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("failed to read latest published height: %w", err)
+	}
+	return height, true, nil
+}
+
+// redisBlockPublisherComponentName labels this endpoint's logs. It is NOT
+// ComponentBlockSubscriber: on the leader, a publish line tagged block_subscriber
+// tells an operator reading logs during an incident that the leader is
+// consuming, which is the exact wrong conclusion and the confusion this type
+// exists to end. It is not blockPublisherComponentName either -- that belongs to
+// BlockPublisher, the chain watcher one layer above.
+const redisBlockPublisherComponentName = "redis_block_publisher"
+
+// RedisBlockPublisher publishes block events onto the shared channel and does
+// NOTHING ELSE. It exists because the leader needs to publish but has no reason
+// to receive: RedisBlockSubscriber.Start always spawns a pub/sub receive loop,
+// so using one as a publisher made the leader consume every event it published
+// and hand it to zero subscribers. Measured on a resting localnet before this
+// type existed: the leader reported 480 received against 240 published, exactly
+// double, while a follower reported 240 — which put a per-process floor under
+// ha_cache_block_events_received_total that no gate could assert against.
+//
+// There is no Start: a publisher has no background work. Close is present so
+// callers can treat it like every other component they own.
+type RedisBlockPublisher struct {
+	logger      logging.Logger
+	redisClient *redisutil.Client
+
+	mu     sync.RWMutex
+	closed bool
+}
+
+// NewRedisBlockPublisher creates a publish-only block event endpoint.
+func NewRedisBlockPublisher(logger logging.Logger, redisClient *redisutil.Client) *RedisBlockPublisher {
+	return &RedisBlockPublisher{
+		logger:      logging.ForComponent(logger, redisBlockPublisherComponentName),
+		redisClient: redisClient,
+	}
+}
+
+// PublishBlockHeight publishes a new block height to all subscribers.
+func (p *RedisBlockPublisher) PublishBlockHeight(ctx context.Context, event BlockEvent) error {
+	p.mu.RLock()
+	if p.closed {
+		p.mu.RUnlock()
+		return fmt.Errorf("publisher is closed")
+	}
+	p.mu.RUnlock()
+
+	return publishBlockEvent(ctx, p.logger, p.redisClient, event)
+}
+
+// Close marks the publisher closed. Idempotent.
+func (p *RedisBlockPublisher) Close() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.closed = true
 	return nil
 }
 
@@ -311,6 +444,30 @@ func (s *RedisBlockSubscriber) LatestBlockTime() time.Time {
 	s.heightMu.RLock()
 	defer s.heightMu.RUnlock()
 	return s.currentTime
+}
+
+// SeedBlockTime sets the block time read off the chain at startup, so the
+// process anchors its transactions on chain time before the first block event
+// reaches it. In the process that wins the election the leader that publishes
+// those events only starts later, so without this the anchor is the zero time
+// for as long as a block lasts.
+//
+// It seeds the TIME only, never currentHeight: handleBlockEvent advances on a
+// strictly greater height, so a seed from a node one block ahead would make the
+// events that follow look old and be dropped.
+//
+// An event always wins over a seed, whichever arrives first: the seed applies
+// only while no event has been seen (currentHeight == 0), so a seed that lost a
+// race against the pub/sub cannot rewind the time an event brought. It reports
+// whether it was applied.
+func (s *RedisBlockSubscriber) SeedBlockTime(blockTime time.Time) bool {
+	s.heightMu.Lock()
+	defer s.heightMu.Unlock()
+	if s.currentHeight > 0 || blockTime.IsZero() {
+		return false
+	}
+	s.currentTime = blockTime
+	return true
 }
 
 // Close gracefully shuts down the subscriber.

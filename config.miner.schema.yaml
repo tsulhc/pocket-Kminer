@@ -6,6 +6,7 @@ required:
   - redis
   - pocket_node
   - keys
+  - block_time_seconds
 
 properties:
   redis:
@@ -16,22 +17,46 @@ properties:
     properties:
       url:
         type: string
-        description: Redis connection URL
-        pattern: ^redis(s)?://
+        description: >-
+          Redis connection URL. The scheme selects the client: redis:// or
+          rediss:// (TLS) for a single Redis, redis-sentinel:// for Sentinel
+          (sentinel addresses, then the master name as the path), and
+          redis-cluster:// for a Cluster. A comma-separated host list under
+          redis:// is not a cluster. Redis must run with maxmemory set and
+          maxmemory-policy noeviction, or the miner refuses to start.
+        pattern: ^(redis|rediss|redis-sentinel|redis-cluster)://
         examples:
           - redis://localhost:6379
-          - redis://redis-node1:6379,redis-node2:6379
+          - redis-sentinel://sentinel1:26379,sentinel2:26379/mymaster?db=0
+          - redis-cluster://node1:6379,node2:6379,node3:6379
       consumer_name:
         type: string
-        description: Unique consumer name for this miner instance (auto-generated from hostname if not set)
+        description: >-
+          Readable PREFIX for this miner's Redis stream-consumer name, not the
+          name itself: "-<hostname>-<pid>" is always appended, because Redis
+          identifies a consumer by name alone and two replicas sharing one would
+          share a pending-entries list, so neither could reclaim the other's
+          stranded deliveries. Defaults to "miner".
       claim_idle_timeout_ms:
         type: integer
-        description: Timeout for reclaiming idle messages from crashed consumers
+        description: Milliseconds after which a delivered, unacknowledged relay is reclaimed (recovery from a crashed consumer)
         default: 60000
         minimum: 1000
+      relay_batch_flush_interval_ms:
+        type: integer
+        description: >-
+          How often each supplier marks, counts and acknowledges, in one Redis
+          script per session, the relays it already added to the session tree.
+          Their stream entries stay pending until then, so it must be at most
+          claim_idle_timeout_ms / 4; startup fails otherwise.
+        default: 15000
+        minimum: 0
       pool_size:
         type: integer
-        description: Maximum number of socket connections (0 = use default 20 × GOMAXPROCS)
+        description: >-
+          Maximum number of connections (0 = default, 50). Size it as the
+          number of suppliers + 20: each supplier holds one blocking stream
+          read.
         default: 0
         minimum: 0
       min_idle_conns:
@@ -41,54 +66,31 @@ properties:
         minimum: 0
       pool_timeout_seconds:
         type: integer
-        description: Wait time for connection from pool in seconds (0 = use default 4s)
+        description: Seconds a caller waits for a pooled connection (0 = default, 6)
         default: 0
         minimum: 0
       conn_max_idle_time_seconds:
         type: integer
-        description: Close idle connections after this many seconds (0 = use default 300s)
+        description: >-
+          Close a connection idle for this many seconds (0 = the Redis client
+          library's default, 30 minutes)
         default: 0
         minimum: 0
       namespace:
         type: object
-        description: Redis key namespace configuration (defaults match historical "ha:" prefix structure)
+        description: >-
+          Redis key namespace. Only base_prefix is configurable; every segment
+          below it is fixed in code so miner and relayer cannot drift, and no
+          family's SCAN pattern can match another family's keys.
         properties:
           base_prefix:
             type: string
-            description: Root prefix for all Redis keys
+            description: >-
+              Root prefix for all Redis keys. Two base prefixes are two disjoint
+              keyspaces. Must not contain ':', whitespace, or * ? [ ]. Must be
+              the same in the miner and every relayer of one fleet.
+            pattern: "^[^:*?\\[\\]\\s]+$"
             default: ha
-          cache_prefix:
-            type: string
-            description: Cache data prefix (full key: {base_prefix}:{cache_prefix}:*)
-            default: cache
-          events_prefix:
-            type: string
-            description: Pub/sub channels prefix (full key: {base_prefix}:{events_prefix}:*)
-            default: events
-          streams_prefix:
-            type: string
-            description: Relay streams prefix (full key: {base_prefix}:{streams_prefix}:*)
-            default: relays
-          miner_prefix:
-            type: string
-            description: Miner state prefix (full key: {base_prefix}:{miner_prefix}:*)
-            default: miner
-          supplier_prefix:
-            type: string
-            description: Supplier data prefix (full key: {base_prefix}:{supplier_prefix}:*)
-            default: supplier
-          meter_prefix:
-            type: string
-            description: Metering data prefix (full key: {base_prefix}:{meter_prefix}:*)
-            default: meter
-          params_prefix:
-            type: string
-            description: Cached params prefix (full key: {base_prefix}:{params_prefix}:*)
-            default: params
-          consumer_group_prefix:
-            type: string
-            description: Consumer group name suffix (full name: {base_prefix}-{consumer_group_prefix})
-            default: miners
 
   pocket_node:
     type: object
@@ -99,15 +101,15 @@ properties:
     properties:
       query_node_rpc_url:
         type: string
-        description: RPC endpoint for queries and block subscription
+        description: CometBFT RPC endpoint for queries, block subscription and transaction submission
         examples:
-          - https://rpc.testnet.pokt.network
+          - https://your-full-node:26657
           - http://localhost:26657
       query_node_grpc_url:
         type: string
         description: gRPC endpoint for queries
         examples:
-          - grpc.testnet.pokt.network:443
+          - your-full-node:9090
           - localhost:9090
       chain_id:
         type: string
@@ -115,11 +117,16 @@ properties:
         default: pocket
         examples:
           - pocket
-          - pocket-beta
+          - pocket-lego-testnet
       grpc_insecure:
         type: boolean
         description: Disable TLS for gRPC connections (use for local development only)
         default: false
+      query_timeout_seconds:
+        type: integer
+        description: Seconds allowed for one chain query
+        default: 5
+        minimum: 0
 
   transaction:
     type: object
@@ -132,130 +139,93 @@ properties:
         minimum: 0
       gas_price:
         type: string
-        description: Gas price in upokt (e.g., "0.00001upokt")
-        default: "0.00001upokt"
+        description: Gas price in upokt (1 POKT = 1,000,000 upokt)
+        default: "0.000001upokt"
         pattern: ^[0-9]+(\\.[0-9]+)?upokt$
       gas_adjustment:
         type: number
         description: Gas adjustment multiplier applied to simulated gas (only used when gas_limit=0)
         default: 1.7
         minimum: 1.0
-      disable_claim_batching:
-        type: boolean
-        description: |
-          Disable batching of claim submissions (one tx per claim). DISCOURAGED —
-          at scale this sends hundreds-to-thousands of txs per window and is a
-          primary cause of CLAIM_MISSING forfeits; the miner logs a startup
-          warning if set. Default false (batching on).
-        default: false
-      disable_proof_batching:
-        type: boolean
-        description: |
-          Disable batching of proof submissions (one tx per proof). DISCOURAGED —
-          at scale this floods the node and is a primary cause of PROOF_MISSING
-          forfeits; the miner logs a startup warning if set. Default false
-          (batching on).
-        default: false
       disable_pre_proof_claim_verification:
         type: boolean
         description: |
-          Disable the pre-proof GetClaim guard that verifies each session's
-          claim is on-chain before proof submission. Default: false (guard
-          enabled — recommended). Enabling this reproduces pre-WS-A behavior
-          where proof submission attempts run even when the claim never
-          landed on-chain, producing FailedPrecondition retry storms.
+          Diagnostic only. Disables the check that each session's claim is on
+          chain before its proof is submitted. With it disabled, proofs are
+          submitted for claims that never landed, and each fails and is
+          retried. Default: false (check enabled, recommended).
         default: false
-      disable_inclusion_reconciler:
-        type: boolean
-        description: |
-          Disable the block-driven inclusion reconciler. When enabled (the
-          default) the miner persists each built claim/proof, verifies on-chain
-          inclusion once per block via x/proof module state (AllClaims/AllProofs
-          by supplier — works on any node regardless of tx_index configuration),
-          records claim_on_chain_outcome / proof_on_chain_outcome
-          (on_chain_found | on_chain_missing | poll_error), emits the inclusion
-          outcome + rebroadcast metrics, and re-broadcasts a still-missing
-          claim/proof while its window is open. This is the fix for silent
-          CLAIM_MISSING / PROOF_MISSING forfeits (accepted to mempool but never
-          included, with no retry).
-        default: false
-      disable_claim_inclusion_tracking:
-        type: boolean
-        description: |
-          Deprecated compatibility alias for disable_inclusion_reconciler. If
-          set to true, it disables the unified claim+proof inclusion reconciler.
-          Prefer disable_inclusion_reconciler for new configs.
-        default: false
+      tx_max_concurrent:
+        type: integer
+        description: >-
+          How many claim/proof broadcasts may be in flight at once. It bounds
+          the load on the full node (with gas estimation on, each transaction
+          costs a simulation plus a broadcast). Raise it only when
+          ha_tx_permit_wait_seconds shows broadcasts waiting. 0 = default.
+        default: 32
+        minimum: 0
+      tx_rpc_timeout_seconds:
+        type: integer
+        description: >-
+          Seconds allowed for ONE broadcast attempt; not the transaction's
+          on-chain deadline. Tune it from the p99 of
+          ha_tx_broadcast_latency_seconds. 0 = default.
+        default: 30
+        minimum: 0
+      tx_conn_probe_interval_seconds:
+        type: integer
+        description: >-
+          Seconds between probes of the dedicated transaction connection while
+          it is idle, so a connection dropped between windows is reported
+          before the next window instead of costing a claim. 0 = default.
+        default: 60
+        minimum: 0
       inclusion_reconciler_max_concurrent:
         type: integer
-        description: Worker pool size for per-block group reconciliation (one task per owned supplier per block).
+        description: Worker pool size for per-block group reconciliation (one task per owned supplier per block). Capped at tx_max_concurrent.
         default: 64
         minimum: 1
       max_rebroadcasts:
         type: integer
-        description: |
-          Max in-window re-submissions of a still-missing claim/proof. Default 1
-          (a single self-try: at the window midpoint for an accepted-but-evicted
-          tx; promptly for a build-OK-but-submit-failed tx that was never
-          broadcast). Set to 0 for observe-only (verify + record outcomes but
-          never resend). Omit to use the default.
-        default: 1
+        description: >-
+          Cap on in-window re-sends of a still-missing claim/proof. Unset: no
+          cap -- a still-missing claim or proof is re-sent on every block its
+          window allows, each re-send costing one transaction fee. 0:
+          observe-only (verify and record outcomes, never re-send).
         minimum: 0
       rebroadcast_safety_blocks:
         type: integer
-        description: |
-          Stop rebroadcasting once the chain is within this many blocks of
-          window-close (claim or proof), so a re-submit cannot land after the
-          window.
-        default: 1
+        description: >-
+          Stop re-sending once the chain is within this many blocks of the
+          window close (claim or proof). 0: the block before the close is the
+          last re-send, the last one that can still be included.
+        default: 0
         minimum: 0
       inclusion_reconciler_per_group_timeout_ms:
         type: integer
         description: Wall-clock cap on one supplier-group reconcile per block (the AllProofs/AllClaims query plus rebroadcasts).
         default: 10000
         minimum: 1000
-      tx_timeout_min_seconds:
-        type: integer
-        description: |
-          Compatibility knob retained for existing configs. Window-based
-          claim/proof submissions use tx_timeout_max_seconds; non-window
-          submissions use tx_timeout_default_seconds.
-        default: 120
-        minimum: 1
-      tx_timeout_max_seconds:
-        type: integer
-        description: |
-          Safe unordered-TX TTL for window-based claim/proof submissions
-          (seconds). The cosmos-sdk hard-rejects unordered TXs whose
-          timeoutTimestamp is >10 minutes ahead of validator time. Stay strictly
-          below 600. Values below the code default are raised internally to avoid
-          mempool expiry before inclusion during slow/empty blocks.
-        maximum: 599
-        minimum: 1
-      tx_timeout_default_seconds:
-        type: integer
-        description: Fallback TX broadcast deadline when no window info is available (seconds).
-        default: 120
-        minimum: 1
-      tx_timeout_clock_skew_buffer_seconds:
-        type: integer
-        description: |
-          Compatibility knob retained for existing configs. Window-based
-          claim/proof submissions no longer spend this budget from the protocol
-          window; they use tx_timeout_max_seconds instead.
-        default: 60
-        minimum: 0
 
   keys:
     type: object
-    description: Supplier signing key configuration
+    description: >-
+      Supplier signing key configuration. Full reference: docs/SUPPLIER_KEYS.md. keys_file and keyring are MUTUALLY
+      EXCLUSIVE: setting both is a startup error. Exactly one is required -- a
+      miner with no keys has nothing to do.
     properties:
+      hot_reload_enabled:
+        type: boolean
+        description: >-
+          Reload signing keys while the process runs, so a key added or pulled
+          takes effect without a restart. Covers every key source: keys_file is
+          watched and reacts at once, a keyring cannot be watched and is picked
+          up by the reload timer within 30s. Turning it off is logged as a
+          warning at startup, because a key change then needs a restart.
+        default: true
       keys_file:
         type: string
         description: Path to YAML file with hex-encoded private keys
-      keys_dir:
-        type: string
-        description: Directory containing individual key files
       keyring:
         type: object
         description: Cosmos SDK keyring configuration
@@ -264,17 +234,40 @@ properties:
             type: string
             enum:
               - file
-              - os
               - test
-              - memory
-            description: Keyring backend type
+            description: >-
+              Keyring backend. Only backends whose behaviour can be guaranteed
+              for a long-running signer: "file" is passphrase-protected (piped
+              in, cached for the whole keyring) and "test" uses a fixed
+              password. "memory" starts empty and nothing writes to it, and "os"
+              depends on whether a system keychain is reachable -- both are
+              rejected at startup. The interactive CLI rejects them too.
           dir:
             type: string
-            description: Directory for keyring (file backend only)
+            description: >-
+              Directory CONTAINING the keyring, not the keyring itself: the file
+              backend reads <dir>/keyring-file.
           app_name:
             type: string
             description: Application name for keyring
             default: pocket
+          passphrase_file:
+            type: string
+            description: >-
+              Path to a file holding the keyring passphrase ("file" backend
+              only). A REFERENCE, not the secret: mount a Kubernetes or compose
+              secret and point at it, the same way keys_file points at a file of
+              private keys. Preferred over passphrase_env, since an environment
+              variable is readable from /proc/<pid>/environ and tends to reach
+              crash dumps and process listings. With neither set the passphrase
+              is read from stdin, which suits a pipe or a terminal but not a
+              container (its stdin is /dev/null).
+          passphrase_env:
+            type: string
+            description: >-
+              NAME of an environment variable holding the keyring passphrase
+              ("file" backend only) -- not the passphrase itself. Mutually
+              exclusive with passphrase_file.
           key_names:
             type: array
             description: Specific key names to load (empty = load all)
@@ -297,16 +290,16 @@ properties:
 
   pprof:
     type: object
-    description: Prometheus metrics server configuration
+    description: Pprof profiling server configuration (for debugging)
     properties:
       enabled:
         type: boolean
         description: Enable pprof profiling server (for debugging, disable in production)
-        default: true
+        default: false
       addr:
         type: string
-        description: Pprof HTTP server address (use localhost for security)
-        default: ":6060"
+        description: Pprof HTTP server address. Loopback when unset; reaching it from outside the host or container takes an explicit address such as 0.0.0.0:6060
+        default: "127.0.0.1:6060"
         pattern: ^.*:[0-9]+$
 
   logging:
@@ -316,7 +309,6 @@ properties:
       level:
         type: string
         enum:
-          - trace
           - debug
           - info
           - warn
@@ -328,19 +320,34 @@ properties:
           - json
           - text
         default: json
-      output:
-        type: string
-        description: Log output destination
-        default: stdout
       async:
         type: boolean
         description: Enable async logging for better performance
         default: true
       async_buffer_size:
         type: integer
-        description: Async log buffer size
+        description: Async ring buffer size, in log messages (not bytes)
         default: 100000
         minimum: 1000
+      async_poll_interval:
+        type: integer
+        description: How often the async writer flushes buffered log lines (milliseconds). Lower = less latency, more CPU; higher = batches more. 10-50 for high-throughput production.
+        default: 100
+        minimum: 1
+      sampling:
+        type: boolean
+        description: Enable log sampling to cap volume under extreme throughput. GLOBAL - samples every component and level equally, state-change logs included. Leave off unless log volume is a measured problem.
+        default: false
+      sampling_initial:
+        type: integer
+        description: With sampling on, number of log lines always written before sampling kicks in
+        default: 100
+        minimum: 1
+      sampling_thereafter:
+        type: integer
+        description: With sampling on, write 1 in N log lines after the initial burst
+        default: 10
+        minimum: 1
       enable_caller:
         type: boolean
         description: Add caller file:line to log events. Useful for debugging but adds ~14% allocation overhead under high throughput. Disable in production.
@@ -348,18 +355,22 @@ properties:
 
   block_time_seconds:
     type: integer
-    description: Expected block time in seconds (30s for mainnet/testnet, 6s for localnet)
-    default: 30
+    description: >-
+      REQUIRED, with no default: the miner does not start without it. Expected
+      block time in seconds; every claim and proof transaction deadline is
+      computed from it. Mainnet, testnet and localnet run different block
+      times, and mainnet's drifts with network conditions, so measure your
+      target network (mainnet is roughly 60).
     minimum: 1
 
   block_health_monitor:
     type: object
-    description: Block health monitoring configuration (Feature 1)
+    description: Block health monitoring (warns when blocks arrive slower than expected)
     properties:
       enabled:
         type: boolean
         description: Enable block health monitoring
-        default: false
+        default: true
       slowness_threshold:
         type: number
         description: Alert when blocks arrive slower than threshold × configured time
@@ -368,7 +379,11 @@ properties:
 
   default_service_factor:
     type: number
-    description: Global serviceFactor applied to all services. If set, effectiveLimit = appStake × serviceFactor. If 0 or unset, use baseLimit formula.
+    description: >-
+      Global service factor for every service without an override. If set,
+      effectiveLimit = appStake x factor. If 0 or unset, the baseLimit formula
+      applies: (appStake / num_suppliers_per_session) / pendingSessions, which
+      follows the chain's parameters.
     default: 0
     minimum: 0
 
@@ -379,22 +394,13 @@ properties:
       type: number
       minimum: 0
 
-  settlement_monitor:
-    type: object
-    description: On-chain claim settlement tracking configuration
-    properties:
-      enabled:
-        type: boolean
-        description: Enable on-chain settlement event tracking
-        default: false
-
   balance_monitor:
     type: object
-    description: Balance and stake monitoring configuration (Feature 4)
+    description: Balance and stake monitoring
     properties:
       enabled:
         type: boolean
-        description: Enable balance/stake monitoring
+        description: Runs the balance and stake monitor. false turns it off entirely -- no balance warnings and no stake alerts.
         default: true
       check_interval_seconds:
         type: integer
@@ -444,17 +450,12 @@ properties:
       workers_per_supplier:
         type: integer
         description: Workers allocated per supplier for claim/proof building
-        default: 2
+        default: 6
         minimum: 1
       query_workers:
         type: integer
         description: Fixed workers for blockchain queries (startup, cache refresh)
         default: 20
-        minimum: 1
-      settlement_workers:
-        type: integer
-        description: Fixed workers for settlement event processing
-        default: 2
         minimum: 1
 
   leader_election:
@@ -474,7 +475,7 @@ properties:
 
   supplier_claiming:
     type: object
-    description: Distributed supplier claiming configuration for current RC primary/standby HA. Controls Redis lease timing for supplier ownership and orphan reclaim; it does not fair-share suppliers across active miners.
+    description: Distributed supplier claiming configuration (HA multi-miner). Controls Redis lease timing for distributing suppliers across miner replicas.
     properties:
       claim_ttl_seconds:
         type: integer
@@ -488,55 +489,38 @@ properties:
         minimum: 1
       rebalance_interval_seconds:
         type: integer
-        description: How often to scan for missing or expired supplier claims (seconds). Kept under the historical rebalance name for config compatibility.
+        description: How often to check supplier distribution and scan for orphans (seconds).
         default: 30
         minimum: 5
 
-  deduplication_ttl_blocks:
-    type: integer
-    description: How many blocks to keep relay hashes for deduplication
-    default: 10
-    minimum: 1
-
   batch_size:
     type: integer
-    description: Number of messages to fetch per XREADGROUP operation
+    description: Number of relays read per stream read
     default: 1000
     minimum: 1
 
-  ack_batch_size:
-    type: integer
-    description: Number of messages to acknowledge in a batch
-    default: 50
-    minimum: 1
-
-  hot_reload_enabled:
-    type: boolean
-    description: Enable hot-reload of supplier keys
-    default: true
+  # hot_reload_enabled is NOT a top-level setting: it lives under keys, in both
+  # binaries. A top-level value is reported at startup, and fails
+  # "miner validate" and --strict-config.
 
   session_ttl:
     type: string
-    description: TTL for session data (duration string, e.g., "24h")
-    default: 24h
+    description: >-
+      TTL of session state in Redis (duration string, e.g. "2h"). Unset: equal
+      to cache_ttl, so sessions and their trees expire together.
     pattern: ^[0-9]+(ns|us|µs|ms|s|m|h)$
 
   cache_ttl:
     type: string
-    description: TTL for Redis-backed session and SMST data in the current RC. Backup safety net for cleanup and retained for compatibility during migration toward local miner SMST/WAL.
+    description: TTL for Redis cached data (sessions, SMST trees). Backup safety net - manual cleanup is primary.
     default: 2h
     pattern: ^[0-9]+(ns|us|µs|ms|s|m|h)$
 
-  smst_live_root_checkpoint_interval:
-    type: integer
-    description: |
-      How often (in UpdateTree calls) the intermediate SMST root is written to
-      Redis so a follower promoted mid-session can resume the tree. Bounds the
-      relay loss window on a leader kill to (interval - 1) relays. Lower = safer,
-      more Redis writes. Default 10 balances durability vs write amplification.
-      Set to 1 for zero-loss mode. 0 is treated as "use default".
-    default: 10
-    minimum: 0
+  service_factor_republish_interval:
+    type: string
+    description: How often the leader rewrites the service factor manifest. The manifest has no TTL, so this is what bounds how long a miner that lost leadership can leave its own config standing.
+    default: 5m
+    pattern: ^[0-9]+(ns|us|µs|ms|s|m|h)$
 
   submission_tracking_ttl:
     type: string

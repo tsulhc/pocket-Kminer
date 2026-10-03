@@ -1,23 +1,19 @@
 package relay_client
 
 import (
-	"context"
 	"encoding/hex"
 	"testing"
 
 	"github.com/cosmos/cosmos-sdk/crypto/keys/secp256k1"
 	ring_secp256k1 "github.com/pokt-network/go-dleq/secp256k1"
 	"github.com/stretchr/testify/require"
-
-	apptypes "github.com/pokt-network/poktroll/x/application/types"
-	servicetypes "github.com/pokt-network/poktroll/x/service/types"
 )
 
 const (
 	// Valid test private key (32 bytes hex)
-	testPrivKeyHex = "2d00ef074d9b51e46886dc9a1df11e7b986611d0f336bdcf1f0adce3e037ec0a"
+	testPrivKeyHex = "c188c43496351a963762a5d9de78ff887ac66b4ba5de5967efd55a6d1e71ddda"
 	// Expected address derived from testPrivKeyHex
-	testExpectedAddress = "pokt1mrqt5f7qh8uxs27cjm9t7v9e74a9vvdnq5jva4"
+	testExpectedAddress = "pokt1pyr6a2yz9rrdhlgg8ff0xqhlsv3qsxcmm3yp8z"
 )
 
 // TestNewSignerFromHex_ValidKey tests signer creation with a valid private key.
@@ -101,32 +97,6 @@ func TestDeriveAddressFromPubKey(t *testing.T) {
 	require.Equal(t, testExpectedAddress, address, "Address should match expected value")
 }
 
-// TestSignRelayRequest_NilRequest tests that nil request is rejected.
-func TestSignRelayRequest_NilRequest(t *testing.T) {
-	signer, err := NewSignerFromHex(testPrivKeyHex)
-	require.NoError(t, err)
-
-	err = signer.SignRelayRequest(context.Background(), nil, &apptypes.Application{}, nil)
-	require.Error(t, err, "SignRelayRequest should fail with nil request")
-	require.Contains(t, err.Error(), "relay request is nil")
-}
-
-// TestSignRelayRequest_MissingSessionHeader tests that missing session header is rejected.
-func TestSignRelayRequest_MissingSessionHeader(t *testing.T) {
-	signer, err := NewSignerFromHex(testPrivKeyHex)
-	require.NoError(t, err)
-
-	relayRequest := &servicetypes.RelayRequest{
-		Meta: servicetypes.RelayRequestMetadata{
-			SessionHeader: nil, // Missing
-		},
-	}
-
-	err = signer.SignRelayRequest(context.Background(), relayRequest, &apptypes.Application{}, nil)
-	require.Error(t, err, "SignRelayRequest should fail with missing session header")
-	require.Contains(t, err.Error(), "missing session header")
-}
-
 // TestScalarConversion tests private key to scalar conversion.
 func TestScalarConversion(t *testing.T) {
 	// Create test private key
@@ -135,11 +105,48 @@ func TestScalarConversion(t *testing.T) {
 
 	privKey := secp256k1.GenPrivKeyFromSecret(keyBytes)
 
-	// Convert to scalar (same logic as in SignRelayRequest)
+	// Convert to scalar (same logic as in SignRelayRequestWithRing)
 	curve := ring_secp256k1.NewCurve()
 	scalar, err := curve.DecodeToScalar(privKey.Bytes())
 	require.NoError(t, err, "DecodeToScalar should succeed")
 	require.NotNil(t, scalar, "Scalar should not be nil")
+}
+
+// TestPubKeyHexFromPrivKeyHex_ValidKey tests that the derived pubkey hex
+// matches the pubkey directly derived from the same private key bytes.
+func TestPubKeyHexFromPrivKeyHex_ValidKey(t *testing.T) {
+	pubHex, err := PubKeyHexFromPrivKeyHex(testPrivKeyHex)
+	require.NoError(t, err)
+	require.NotEmpty(t, pubHex)
+
+	keyBytes, err := hex.DecodeString(testPrivKeyHex)
+	require.NoError(t, err)
+	privKey := &secp256k1.PrivKey{Key: keyBytes}
+	require.Equal(t, hex.EncodeToString(privKey.PubKey().Bytes()), pubHex)
+}
+
+// TestPubKeyHexFromPrivKeyHex_EmptyKey tests that an empty key is rejected,
+// mirroring NewSignerFromHex's own validation.
+func TestPubKeyHexFromPrivKeyHex_EmptyKey(t *testing.T) {
+	_, err := PubKeyHexFromPrivKeyHex("")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "private key hex is empty")
+}
+
+// TestPubKeyHexFromPrivKeyHex_InvalidHex tests that malformed hex is rejected.
+func TestPubKeyHexFromPrivKeyHex_InvalidHex(t *testing.T) {
+	_, err := PubKeyHexFromPrivKeyHex("not-valid-hex")
+	require.Error(t, err)
+}
+
+// TestPubKeyHexFromPrivKeyHex_Deterministic tests that repeated calls with the
+// same key produce the same pubkey hex.
+func TestPubKeyHexFromPrivKeyHex_Deterministic(t *testing.T) {
+	first, err := PubKeyHexFromPrivKeyHex(testPrivKeyHex)
+	require.NoError(t, err)
+	second, err := PubKeyHexFromPrivKeyHex(testPrivKeyHex)
+	require.NoError(t, err)
+	require.Equal(t, first, second)
 }
 
 // TestKeyConsistency tests that same hex always produces same key and address.

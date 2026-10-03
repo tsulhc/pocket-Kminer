@@ -1,0 +1,331 @@
+#!/usr/bin/env bash
+#
+# Gate: static checks. Seconds, no cluster, no network.
+#
+#   gofmt -s · go build · go vet · golangci-lint · tracked-file guard · Spanish text
+#
+# Usage:
+#   scripts/gates/static.sh              # whole tree, both Go modules
+#   scripts/gates/static.sh --staged     # gofmt only what this commit stages
+#   PKG=miner scripts/gates/static.sh    # narrow build/vet to one package
+#
+# --staged exists for the pre-commit hook: formatting is judged on the files the
+# commit actually contains, while build/vet/lint stay whole-tree because a
+# package cannot be compiled in isolation from the change that breaks it.
+#
+# This repository has TWO Go modules -- the root and tilt/backend-server -- and
+# `go build ./...` in the root does not reach the second one. Both are checked
+# here, matching what `make lint` and `make fmt` already do.
+
+set -uo pipefail
+
+# shellcheck source=scripts/gates/lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
+gate_repo_root
+
+readonly BACKEND_DIR="tilt/backend-server"
+
+staged_only=0
+for arg in "$@"; do
+    case "$arg" in
+    --staged) staged_only=1 ;;
+    -h | --help)
+        sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+        exit 0
+        ;;
+    *)
+        printf 'unknown argument: %s\n' "$arg" >&2
+        exit 2
+        ;;
+    esac
+done
+
+pkg="$(gate_pkg_target)"
+
+# ---------------------------------------------------------------------------
+gate_step "gofmt"
+if [ "$staged_only" -eq 1 ]; then
+    # Added, copied, modified, renamed -- not deleted, which have nothing left
+    # to format. NUL-delimited so a path containing a space survives.
+    staged_go=()
+    while IFS= read -r -d '' f; do
+        case "$f" in
+        *.go) staged_go+=("$f") ;;
+        esac
+    done < <(git diff --cached --name-only --diff-filter=ACMR -z)
+
+    if [ "${#staged_go[@]}" -eq 0 ]; then
+        gate_pass "no Go files staged"
+    else
+        unformatted="$(gofmt -s -l "${staged_go[@]}" 2>/dev/null || true)"
+        if [ -n "$unformatted" ]; then
+            gate_fail "these staged files are not gofmt'd:"
+            gate_detail "$unformatted"
+            printf '         run: %smake fmt%s, then stage the result\n' \
+                "$GATE_BOLD" "$GATE_RESET"
+        else
+            gate_pass "staged Go files are formatted"
+        fi
+    fi
+    # Reported in BOTH modes, so the gate's contract does not depend on which
+    # one ran: --staged used to say nothing, and a gate that reports units in one
+    # mode and not the other is a NOT RUN waiting for the day all.sh gains a
+    # staged path. Zero staged Go files honestly measures nothing here; the
+    # pre-commit hook does not read units, so it still commits.
+    gate_exercised coverage staged_go_files "${#staged_go[@]}"
+else
+    # gofmt over TRACKED files only, never `gofmt -s -l .`: unlike the go
+    # command's walker, gofmt DOES descend dot- and underscore-prefixed
+    # directories, so gitignored scratch (.claude/worktrees/, an agent's
+    # half-edited file, a rescue under scripts/localonly/_rescued/) can turn
+    # the gate red -- and the printed remedy (`make fmt` = go fmt ./...,
+    # which skips those dirs) can never fix it.
+    unformatted="$(git ls-files -z '*.go' | xargs -0 -r gofmt -s -l 2>/dev/null || true)"
+    if [ -n "$unformatted" ]; then
+        gate_fail "these files are not gofmt'd:"
+        gate_detail "$unformatted"
+        printf '         run: %smake fmt%s\n' "$GATE_BOLD" "$GATE_RESET"
+    else
+        gate_pass "all tracked Go files are formatted"
+    fi
+    gate_exercised coverage gofmt_files "$(git ls-files '*.go' | grep -c . || true)"
+fi
+
+# ---------------------------------------------------------------------------
+gate_step "go build"
+# -o /dev/null: without it, `go build` on a pattern that resolves to a SINGLE
+# main package writes the executable into the current directory. Measured
+# 2026-08-26 with PKG=scripts/ws-test: an 8 MB binary appeared at the repo root,
+# untracked and NOT gitignored, so the next `git add` would have offered it.
+if build_out="$(go build -o /dev/null "$pkg" 2>&1)"; then
+    gate_pass "root module builds"
+else
+    gate_fail "the root module does not build:"
+    gate_detail "$build_out"
+fi
+
+if [ -f "$BACKEND_DIR/go.mod" ]; then
+    if build_out="$(cd "$BACKEND_DIR" && go build ./... 2>&1)"; then
+        gate_pass "$BACKEND_DIR builds"
+    else
+        gate_fail "$BACKEND_DIR does not build:"
+        gate_detail "$build_out"
+    fi
+else
+    gate_skip "$BACKEND_DIR absent on this branch"
+fi
+
+# ---------------------------------------------------------------------------
+gate_step "go vet"
+if vet_out="$(go vet "$pkg" 2>&1)"; then
+    gate_pass "root module vet clean"
+else
+    gate_fail "go vet (root module):"
+    gate_detail "$vet_out"
+fi
+
+# Again under the `test` tag, which is NOT a formality: this repository puts
+# test-only helpers behind //go:build test, so a plain vet never compiles them.
+# Without this pass a change can delete a symbol that only test code uses and
+# reach a green level 1 while the suite does not build -- observed, not
+# theoretical. Cheap enough to always run, and it fails minutes earlier than the
+# test gate would.
+if vet_out="$(go vet -tags test "$pkg" 2>&1)"; then
+    gate_pass "root module vet clean (-tags test)"
+else
+    gate_fail "go vet -tags test (root module):"
+    gate_detail "$vet_out"
+fi
+
+if [ -f "$BACKEND_DIR/go.mod" ]; then
+    if vet_out="$(cd "$BACKEND_DIR" && go vet ./... 2>&1)"; then
+        gate_pass "$BACKEND_DIR vet clean"
+    else
+        gate_fail "go vet ($BACKEND_DIR):"
+        gate_detail "$vet_out"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# .gitignore cannot enforce anything on a path git already tracks, which is
+# exactly how .planning/ and .idea/ ended up in the repository. Guarded by
+# Go files left under scripts/localonly/ compile as part of the module, and they
+# are almost always EVIDENCE copies from a delivery -- a test pulled out of a
+# worktree to show a red. They reference identifiers that do not exist at the
+# repository root, so vet and the linter fail with "undefined: SessionLifecycleManager"
+# and nothing points at the real cause. Measured 2026-09-17: six such files from
+# three earlier deliveries failed this gate, and the message named none of them.
+#
+# The trap only bites the MAIN tree: a fresh worktree does not carry gitignored
+# files, so a delivery's own gate passes green and the failure surfaces at
+# integration. Go ignores any directory or file whose name starts with "_" or
+# ".", so the fix is to move the file under a "_rescued/" directory.
+gate_step "stray Go files under scripts/localonly"
+if [ -d scripts/localonly ]; then
+    stray="$(find scripts/localonly -name '*.go' -not -path '*/[._]*' 2>/dev/null | sort)"
+    if [ -z "$stray" ]; then
+        gate_pass "no Go files under scripts/localonly that the module would compile"
+    else
+        gate_fail "Go files under scripts/localonly are compiled with the module:"
+        gate_detail "$stray"
+        gate_detail "move each one under a directory starting with _ (e.g. _rescued/)"
+    fi
+else
+    gate_skip "scripts/localonly not present"
+fi
+
+# existence so this gate still runs on branches predating the script.
+gate_step "tracked files"
+if [ -x ./scripts/check-tracked-files.sh ]; then
+    if tracked_out="$(./scripts/check-tracked-files.sh 2>&1)"; then
+        gate_pass "no local-only files tracked"
+    else
+        gate_fail "local-only files are tracked:"
+        gate_detail "$tracked_out"
+    fi
+else
+    gate_skip "scripts/check-tracked-files.sh not present on this branch"
+fi
+
+# ---------------------------------------------------------------------------
+# Every tracked text is English. c1cc164 had to translate 25 files by hand, and
+# nothing stopped the next one from arriving. The matcher lives in lib.sh
+# (gate_spanish_hits) so lib_test.sh can prove it bites; the word list is
+# scripts/gates/spanish-words.txt, the only file the check excludes.
+#
+# --staged reads the INDEX (what the commit contains), the full run reads the
+# working tree; both scan every tracked file, not only the staged ones. Zero
+# files scanned is a broken matcher, not a clean tree.
+gate_step "Spanish in tracked files"
+spanish_mode=''
+[ "$staged_only" -eq 1 ] && spanish_mode='--cached'
+spanish_scanned="$(gate_spanish_scanned .)"
+spanish_out="$(gate_spanish_hits . scripts/gates/spanish-words.txt ${spanish_mode:+"$spanish_mode"})"
+spanish_rc=$?
+case "$spanish_rc" in
+0) gate_pass "no Spanish in $spanish_scanned tracked file(s)" ;;
+1)
+    gate_fail "Spanish text in tracked files (path:line):"
+    gate_detail "$spanish_out" 30
+    printf '         translate it; if a listed word is a false positive, remove THE WORD from scripts/gates/spanish-words.txt\n'
+    ;;
+*) gate_fail "the Spanish check could not look ($spanish_scanned tracked file(s), word list scripts/gates/spanish-words.txt) -- the matcher is broken, not the tree" ;;
+esac
+gate_exercised coverage spanish_scanned_files "$spanish_scanned"
+
+# ---------------------------------------------------------------------------
+# Last, because it is by far the slowest.
+gate_step "golangci-lint"
+if ! command -v golangci-lint >/dev/null 2>&1; then
+    gate_skip "golangci-lint not installed -- CI will run it"
+else
+    if lint_out="$(golangci-lint run 2>&1)"; then
+        gate_pass "root module lint clean"
+    else
+        gate_fail "golangci-lint (root module):"
+        gate_detail "$lint_out" 30
+    fi
+
+    if [ -f "$BACKEND_DIR/go.mod" ]; then
+        if lint_out="$(cd "$BACKEND_DIR" && golangci-lint run 2>&1)"; then
+            gate_pass "$BACKEND_DIR lint clean"
+        else
+            gate_fail "golangci-lint ($BACKEND_DIR):"
+            gate_detail "$lint_out" 30
+        fi
+    fi
+fi
+
+gate_step "gate self-tests"
+if lib_test_out="$(./scripts/gates/lib_test.sh 2>&1)"; then
+    gate_pass "gate helper self-tests pass"
+else
+    gate_fail "scripts/gates/lib_test.sh:"
+    gate_detail "$lib_test_out" 20
+fi
+
+gate_step "skill output contracts"
+# Every skill declares WHAT its reply must contain, under one heading, so the
+# behaviour is comparable across both products rather than left to prose. Agreed
+# with budgetkit 2026-08-26, which added the same check to its own level 1 --
+# verified by reading that repository ON THAT DATE and by nothing since. Nothing
+# here observes the other product, so the parity is a coordination fact with an
+# expiry, not an asserted invariant.
+#
+# The walk protects itself: ZERO skills found is a broken matcher, not a clean
+# tree -- the failure mode this repository refuses everywhere else.
+contract_heading='## The one-line test for whether this ran'
+missing_contract=()
+skill_count=0
+while IFS= read -r skill; do
+    skill_count=$((skill_count + 1))
+    grep -qF "$contract_heading" "$skill" || missing_contract+=("$(basename "$(dirname "$skill")")")
+done < <(find .claude/skills -mindepth 2 -maxdepth 2 -name SKILL.md | sort)
+
+if [ "$skill_count" -eq 0 ]; then
+    gate_fail "found NO skills under .claude/skills -- the matcher is broken, not the tree"
+elif [ "${#missing_contract[@]}" -ne 0 ]; then
+    gate_fail "these skills declare no output contract: ${missing_contract[*]}"
+    printf '         add: %s\n' "$contract_heading"
+else
+    gate_pass "all $skill_count skill(s) declare their output contract"
+fi
+gate_exercised coverage skill_contracts "$skill_count"
+
+gate_step "dashboards"
+# The Grafana dashboards are generated from the metrics the Go code defines.
+# A metric added with no panel, or a JSON file edited by hand, fails here.
+if dash_out=$(python3 scripts/dashboards/generate.py --check 2>&1); then
+    gate_pass "$dash_out"
+else
+    gate_fail "dashboards drifted from the code (python3 scripts/dashboards/generate.py):"
+    printf '%s\n' "$dash_out" | sed 's/^/         /'
+fi
+
+gate_step "unreachable functions"
+
+# A function nobody calls is not merely clutter here: it is how an assertion
+# stops running without anything going red. Measured 2026-08-30:
+# RecordClaimLeafStats compared the leaves we claim against the relays we
+# counted and bumped claim_leaf_collapse_total on a shortfall -- money we served
+# and will not be billed for. Its only caller was deleted with claim_pipeline.go
+# on 2026-06-24. For four months golangci-lint passed (its `unused` check does
+# not report EXPORTED identifiers), CI passed, and the repo's own metric check
+# passed (it counts REFERENCES to the metric variable, and the dead recorder
+# mentions it). docs/CLAIM_LEAF_MODEL.md meanwhile told operators to watch a
+# counter that could not move.
+#
+# Roots are the production mains, and TEST FILES ARE NOT ROOTS. That is the
+# whole point: a function alive only because its own unit test calls it is the
+# self-deception this check exists to catch, and it is precisely the shape that
+# survived above.
+if ! command -v deadcode >/dev/null 2>&1 && [ ! -x "$(go env GOPATH)/bin/deadcode" ]; then
+    gate_skip "deadcode not installed -- go install golang.org/x/tools/cmd/deadcode@latest"
+else
+    deadcode_bin="$(command -v deadcode || echo "$(go env GOPATH)/bin/deadcode")"
+    allowlist="scripts/gates/deadcode-allowlist.txt"
+    dc_out="$(mktemp)"; dc_allowed="$(mktemp)"; dc_new="$(mktemp)"
+    trap 'rm -f "$dc_out" "$dc_allowed" "$dc_new"' RETURN 2>/dev/null || true
+
+    # "file.go Func", no line numbers: the allowlist must not churn on every edit.
+    "$deadcode_bin" -filter 'pocket-relay-miner' ./... 2>/dev/null |
+        sed 's/^\(.*\):[0-9]*:[0-9]*: unreachable func: \(.*\)$/\1 \2/' | sort -u > "$dc_out"
+    grep -v '^#' "$allowlist" 2>/dev/null | grep -v '^[[:space:]]*$' |
+        sed 's/[[:space:]]*#.*$//' | sed 's/[[:space:]]*$//' | sort -u > "$dc_allowed"
+    comm -23 "$dc_out" "$dc_allowed" > "$dc_new"
+
+    dc_total="$(wc -l < "$dc_out" | tr -d " ")"
+    dc_newcount="$(wc -l < "$dc_new" | tr -d " ")"
+    if [ "${dc_newcount:-0}" -gt 0 ]; then
+        gate_fail "$dc_newcount function(s) unreachable from the production mains and not in $allowlist"
+        sed 's/^/         /' "$dc_new"
+        printf '         Either wire it up, delete it, or add it with the reason why it stays.\n'
+    else
+        gate_pass "no new unreachable functions ($dc_total known, frozen in the allowlist)"
+    fi
+    gate_exercised coverage unreachable_known "$dc_total"
+    rm -f "$dc_out" "$dc_allowed" "$dc_new"
+fi
+
+gate_verdict "static"

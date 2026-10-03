@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
-	"sync"
 	"testing"
 
 	"github.com/pokt-network/smt"
@@ -28,12 +27,8 @@ func (m *mockDeduplicator) IsDuplicate(_ context.Context, _ []byte, _ string) (b
 	return false, nil
 }
 
-func (m *mockDeduplicator) MarkProcessed(_ context.Context, _ []byte, _ string) error {
-	return nil
-}
-
-func (m *mockDeduplicator) MarkProcessedBatch(_ context.Context, _ [][]byte, _ string) error {
-	return nil
+func (m *mockDeduplicator) MarkProcessed(_ context.Context, _ []byte, _ string) (bool, error) {
+	return true, nil
 }
 
 func (m *mockDeduplicator) CleanupSession(_ context.Context, sessionID string) error {
@@ -55,11 +50,6 @@ type mockSMSTManager struct {
 	deleteErr    error
 }
 
-type mockStreamDeleter struct {
-	deletedStreams []string
-	deleteErr      error
-}
-
 func (m *mockSMSTManager) FlushTree(_ context.Context, _ string) ([]byte, error) {
 	return []byte("mock-root"), nil
 }
@@ -77,19 +67,13 @@ func (m *mockSMSTManager) DeleteTree(_ context.Context, sessionID string) error 
 	return m.deleteErr
 }
 
-func (m *mockStreamDeleter) DeleteStream(_ context.Context, sessionID string) error {
-	m.deletedStreams = append(m.deletedStreams, sessionID)
-	return m.deleteErr
-}
-
 // createTestLifecycleCallback creates a LifecycleCallback with minimal dependencies for testing.
 func createTestLifecycleCallback(smstManager SMSTManager) *LifecycleCallback {
 	logger := logging.NewLoggerFromConfig(logging.DefaultConfig())
 	return &LifecycleCallback{
-		logger:       logger,
-		config:       DefaultLifecycleCallbackConfig(),
-		smstManager:  smstManager,
-		sessionLocks: make(map[string]*sync.Mutex),
+		logger:      logger,
+		config:      DefaultLifecycleCallbackConfig(),
+		smstManager: smstManager,
 	}
 }
 
@@ -143,56 +127,6 @@ func TestLifecycleCallback_OnProbabilisticProved_CleansDeduplicator(t *testing.T
 	require.NoError(t, err)
 	require.Len(t, dedup.cleanedSessions, 1)
 	require.Equal(t, "test-session-456", dedup.cleanedSessions[0])
-}
-
-// TestLifecycleCallback_OnClaimWindowClosed_CleansResources verifies that
-// claim window terminal cleanup removes SMST, stream and dedup state.
-func TestLifecycleCallback_OnClaimWindowClosed_CleansResources(t *testing.T) {
-	smstManager := &mockSMSTManager{}
-	streamDeleter := &mockStreamDeleter{}
-	dedup := &mockDeduplicator{}
-
-	lc := createTestLifecycleCallback(smstManager)
-	lc.SetStreamDeleter(streamDeleter)
-	lc.SetDeduplicator(dedup)
-
-	snapshot := &SessionSnapshot{
-		SessionID:               "test-session-claim-window-closed",
-		SupplierOperatorAddress: "pokt1supplier",
-		ServiceID:               "svc1",
-		RelayCount:              50,
-	}
-
-	err := lc.OnClaimWindowClosed(context.Background(), snapshot)
-	require.NoError(t, err)
-	require.Equal(t, []string{"test-session-claim-window-closed"}, smstManager.deletedTrees)
-	require.Equal(t, []string{"test-session-claim-window-closed"}, streamDeleter.deletedStreams)
-	require.Equal(t, []string{"test-session-claim-window-closed"}, dedup.cleanedSessions)
-}
-
-// TestLifecycleCallback_OnProofWindowClosed_CleansResources verifies that
-// proof window terminal cleanup removes SMST, stream and dedup state.
-func TestLifecycleCallback_OnProofWindowClosed_CleansResources(t *testing.T) {
-	smstManager := &mockSMSTManager{}
-	streamDeleter := &mockStreamDeleter{}
-	dedup := &mockDeduplicator{}
-
-	lc := createTestLifecycleCallback(smstManager)
-	lc.SetStreamDeleter(streamDeleter)
-	lc.SetDeduplicator(dedup)
-
-	snapshot := &SessionSnapshot{
-		SessionID:               "test-session-proof-window-closed",
-		SupplierOperatorAddress: "pokt1supplier",
-		ServiceID:               "svc1",
-		RelayCount:              50,
-	}
-
-	err := lc.OnProofWindowClosed(context.Background(), snapshot)
-	require.NoError(t, err)
-	require.Equal(t, []string{"test-session-proof-window-closed"}, smstManager.deletedTrees)
-	require.Equal(t, []string{"test-session-proof-window-closed"}, streamDeleter.deletedStreams)
-	require.Equal(t, []string{"test-session-proof-window-closed"}, dedup.cleanedSessions)
 }
 
 // TestLifecycleCallback_NilDeduplicator_NoError verifies that OnSessionProved

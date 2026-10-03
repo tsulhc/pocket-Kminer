@@ -1,7 +1,7 @@
 # miner.tilt - Miner deployment (HA mode with leader election)
 
 load("./ports.Tiltfile", "get_miner_ports")
-load("./utils.Tiltfile", "deep_merge", "read_miner_example_config", "get_redis_host", "apply_k8s_overrides_miner")
+load("./utils.Tiltfile", "deep_merge", "read_miner_example_config", "get_redis_host", "apply_k8s_overrides_miner", "config_hash")
 
 def deploy_miners(config):
     """Deploy miner as a Deployment with N replicas"""
@@ -11,14 +11,15 @@ def deploy_miners(config):
 
     print("Deploying miner Deployment with {} replica(s)...".format(config["miner"]["count"]))
 
-    # Create miner ConfigMap first
-    create_miner_configmap(config)
+    # Create miner ConfigMap first, and reuse its rendered YAML so the
+    # Deployment can carry the config hash that rolls the pods on a change.
+    miner_config_yaml = create_miner_configmap(config)
 
     # Deploy single miner Deployment with replicas
-    deploy_miner_deployment(config)
+    deploy_miner_deployment(config, config_hash(miner_config_yaml))
 
 def create_miner_configmap(config):
-    """Create ConfigMap with miner configuration"""
+    """Create ConfigMap with miner configuration. Returns the rendered YAML."""
     miner_config_dict = generate_miner_config(config)
 
     # Add known_applications from parent config if available
@@ -40,7 +41,9 @@ data:
 
     k8s_yaml(blob(miner_configmap))
 
-def deploy_miner_deployment(config):
+    return miner_config_yaml
+
+def deploy_miner_deployment(config, miner_config_hash):
     """Deploy miner as a single Deployment with N replicas"""
 
     # Miner Deployment with replicas + Service
@@ -52,7 +55,7 @@ metadata:
   labels:
     app: miner
 spec:
-  replicas: {}
+  replicas: {replicas}
   selector:
     matchLabels:
       app: miner
@@ -60,10 +63,124 @@ spec:
     metadata:
       labels:
         app: miner
+      annotations:
+        # See config_hash in utils.Tiltfile: a mounted ConfigMap change does not
+        # roll pods by itself, and the miner reads its config only at startup.
+        pocket-relay-miner/config-hash: "{config_hash}"
     spec:
+      initContainers:
+      # Build a cosmos keyring from the SAME hex keys the keys_file holds, so the
+      # stack can be run against either source without changing what suppliers
+      # exist. The "test" backend needs no passphrase and stores to disk; pocketd
+      # writes /keyring/keyring-test/<name>.info, which is exactly what a
+      # KeyringProvider with backend "test" and dir /keyring reads.
+      #
+      # No curly braces below: this YAML is rendered through Starlark's
+      # .format(), which reads them as placeholders and fails the Tiltfile.
+      #
+      # An emptyDir, rebuilt on every pod start, on purpose: the keyring is
+      # DERIVED from the secret, so there is one source of truth for which keys
+      # exist and no second place to update.
+      - name: build-keyring
+        image: ghcr.io/pokt-network/pocketd:0.1.35
+        # As the SAME user the app container runs as, so the keyring files are
+        # born owned by it. The first attempt chowned them afterwards instead and
+        # failed with "Operation not permitted": this image does not run as root,
+        # so it could not hand ownership to anyone. Before that the files were
+        # simply unreadable to the app, which loaded ZERO keys.
+        securityContext:
+          runAsUser: 1000
+          runAsGroup: 1000
+        env:
+        # pocketd writes a client config under $HOME on startup, and as a
+        # non-root user in this image $HOME is not writable: it tried /.pocket
+        # and failed with "permission denied", which surfaced as a failed key
+        # import until the error stopped being swallowed.
+        - name: HOME
+          value: /tmp
+        command:
+        - sh
+        - -c
+        - |
+          set -eu
+          # Derived data, rebuilt from scratch. An emptyDir survives a container
+          # RESTART, and import-hex refuses a name that already exists, so a
+          # retry after any failure would die on supplier1 "already exists" --
+          # reporting the retry instead of the cause. Measured: that is exactly
+          # what a CrashLoopBackOff here looked like.
+          # The CONTENTS, not the directory: /keyring is the mount point and
+          # removing it fails with "Permission denied". Named explicitly rather
+          # than globbed, because these are the only two subdirectories cosmos-sdk
+          # creates and a glob would need a shell brace this YAML cannot carry.
+          rm -rf /keyring/keyring-file /keyring/keyring-test
+          mkdir -p /keyring
+          # Read the backend from the RENDERED config rather than taking it as a
+          # parameter: the keyring must be built in the same format the process
+          # will open, and reading the one file that decides that makes them
+          # agree by construction. No keyring block (keys_file mode) means the
+          # keyring is still built, in the default format, so switching source
+          # later is a config change and nothing else.
+          # No braces and no backslashes anywhere in this script. This YAML goes
+          # through Starlark's .format() (which reads a brace as a placeholder)
+          # inside a triple-quoted Starlark string (where a backslash-n becomes
+          # a REAL newline -- that one produced a YAML "unknown directive"
+          # because the fragment after it started with a percent sign). Two
+          # greps instead of awk or sed for exactly that reason.
+          # The two greps must not be allowed to fail the script: under set -e an
+          # assignment from a failing pipeline aborts immediately, and in
+          # keys_file mode there IS no backend line, so the init container died
+          # before printing anything and the fallback below never ran. Measured
+          # 2026-08-22, switching the fleet back to keys_file.
+          BACKEND=$(grep -oE 'backend: *"?(file|test)' /config/config.yaml | head -1 | grep -oE 'file|test' || true)
+          if [ -z "$BACKEND" ]; then BACKEND=test; fi
+          # The passphrase, twice, in a file: cosmos-sdk asks once and then a
+          # second time to confirm when it is CREATING the keyring (no keyhash
+          # file yet), so feeding two lines covers both cases. A file rather
+          # than a printf because printf would need a backslash-n.
+          PASS=$(cat /keyring-pass/passphrase)
+          echo "$PASS" > /tmp/pp
+          echo "$PASS" >> /tmp/pp
+          i=0
+          # The hex keys are one per line in the mounted secret. Selecting them by
+          # LENGTH instead of a regex quantifier keeps this free of a yq
+          # dependency in the pocketd image and free of curly braces, which the
+          # Starlark .format() that renders this YAML reads as placeholders.
+          for hex in $(grep -oiE '[0-9a-f]+' /keys/supplier-keys.yaml | awk 'length == 64'); do
+            i=$((i+1))
+            # The spare second line dies with the process; the test backend
+            # ignores stdin entirely. pocketd's own error is PRINTED, not
+            # swallowed: discarding it once already hid the real cause behind a
+            # generic failure line.
+            if ! pocketd keys import-hex "supplier$i" "$hex" \
+              --keyring-backend "$BACKEND" --keyring-dir /keyring < /tmp/pp >/dev/null; then
+              echo "failed to import supplier$i into the $BACKEND keyring (error above)" >&2
+              exit 1
+            fi
+          done
+          # No chown and no chmod: runAsUser above makes these files the app
+          # user's, and cosmos-sdk writes them 0600 already. Touching the mount
+          # point itself is not permitted to a non-root user anyway.
+          # Importing nothing is a failure, not a quiet success. When the
+          # supplier-keys Secret went missing this printed "imported 0 keys" and
+          # exited 0, and the problem only surfaced two layers down as the app
+          # refusing to start. Fail where the cause is.
+          if [ "$i" -eq 0 ]; then
+            echo "no 64-character hex keys in /keys/supplier-keys.yaml: the supplier-keys secret is missing or empty" >&2
+            exit 1
+          fi
+          echo "imported $i keys into the $BACKEND keyring at /keyring, owned by uid 1000"
+        volumeMounts:
+        - name: config
+          mountPath: /config
+        - name: keys
+          mountPath: /keys
+        - name: keyring
+          mountPath: /keyring
+        - name: keyring-pass
+          mountPath: /keyring-pass
       containers:
       - name: miner
-        image: {}
+        image: {image}
         imagePullPolicy: Never
         command:
         - pocket-relay-miner
@@ -75,10 +192,12 @@ spec:
         - containerPort: 6060
           name: pprof
         env:
-        - name: GOMAXPROCS
-          value: "4"  # Match CPU limit - makes runtime.NumCPU() return 4
         - name: LOG_LEVEL
-          value: "{}"
+          value: "{log_level}"
+        # Soft limit for the Go runtime below the container limit, so the GC
+        # tightens before the kernel OOM-kills the pod.
+        - name: GOMEMLIMIT
+          value: "7GiB"
         - name: POD_NAME
           valueFrom:
             fieldRef:
@@ -88,13 +207,21 @@ spec:
           mountPath: /config
         - name: keys
           mountPath: /keys
+        - name: keyring
+          mountPath: /keyring
+        - name: keyring-pass
+          mountPath: /keyring-pass
         resources:
           requests:
             cpu: "500m"
             memory: "512Mi"
           limits:
-            cpu: "4000m"  # 4 cores - miner is the core component doing SMST, claims, proofs
-            memory: "2Gi"
+            # From miner.cpu_cores. GOMAXPROCS is NOT set: automaxprocs
+            # (main.go:7) derives it from THIS limit, and a present env would make
+            # it return without touching anything (maxprocs.go:105-111). The miner
+            # is the core component doing SMST, claims and proofs.
+            cpu: "{cpu_limit}"
+            memory: "8Gi"
         readinessProbe:
           httpGet:
             path: /health
@@ -109,6 +236,11 @@ spec:
         secret:
           secretName: supplier-keys
           optional: true
+      - name: keyring
+        emptyDir: {{}}
+      - name: keyring-pass
+        secret:
+          secretName: keyring-passphrase
 ---
 apiVersion: v1
 kind: Service
@@ -127,9 +259,11 @@ spec:
     targetPort: 6060
     name: pprof
 """.format(
-        config["miner"]["count"],
-        config["global"]["image"],
-        "debug" if config["global"]["debug"] else "info"
+        replicas=config["miner"]["count"],
+        config_hash=miner_config_hash,
+        image=config["global"]["image"],
+        log_level="debug" if config["global"]["debug"] else "info",
+        cpu_limit="{}000m".format(config["miner"]["cpu_cores"]),
     )
 
     k8s_yaml(blob(miner_yaml))
@@ -152,6 +286,7 @@ def generate_miner_config(config):
     1. Base: config.miner.example.yaml (single source of truth for defaults)
     2. User overrides: tilt_config.yaml miner.config section
     3. K8s overrides: Redis URL, validator URL, keys path, metrics addr
+    4. The localnet clock, which is not the miner's to hold on its own
     """
     # 1. Read example config as base
     base_config = read_miner_example_config()
@@ -163,6 +298,19 @@ def generate_miner_config(config):
     # 3. Apply k8s-specific overrides (service names, paths)
     redis_host = get_redis_host(config.get("redis", {}).get("mode", "standalone"))
     final_config = apply_k8s_overrides_miner(merged_config, redis_host)
+
+    # 4. THE clock, from localnet.block_time_seconds -- the same number that
+    # becomes the validator's timeout_commit. It is forced rather than merged
+    # because two places holding one clock is how they drift, and the miner
+    # derives its claim and proof deadlines from this value: a divergence
+    # miscomputes them with no error anywhere. Forcing an operator's value is
+    # announced, the way the mode matrix in utils.Tiltfile announces its own.
+    block_time = config["localnet"]["block_time_seconds"]
+    stored = final_config.get("block_time_seconds")
+    if stored != block_time:
+        print("localnet clock: forcing miner block_time_seconds {!r} -> {!r} (set localnet.block_time_seconds instead)".format(
+            stored, block_time))
+    final_config["block_time_seconds"] = block_time
 
     return final_config
 

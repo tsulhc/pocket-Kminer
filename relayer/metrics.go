@@ -1,6 +1,11 @@
 package relayer
 
 import (
+	"errors"
+	"fmt"
+	"sync/atomic"
+
+	"github.com/alitto/pond/v2"
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/pokt-network/pocket-relay-miner/observability"
@@ -10,6 +15,21 @@ const (
 	metricsNamespace = "ha"
 	metricsSubsystem = "relayer"
 )
+
+// statusCodeNoHTTP is the status_code value for transports that HAVE no HTTP
+// status: gRPC and WebSocket. It is deliberately NOT a gRPC code -- this repo
+// already decided not to mix two numbering systems in one field (see
+// tx/tx_rejection.go, which keeps ABCICode and GRPCCode in two differently typed
+// fields and says why), and a numeric value here would be read as an HTTP status
+// when grouping. It is not "200" either: a padded HTTP code would be a false
+// value in a label operators group by.
+//
+// It asserts success, and that is true BY CONSTRUCTION at both sites that use
+// it: the gRPC increment sits after a successful SendMsg on the success branch,
+// and the WebSocket one at the top of emitRelay, which is reached only after the
+// response was written to the gateway. A future non-success site on those
+// transports needs its own value, not this one.
+const statusCodeNoHTTP = "ok"
 
 var (
 	// Request metrics
@@ -33,6 +53,52 @@ var (
 		[]string{"service_id", "rpc_type", "status_code"},
 	)
 
+	// relaysServedOverBudget counts relays that were served and charged and left
+	// their session at or over its budget. A WebSocket backend message is charged
+	// after it is served, so the one that reaches the budget is served and then
+	// closes the connection: at most one per connection. It is apart from
+	// relays_rejected_total because the relay WAS served, and apart from
+	// websocket_closes_total because that series does not say whether anything
+	// was served past the budget. reason is a constant.
+	relaysServedOverBudget = observability.RelayerFactory.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      "relays_served_over_budget_total",
+			Help:      "Relays served and charged that left their session at or over its budget",
+		},
+		[]string{"service_id", "rpc_type", "reason"},
+	)
+
+	// backendMissing counts relays that resolved no backend pool for their
+	// requested transport type on a service that exists. Under the strict
+	// backend contract (no cross-transport fallback) this is the signal an
+	// operator needs: e.g. a `websocket` relay arriving at a service that has
+	// only a jsonrpc backend configured. rpc_type is the resolved backend-type
+	// name, bounded to the five known transports (plus any explicit override),
+	// so cardinality stays low.
+	backendMissing = observability.RelayerFactory.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      "backend_missing_total",
+			Help:      "Relays with no backend configured for their transport type (service exists but lacks that backend)",
+		},
+		[]string{"service_id", "rpc_type"},
+	)
+
+	// liveConnectionsCut counts live WebSocket bridges and in-flight gRPC relays
+	// cut because Redis stopped taking writes, by transport (websocket, grpc).
+	liveConnectionsCut = observability.RelayerFactory.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      "live_connections_cut_total",
+			Help:      "Live WebSocket bridges and in-flight gRPC relays cut because Redis stopped taking writes",
+		},
+		[]string{"transport"},
+	)
+
 	relaysRejected = observability.RelayerFactory.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: metricsNamespace,
@@ -43,14 +109,50 @@ var (
 		[]string{"service_id", "rpc_type", "reason"},
 	)
 
+	// undeclaredTransportServed counts relays served for a (service, transport)
+	// the supplier did NOT declare on-chain (it staked the service but not that
+	// rpc_type endpoint). The relay is still served and is claimable — the chain
+	// keys claims by (supplier, session) and never sees the transport — so this
+	// is a visibility signal, not a rejection: declare the endpoint on-chain so
+	// a gateway routes it deliberately. It also fires for every relay of a supplier
+	// whose miner is too old to publish the per-transport stake view, because an
+	// empty view now declares nothing; the deduped warn names which of the two
+	// cases it is.
+	// Cardinality is service_id × rpc_type (bounded); the supplier is in the
+	// deduped warn log, not a label.
+	undeclaredTransportServed = observability.RelayerFactory.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      "undeclared_transport_served_total",
+			Help:      "Relays served for a (service, transport) the supplier did not declare on-chain (staked the service but not that rpc_type)",
+		},
+		[]string{"service_id", "rpc_type"},
+	)
+
+	// relaysServedOptimistically counts relays served during the boot window
+	// for a supplier that is absent from the registry but whose operator key
+	// this relayer holds (so it is ours). See handleRelay: the miner is the
+	// final arbiter and won't claim a non-staked supplier, so this is safe.
+	// A persistently high rate means the registry is not being populated.
+	relaysServedOptimistically = observability.RelayerFactory.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      "relays_served_optimistically_total",
+			Help:      "Relays served for an owned supplier not yet in the registry (boot-window optimistic path)",
+		},
+		[]string{"service_id", "rpc_type"},
+	)
+
 	relaysPublished = observability.RelayerFactory.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: metricsNamespace,
 			Subsystem: metricsSubsystem,
 			Name:      "relays_published_total",
-			Help:      "Total number of mined relays published to Redis",
+			Help:      "Mined relays ACCEPTED by the publisher, over any transport. Accepted is not written: the relayer always batches, so a relay is counted here the moment it is queued. ha_transport_published_total is the one that means it reached the stream, and this counter minus that one is what is queued and not yet dispatched. rpc_type is the transport that published it",
 		},
-		[]string{"service_id", "supplier"},
+		[]string{"service_id", "supplier", "rpc_type"},
 	)
 
 	relaysDropped = observability.RelayerFactory.NewCounterVec(
@@ -58,9 +160,41 @@ var (
 			Namespace: metricsNamespace,
 			Subsystem: metricsSubsystem,
 			Name:      "relays_dropped_total",
-			Help:      "Total number of relays served but not mined (optimistic mode: validation failed, meter error, stake exhausted)",
+			Help:      "Total number of relays served but not mined (optimistic mode: validation failed, meter error, stake exhausted). Because the relayer always batches, reason=publish_failed is only a REJECTION at enqueue -- a malformed message, or a closed publisher -- because a failing XADD no longer reaches the caller; those are counted in ha_transport_publish_errors_total",
 		},
-		[]string{"service_id", "application", "reason"},
+		// application excluded: on-chain bech32 address is unbounded on a
+		// Counter → TSDB OOM. Per-app detail is in the drop logs.
+		[]string{"service_id", "rpc_type", "reason"},
+	)
+
+	// simulatedRelaysTotal counts SIMULATED relays only. It is deliberately
+	// separate from every real-relay counter above: a simulated relay never
+	// increments relaysReceived/relaysServed/relaysRejected/etc. `key_id` is
+	// intentionally NOT a label (operator-chosen, potentially unbounded).
+	// result ∈ {success, rate_limited, verify_failed, replay_rejected,
+	// identity_mismatch, service_unknown, supplier_not_loaded, sign_failed,
+	// backend_error, meter_degraded}.
+	simulatedRelaysTotal = observability.RelayerFactory.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      "simulated_relays_total",
+			Help:      "Total simulated relays (health-check/probe traffic), isolated from real-relay counters",
+		},
+		[]string{"transport", "service", "supplier", "result"},
+	)
+
+	// simulatedRelayDuration is the end-to-end latency of simulated relays,
+	// kept separate from relayLatency so probe traffic never skews real p99s.
+	simulatedRelayDuration = observability.RelayerFactory.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      "simulated_relay_duration_seconds",
+			Help:      "End-to-end latency of simulated relays",
+			Buckets:   observability.FineGrainedLatencyBuckets,
+		},
+		[]string{"transport", "service"},
 	)
 
 	// === CRITICAL HISTOGRAMS (async recorded to avoid hot path blocking) ===
@@ -86,7 +220,7 @@ var (
 	//   - success             : 2xx/3xx/4xx response received and read
 	//   - backend_5xx         : 5xx response (not mined)
 	//   - backend_timeout     : our internal context deadline fired
-	//   - client_disconnected : PATH cancelled the request mid-flight
+	//   - client_disconnected : the gateway cancelled the request mid-flight
 	//   - backend_network_error: dial/read/reset/other transport error
 	backendLatency = observability.RelayerFactory.NewHistogramVec(
 		prometheus.HistogramOpts{
@@ -118,6 +252,100 @@ var (
 	// saturation: in_flight / max_conns. If saturation stays near 1.0, the
 	// service is pool-bound and needs a bigger profile (or a faster
 	// backend).
+	// workerPoolMaxWorkers is each subpool's capacity, so the depth above can be
+	// read against something. It changes only with the CPU limit.
+	workerPoolMaxWorkers = observability.RelayerFactory.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      "worker_pool_max_workers",
+			Help:      "Concurrent workers a subpool is allowed",
+		},
+		[]string{"subpool"},
+	)
+
+	// publishQueueBytes is the request AND response bodies the publish queue is
+	// holding. Task COUNT is not a proxy for it: a hundred tasks carrying 100 KB
+	// each are 10 MB of retained heap and a hundred carrying ten bytes are
+	// nothing, and it is the bytes that end a process, not the count.
+	// Per SERVICE, because the bound is per service: with a global bound the
+	// service that PAID the rejection and the one that was OCCUPYING could be
+	// different, which is the defect this replaced. The max below is its twin:
+	// a depth is only readable against the ceiling it is approaching, the same
+	// pairing as http_pool_in_flight with http_pool_max_conns.
+	validationQueueBytes = observability.RelayerFactory.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      "validation_queue_bytes",
+			Help:      "Request and response bodies held by this service's optimistic relays, served and not yet validated",
+		},
+		[]string{"service_id"},
+	)
+
+	validationQueueMaxBytes = observability.RelayerFactory.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      "validation_queue_max_bytes",
+			Help:      "Most this service's optimistic relays may hold before it is refused (effective bound, floor applied)",
+		},
+		[]string{"service_id"},
+	)
+
+	publishQueueBytes = observability.RelayerFactory.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      "publish_queue_bytes",
+			Help:      "Request and response bodies currently retained by queued publish tasks",
+		},
+	)
+
+	// batch_queue_bytes is the batcher's own retained-bytes count -- the exact
+	// number the admission gate compares against redis.batch_max_queued_mib
+	// (cmd/cmd_relayer.go). It stayed unexported until 2026-09-22: a pulse test
+	// found a 1 GiB relayer RSS spike with zero publish_queue_full rejections,
+	// and there was no metric to say whether the gate saw it or not -- the
+	// number that decides admission was invisible to Prometheus.
+	//
+	// Read at scrape time and not written by the admission check: the queue
+	// drains while NO admission asks, and a gauge written only on admission kept
+	// the last size it saw -- measured, 3.1 MB three hours after a load ended.
+	_ = observability.RelayerFactory.NewGaugeFunc(
+		prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      "batch_queue_bytes",
+			Help:      "Bytes the batching publisher retains right now -- the exact value the admission gate compares against redis.batch_max_queued_mib",
+		},
+		func() float64 {
+			if read := batchQueueBytesSource.Load(); read != nil {
+				return float64((*read)())
+			}
+			return 0
+		},
+	)
+
+	// signingKeysLoaded is how many supplier signing keys this relayer holds
+	// right now. It moves on every hot reload.
+	//
+	// It is an OBSERVABLE and deliberately not a guard. The Redis pool is sized
+	// from the bounded workers and carries no supplier term, because what a
+	// supplier costs depends on how many applications relay through it -- demand
+	// we neither choose nor can read at startup. So there is no "expected"
+	// number to compare this against, and a guard would need a threshold
+	// somebody invented. What this gives an operator is the correlation instead:
+	// the moment latency changed is the moment the set went from 52 to 300.
+	signingKeysLoaded = observability.RelayerFactory.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      "signing_keys_loaded",
+			Help:      "Supplier signing keys the relayer currently holds (changes on key hot reload)",
+		},
+	)
+
 	httpPoolInFlight = observability.RelayerFactory.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Namespace: metricsNamespace,
@@ -166,12 +394,31 @@ var (
 		[]string{"service_id", "mode"}, // mode: eager, optimistic
 	)
 
+	// relayMeterUnbilled counts relays that were SERVED and submitted for mining
+	// without their stake being metered, because the meter could not answer.
+	//
+	// It exists because that outcome has no other signal. In optimistic mode the
+	// meter runs after the response is out, so refusing is not an option -- the
+	// relay is gone -- and dropping it, which is what happened until
+	// 2026-08-31, threw away work whose backend call was already paid for. What
+	// is left is over-servicing, bounded by the application's stake and settled
+	// by the chain, and this is the series that says how much of it happened.
+	relayMeterUnbilled = observability.RelayerFactory.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      "relay_meter_unbilled_total",
+			Help:      "Relays served and submitted for mining without being metered (the meter could not answer)",
+		},
+		[]string{"service_id"},
+	)
+
 	relayMeterLatency = observability.RelayerFactory.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Namespace: metricsNamespace,
 			Subsystem: metricsSubsystem,
 			Name:      "relay_meter_latency_seconds",
-			Help:      "Latency of relay meter check and consume operations (Redis calls)",
+			Help:      "Latency of relay meter check and consume operations (store calls)",
 			Buckets:   observability.FineGrainedLatencyBuckets,
 		},
 		[]string{"service_id", "mode"}, // mode: eager, optimistic
@@ -338,7 +585,7 @@ var (
 	)
 
 	// inboundRequestsByProto tracks the wire protocol every inbound request
-	// arrives on. Today PATH ships over HTTP/1.1 exclusively, so http1 will
+	// arrives on. Today the gateway ships over HTTP/1.1 exclusively, so http1 will
 	// be ~100% and h2c will be 0. The metric is here to surface any shift
 	// early — if h2c starts ticking, we know the MaxConcurrentStreams=250
 	// ceiling per-conn becomes relevant and inflight analysis has to
@@ -354,16 +601,6 @@ var (
 	)
 
 	// Streaming metrics
-	streamingRelaysServed = observability.RelayerFactory.NewCounterVec(
-		prometheus.CounterOpts{
-			Namespace: metricsNamespace,
-			Subsystem: metricsSubsystem,
-			Name:      "streaming_relays_served_total",
-			Help:      "Total number of streaming relay requests served (SSE/NDJSON)",
-		},
-		[]string{"service_id"},
-	)
-
 	streamingChunksForwarded = observability.RelayerFactory.NewCounter(
 		prometheus.CounterOpts{
 			Namespace: metricsNamespace,
@@ -391,6 +628,20 @@ var (
 		},
 	)
 
+	// difficultyQueryFailures counts failures to resolve a service's mining
+	// difficulty. The path FAILS OPEN (the relay is treated as applicable), so
+	// without this counter a broken difficulty query silently mines every
+	// relay against the wrong target with no visible signal.
+	difficultyQueryFailures = observability.RelayerFactory.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      "difficulty_query_failures_total",
+			Help:      "Failures to query a service's relay mining difficulty (fails open: relay treated as applicable)",
+		},
+		[]string{"service_id"},
+	)
+
 	// Mining difficulty metrics
 	relaysSkippedDifficulty = observability.RelayerFactory.NewCounterVec(
 		prometheus.CounterOpts{
@@ -399,17 +650,7 @@ var (
 			Name:      "relays_skipped_difficulty_total",
 			Help:      "Total number of relays skipped due to not meeting mining difficulty",
 		},
-		[]string{"service_id"},
-	)
-
-	relaysMinedSuccessfully = observability.RelayerFactory.NewCounterVec(
-		prometheus.CounterOpts{
-			Namespace: metricsNamespace,
-			Subsystem: metricsSubsystem,
-			Name:      "relays_mined_total",
-			Help:      "Total number of relays that met mining difficulty and were mined",
-		},
-		[]string{"service_id"},
+		[]string{"service_id", "rpc_type"},
 	)
 
 	// WebSocket metrics
@@ -443,58 +684,28 @@ var (
 		[]string{"service_id", "direction"}, // direction: gateway_to_backend, backend_to_gateway
 	)
 
-	wsRelaysEmitted = observability.RelayerFactory.NewCounterVec(
+	// wsClosesTotal is what separates "clients we refused" from "the backend is
+	// down" during an incident. Without it the only WebSocket counters are
+	// active/total/forwarded, so a flood of refused connections and a
+	// dead backend produce the same shape: connections_total climbing and
+	// connections_active flat.
+	//
+	// Both labels are bounded: close_code goes through closeCodeName, which has
+	// an Unknown default so a peer-supplied code cannot invent a series, and
+	// initiated_by goes through closeInitiatorForSource, which maps onto the
+	// three declared wsCloseInitiator constants.
+	wsClosesTotal = observability.RelayerFactory.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: metricsNamespace,
 			Subsystem: metricsSubsystem,
-			Name:      "websocket_relays_emitted_total",
-			Help:      "Total number of relays emitted for billing from WebSocket connections",
+			Name:      "websocket_closes_total",
+			Help:      "Total number of WebSocket bridge closures by close code and initiator",
 		},
-		[]string{"service_id"},
+		[]string{"service_id", "close_code", "initiated_by"},
 	)
 
-	// gRPC Relay Service metrics (for proper relay protocol over gRPC)
-	grpcRelaysTotal = observability.RelayerFactory.NewCounterVec(
-		prometheus.CounterOpts{
-			Namespace: metricsNamespace,
-			Subsystem: metricsSubsystem,
-			Name:      "grpc_relays_total",
-			Help:      "Total number of gRPC relay requests processed",
-		},
-		[]string{"service_id"},
-	)
-
-	grpcRelayErrors = observability.RelayerFactory.NewCounterVec(
-		prometheus.CounterOpts{
-			Namespace: metricsNamespace,
-			Subsystem: metricsSubsystem,
-			Name:      "grpc_relay_errors_total",
-			Help:      "Total number of gRPC relay request errors",
-		},
-		[]string{"service_id", "reason"},
-	)
-
-	grpcRelayLatency = observability.RelayerFactory.NewHistogramVec(
-		prometheus.HistogramOpts{
-			Namespace: metricsNamespace,
-			Subsystem: metricsSubsystem,
-			Name:      "grpc_relay_latency_seconds",
-			Help:      "Latency of gRPC relay requests",
-			Buckets:   observability.FineGrainedLatencyBuckets,
-		},
-		[]string{"service_id"},
-	)
-
-	grpcRelaysPublished = observability.RelayerFactory.NewCounterVec(
-		prometheus.CounterOpts{
-			Namespace: metricsNamespace,
-			Subsystem: metricsSubsystem,
-			Name:      "grpc_relays_published_total",
-			Help:      "Total number of gRPC relays published to Redis",
-		},
-		[]string{"service_id"},
-	)
-
+	// gRPC-Web metrics. gRPC relays themselves count in the same series as every
+	// other transport, under rpc_type="grpc".
 	grpcWebRequestsTotal = observability.RelayerFactory.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: metricsNamespace,
@@ -526,24 +737,65 @@ var (
 		[]string{"supplier", "service_id"},
 	)
 
-	relayMeterRedisErrors = observability.RelayerFactory.NewCounterVec(
+	relayMeterErrors = observability.RelayerFactory.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: metricsNamespace,
 			Subsystem: metricsSubsystem,
-			Name:      "relay_meter_redis_errors_total",
-			Help:      "Total relay meter Redis errors",
+			Name:      "relay_meter_errors_total",
+			Help:      "Total relay meter errors, whether the meter's own store or a chain query it depends on",
 		},
 		[]string{"operation"},
 	)
-
-	// Unused - reserved for future relay meter parameter refresh tracking
-	// relayMeterParamsRefreshed = observability.RelayerFactory.NewCounterVec(
-	// 	prometheus.CounterOpts{
-	// 		Namespace: metricsNamespace,
-	// 		Subsystem: metricsSubsystem,
-	// 		Name:      "relay_meter_params_refreshed_total",
-	// 		Help:      "Total relay meter parameter cache refreshes",
-	// 	},
-	// 	[]string{"param_type"}, // param_type: shared, session, app_stake, service
-	// )
 )
+
+// registerWorkerQueueDepth publishes each subpool's waiting-task count, read at
+// scrape time so it cannot go stale.
+//
+// GaugeFunc and not a value written from the submit path: a queue drains when
+// tasks COMPLETE, and nothing on the submit path runs then, so a gauge updated
+// only on submit would report the depth at the last submission rather than now
+// -- worst exactly when submissions stop because everything is stuck.
+//
+// AlreadyRegisteredError is tolerated because a process may build more than one
+// proxy (tests do). The first registration wins and keeps reading a live pool;
+// failing here would turn an observability detail into a startup error.
+func registerWorkerQueueDepth(subpools map[string]pond.Pool) error {
+	for name, sp := range subpools {
+		sp := sp
+		g := prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+			Namespace:   metricsNamespace,
+			Subsystem:   metricsSubsystem,
+			Name:        "worker_queue_depth",
+			Help:        "Tasks waiting in a worker subpool right now (the queues are unbounded)",
+			ConstLabels: prometheus.Labels{"subpool": name},
+		}, func() float64 {
+			return float64(sp.WaitingTasks())
+		})
+		if err := observability.RelayerRegistry.Register(g); err != nil {
+			var already prometheus.AlreadyRegisteredError
+			if !errors.As(err, &already) {
+				return fmt.Errorf("registering worker_queue_depth for subpool %q: %w", name, err)
+			}
+		}
+	}
+	return nil
+}
+
+// SetSigningKeysLoaded publishes how many supplier signing keys are loaded.
+//
+// Exported because the key manager is wired in package cmd, which is also the
+// only place that learns of a reload.
+func SetSigningKeysLoaded(n int) {
+	signingKeysLoaded.Set(float64(n))
+}
+
+// batchQueueBytesSource is what batch_queue_bytes reads at every scrape; nil
+// until the relayer wires its batcher.
+var batchQueueBytesSource atomic.Pointer[func() int]
+
+// SetBatchQueueBytesSource makes batch_queue_bytes read the batcher's queue.
+//
+// Exported because the batcher is wired in package cmd.
+func SetBatchQueueBytesSource(read func() int) {
+	batchQueueBytesSource.Store(&read)
+}

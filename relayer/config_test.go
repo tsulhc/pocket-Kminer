@@ -248,7 +248,13 @@ services:
 		require.Nil(t, cfg.GetPool("unknown", "jsonrpc"))
 	})
 
-	t.Run("fallback chain: default_backend", func(t *testing.T) {
+	// The four cases below used to assert the cross-transport fallback chain
+	// (default_backend -> jsonrpc -> rest -> any). That behaviour was removed:
+	// a relay is served only by an exact-type backend, because a transport is a
+	// wire protocol, not a preference. These now pin the strict contract — a
+	// mismatched request resolves to nil, and the caller rejects it cleanly.
+
+	t.Run("no fallback to default_backend for a concrete mismatched type", func(t *testing.T) {
 		input := `
 services:
   svc1:
@@ -260,12 +266,14 @@ services:
 		cfg := validConfigFromYAML(t, input)
 		require.NoError(t, cfg.BuildPools())
 
-		// Requesting jsonrpc but service has default_backend=rest
-		p := cfg.GetPool("svc1", "jsonrpc")
-		require.NotNil(t, p, "should fall back to default_backend")
+		// A concrete jsonrpc request must NOT be served by the rest backend just
+		// because rest is the default. default_backend applies only to a
+		// no-Rpc-Type request, and that is resolved by the caller before GetPool.
+		require.Nil(t, cfg.GetPool("svc1", "jsonrpc"),
+			"a concrete type mismatch must not fall back to default_backend")
 	})
 
-	t.Run("fallback chain: jsonrpc fallback", func(t *testing.T) {
+	t.Run("no fallback between HTTP-family types", func(t *testing.T) {
 		input := `
 services:
   svc1:
@@ -276,28 +284,13 @@ services:
 		cfg := validConfigFromYAML(t, input)
 		require.NoError(t, cfg.BuildPools())
 
-		// Requesting rest but service only has jsonrpc
-		p := cfg.GetPool("svc1", "rest")
-		require.NotNil(t, p, "should fall back to jsonrpc")
+		require.Nil(t, cfg.GetPool("svc1", "rest"),
+			"rest must not be served by the jsonrpc backend")
+		require.NotNil(t, cfg.GetPool("svc1", "jsonrpc"),
+			"the configured type still resolves")
 	})
 
-	t.Run("fallback chain: rest fallback", func(t *testing.T) {
-		input := `
-services:
-  svc1:
-    backends:
-      rest:
-        url: "http://api:3000"
-`
-		cfg := validConfigFromYAML(t, input)
-		require.NoError(t, cfg.BuildPools())
-
-		// Requesting jsonrpc but service only has rest
-		p := cfg.GetPool("svc1", "jsonrpc")
-		require.NotNil(t, p, "should fall back to rest")
-	})
-
-	t.Run("fallback chain: any available", func(t *testing.T) {
+	t.Run("no fallback across incompatible transports (the bug)", func(t *testing.T) {
 		input := `
 services:
   svc1:
@@ -308,9 +301,12 @@ services:
 		cfg := validConfigFromYAML(t, input)
 		require.NoError(t, cfg.BuildPools())
 
-		// Requesting grpc but service only has websocket
-		p := cfg.GetPool("svc1", "grpc")
-		require.NotNil(t, p, "should fall back to any available")
+		// The old "any available" tier handed a gRPC request the websocket pool.
+		// A gRPC relay can never be spoken over a ws:// backend.
+		require.Nil(t, cfg.GetPool("svc1", "grpc"),
+			"a gRPC request must not be handed a websocket backend")
+		// And the reverse: a websocket request must not get an http backend.
+		require.Nil(t, cfg.GetPool("svc1", "jsonrpc"))
 	})
 }
 
@@ -515,4 +511,16 @@ func validConfigFromYAML(t *testing.T, yamlStr string) Config {
 	err := yaml.Unmarshal([]byte(yamlStr), &cfg)
 	require.NoError(t, err)
 	return cfg
+}
+
+// TestConfig_Validate_RejectsBadLoggingLevel pins that logging validation is
+// wired into the relayer's Validate: a typo'd level used to silently run the
+// process at Info.
+func TestConfig_Validate_RejectsBadLoggingLevel(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Logging.Level = "warning"
+
+	err := cfg.Validate()
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "logging.level")
 }
