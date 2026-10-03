@@ -52,7 +52,7 @@ const (
 // (upstream A/B rebalancing applies to PG only).
 func TestStateCompatibilityRehearsal_PGDomain(t *testing.T) {
 	rehearseDomain(t, "pg", true)
-	t.Logf("state-compatibility verdict [pg]: %s", VerdictShortCutover)
+	t.Logf("domain state verdict [pg]: %s (cutover still needs AuthorizeCutover)", VerdictShortCutover)
 }
 
 // TestStateCompatibilityRehearsal_FGDomain rehearses the FG domain shape:
@@ -60,7 +60,7 @@ func TestStateCompatibilityRehearsal_PGDomain(t *testing.T) {
 // metadata and SMST live/claimed state. No FG→PG migration, no shared lease.
 func TestStateCompatibilityRehearsal_FGDomain(t *testing.T) {
 	rehearseDomain(t, "fg", false)
-	t.Logf("state-compatibility verdict [fg]: %s", VerdictShortCutover)
+	t.Logf("domain state verdict [fg]: %s (cutover still needs AuthorizeCutover)", VerdictShortCutover)
 }
 
 func rehearseDomain(t *testing.T, domain string, withLeases bool) {
@@ -163,4 +163,36 @@ func TestClassifySupplierOverlap(t *testing.T) {
 		ClassifySupplierOverlap(nil, nil), "two empty domains share nothing")
 	require.Equal(t, "disjoint",
 		ClassifySupplierOverlap([]string{"pokt1aaa"}, nil))
+}
+
+// AuthorizeCutover is the cutover gate: both domain state verdicts must be
+// SHORT_CUTOVER_COMPATIBLE, and an overlapping identity set without proven
+// routing/ownership exclusivity authorizes nothing — even with two SHORT
+// verdicts. The per-domain rehearsals above are inputs to this decision, not
+// the decision itself.
+func AuthorizeCutover(pgVerdict, fgVerdict, overlap string, exclusivityProven bool) string {
+	if pgVerdict != VerdictShortCutover || fgVerdict != VerdictShortCutover {
+		return "NOT_AUTHORIZED"
+	}
+	if overlap != "disjoint" && !exclusivityProven {
+		return "NOT_AUTHORIZED"
+	}
+	return "AUTHORIZED"
+}
+
+func TestAuthorizeCutover(t *testing.T) {
+	require.Equal(t, "AUTHORIZED",
+		AuthorizeCutover(VerdictShortCutover, VerdictShortCutover, "disjoint", false),
+		"disjoint sets with two SHORT verdicts authorize")
+	require.Equal(t, "NOT_AUTHORIZED",
+		AuthorizeCutover(VerdictShortCutover, VerdictShortCutover, "overlap", false),
+		"overlap without an exclusivity proof authorizes nothing, even with two SHORT verdicts")
+	require.Equal(t, "AUTHORIZED",
+		AuthorizeCutover(VerdictShortCutover, VerdictShortCutover, "overlap", true),
+		"overlap with a proven exclusivity authorizes")
+	require.Equal(t, "NOT_AUTHORIZED",
+		AuthorizeCutover(VerdictFullDrain, VerdictShortCutover, "disjoint", false),
+		"a FULL_DRAIN domain verdict never authorizes")
+	require.Equal(t, "NOT_AUTHORIZED",
+		AuthorizeCutover(VerdictShortCutover, VerdictFullDrain, "disjoint", false))
 }
