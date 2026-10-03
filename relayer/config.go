@@ -10,6 +10,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/pokt-network/pocket-relay-miner/config"
+	"github.com/pokt-network/pocket-relay-miner/keys"
 	"github.com/pokt-network/pocket-relay-miner/logging"
 	"github.com/pokt-network/pocket-relay-miner/pool"
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
@@ -40,6 +41,105 @@ const (
 
 // DefaultBackendType is the default backend type when not configured.
 const DefaultBackendType = BackendTypeJSONRPC
+
+// isKnownBackendType reports whether s is one of the five backend/transport
+// type names that a relay can be routed to. The backend map key must be one of
+// these exactly; there are no aliases (see the config validation).
+func isKnownBackendType(s string) bool {
+	switch s {
+	case BackendTypeJSONRPC, BackendTypeREST, BackendTypeWebSocket, BackendTypeGRPC, BackendTypeCometBFT:
+		return true
+	default:
+		return false
+	}
+}
+
+// backendTypeHint returns a " (did you mean \"websocket\"?)" style suffix for a
+// common misspelling of a backend type, or "" when there is no obvious match.
+// It exists because the abbreviation `ws` for `websocket` is the exact mistake
+// an AI agent produced from a schema that did not constrain the key.
+func backendTypeHint(s string) string {
+	hints := map[string]string{
+		"ws":         BackendTypeWebSocket,
+		"websockets": BackendTypeWebSocket,
+		"wss":        BackendTypeWebSocket,
+		"http":       BackendTypeJSONRPC,
+		"json":       BackendTypeJSONRPC,
+		"json-rpc":   BackendTypeJSONRPC,
+		"json_rpc":   BackendTypeJSONRPC,
+		"rpc":        BackendTypeJSONRPC,
+		"grpcs":      BackendTypeGRPC,
+		"comet":      BackendTypeCometBFT,
+		"comet_bft":  BackendTypeCometBFT,
+		"tendermint": BackendTypeCometBFT,
+		"restful":    BackendTypeREST,
+	}
+	if want, ok := hints[s]; ok {
+		return fmt.Sprintf(" (did you mean %q?)", want)
+	}
+	return ""
+}
+
+// validateBackendURLScheme enforces that a websocket backend URL uses a
+// WebSocket scheme. A websocket relay is dialed with gorilla, which requires
+// ws:// or wss://; an http://https:// URL (a natural mistake when copying a
+// jsonrpc backend, and what one operator actually shipped) is accepted by
+// url.Parse but rejected far downstream at connection time with the opaque
+// "malformed ws or wss URL", after the client upgrade is already accepted.
+// Catching it here names the problem at startup.
+//
+// gRPC is checked too, for the mirror-image reason: a gRPC backend is forwarded
+// as an HTTP/2 request, so it must end up as something net/http can dial. The
+// accepted set is not restated here -- it is whatever pool.NormalizeGRPCScheme
+// produces, so validation cannot drift away from the dialer.
+//
+// The HTTP-family types (jsonrpc/rest/cometbft) accept http/https and are not
+// constrained here.
+func validateBackendURLScheme(serviceID, rpcType, rawURL string) error {
+	if rpcType == BackendTypeGRPC {
+		return validateGRPCBackendURLScheme(serviceID, rawURL)
+	}
+	if rpcType != BackendTypeWebSocket {
+		return nil
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("service[%s].backends[%s]: invalid url %q: %w", serviceID, rpcType, rawURL, err)
+	}
+	if u.Scheme != "ws" && u.Scheme != "wss" {
+		return fmt.Errorf(
+			"service[%s].backends[%s]: websocket backend url must use ws:// or wss:// (got %q in %q); "+
+				"an http/https url is dialed as WebSocket and fails at connect time",
+			serviceID, rpcType, u.Scheme, rawURL,
+		)
+	}
+	return nil
+}
+
+// validateGRPCBackendURLScheme rejects, at startup, a gRPC backend url the
+// dialers cannot reach. It does NOT carry its own list of accepted schemes:
+// it asks pool.NormalizeGRPCScheme what the URL becomes and requires the result
+// to be dialable. A second list here is exactly the divergence this whole check
+// exists to close -- config.relayer.schema.yaml promised grpc:// from the
+// initial commit while the dialer refused it for seven months.
+func validateGRPCBackendURLScheme(serviceID, rawURL string) error {
+	normalized := pool.NormalizeGRPCScheme(rawURL)
+
+	scheme, _, hasScheme := strings.Cut(normalized, "://")
+	if !hasScheme {
+		// Bare host:port -- NewBackendEndpoint dials it as h2c cleartext.
+		return nil
+	}
+	if scheme == "http" || scheme == "https" {
+		return nil
+	}
+	return fmt.Errorf(
+		"service[%s].backends[%s]: gRPC backend url must use grpc://, grpcs://, http://, https:// "+
+			"or a bare host:port (got %q in %q); gRPC is forwarded as an HTTP/2 request, "+
+			"so any other scheme is undialable and fails on the first relay",
+		serviceID, BackendTypeGRPC, scheme, rawURL,
+	)
+}
 
 // RPCTypeToBackendType converts numeric RPCType codes (from Rpc-Type header) to backend type strings.
 // This maps the on-chain RPCType enum values to configuration keys.
@@ -144,7 +244,16 @@ type Config struct {
 
 	// Keys configuration for supplier signing keys.
 	// Required for signing relay responses.
-	Keys KeysConfig `yaml:"keys"`
+	Keys config.KeysConfig `yaml:"keys"`
+
+	// unknownKeys are the keys the file carries that this struct does not
+	// declare, found by the strict second pass in LoadConfig and surfaced by
+	// Warnings().
+	//
+	// Unexported on purpose: it is a property of the FILE this config was loaded
+	// from, not a setting, and nothing may set it from YAML. A Config built in
+	// code rather than loaded from disk correctly reports none.
+	unknownKeys []string
 
 	// Services is a map of service configurations keyed by service ID.
 	Services map[string]ServiceConfig `yaml:"services"`
@@ -157,7 +266,38 @@ type Config struct {
 	DefaultRequestTimeoutSeconds int64 `yaml:"default_request_timeout_seconds"`
 
 	// DefaultMaxBodySizeBytes is the default max body size for requests/responses.
+	//
+	// It is the ORIGINAL single knob and it still works: it is the fallback both
+	// directions resolve through, so a config that names only this key keeps the
+	// behaviour it had. The two keys below split it, because the directions are
+	// not alike -- a request body is retained for the whole validation queue and
+	// then again in the SMST leaf until the claim, while a response is read,
+	// signed and dropped.
 	DefaultMaxBodySizeBytes int64 `yaml:"default_max_body_size_bytes"`
+
+	// DefaultMaxRequestBodySizeBytes is the default bound on a RELAY REQUEST
+	// body. Unset (0) inherits DefaultMaxBodySizeBytes.
+	DefaultMaxRequestBodySizeBytes int64 `yaml:"default_max_request_body_size_bytes"`
+
+	// DefaultMaxResponseBodySizeBytes bounds a BACKEND RESPONSE body for every
+	// service that does not override it. Unset (0) inherits
+	// DefaultMaxBodySizeBytes.
+	DefaultMaxResponseBodySizeBytes int64 `yaml:"default_max_response_body_size_bytes"`
+
+	// DefaultValidationQueueMaxMiB bounds, PER SERVICE, the request and response
+	// bodies that service's optimistic relays hold between being served and
+	// being validated. It applies to every service that does not override it.
+	//
+	// The bound is per service and not global on purpose: with one global bound
+	// the relay that ARRIVES pays for the bytes another service is HOLDING, so
+	// a single heavy service refuses everyone. Per service, a service is
+	// refused because IT is over ITS own quota, which also makes the rejection
+	// attributable by construction.
+	//
+	// 0 means the default (DefaultValidationQueueMaxMiB), NEVER unlimited --
+	// the same convention as redis.batch_max_queued_mib. Read it through
+	// ValidationQueueMaxBytes, which also applies the per-service floor.
+	DefaultValidationQueueMaxMiB int `yaml:"default_validation_queue_max_mib,omitempty"`
 
 	// Metrics configuration
 	Metrics MetricsConfig `yaml:"metrics"`
@@ -192,6 +332,10 @@ type Config struct {
 	// sizing. Auto-populated with "low" / "medium" / "high" defaults if not
 	// specified. Services reference them by name via ServiceConfig.PoolProfile.
 	PoolProfiles map[string]PoolProfile `yaml:"pool_profiles,omitempty"`
+
+	// Simulation configures the simulated-relay feature: a pinned-pubkey,
+	// config-driven path for serving synthetic relays. Disabled by default.
+	Simulation SimulationConfig `yaml:"simulation,omitempty"`
 
 	// pools is the registry of backend pools, keyed by "serviceID:rpcType".
 	// Built by BuildPools() after validation, not serialized to YAML.
@@ -247,7 +391,7 @@ type HTTPTransportConfig struct {
 }
 
 // ResponseCompressionConfig controls gzip compression of signed relay responses
-// returned from the relayer to the gateway (PATH).
+// returned from the relayer to the gateway.
 //
 // Historical context: gzip was enabled unconditionally and consumed ~9% of
 // relayer CPU at 200 RPS per the Apr 14 2026 pprof profile (60-67% CPU is
@@ -277,8 +421,8 @@ type RedisConfig struct {
 	URL string `yaml:"url"`
 
 	// PoolSize is the maximum number of socket connections.
-	// Default: 20 × runtime.GOMAXPROCS (2x go-redis default for production)
-	// Set to 0 to use go-redis default (10 × GOMAXPROCS)
+	// Default (0): sized from the relayer's validation and publish workers,
+	// which follow GOMAXPROCS (WorkerSizing.RedisPoolSize).
 	PoolSize int `yaml:"pool_size,omitempty"`
 
 	// MinIdleConns is the minimum number of idle connections to maintain.
@@ -288,15 +432,34 @@ type RedisConfig struct {
 	MinIdleConns int `yaml:"min_idle_conns,omitempty"`
 
 	// PoolTimeout is the amount of time to wait for a connection from the pool.
-	// Default: 4 seconds
-	// Set to 0 to wait indefinitely
+	// Default (0): config.DefaultPoolTimeoutSeconds (6 seconds).
 	PoolTimeoutSeconds int `yaml:"pool_timeout_seconds,omitempty"`
 
 	// ConnMaxIdleTime is the maximum amount of time a connection can be idle.
 	// Idle connections older than this are closed.
-	// Default: 5 minutes
-	// Set to 0 to disable (connections never closed due to idle time)
+	// Default (0): the go-redis default, 30 minutes.
 	ConnMaxIdleTimeSeconds int `yaml:"conn_max_idle_time_seconds,omitempty"`
+
+	// BatchPublishIntervalMs sets how often the relayer writes its batch of mined
+	// relays. The batch is always on: mined relays go out with MULTI/EXEC, which
+	// wakes the miner's blocked reader ONCE per batch instead of once per relay.
+	//
+	// 0 means the default (DefaultBatchPublishIntervalMs), as it does for the
+	// other optional fields of this struct. Read it through BatchPublishInterval.
+	//
+	// Bounds: 500ms to 10s. Below that a batch stops being a batch; above it the
+	// added delay starts to matter against the chain's block time.
+	BatchPublishIntervalMs int `yaml:"batch_publish_interval_ms,omitempty"`
+
+	// BatchMaxQueuedMiB bounds the mined relays the batch may hold before the
+	// relayer STOPS ADMITTING new relays. It never drops what is already queued:
+	// every relay in the queue was served. The bound is in bytes and not in
+	// entries because each entry retains the relay's payload, and a few large
+	// responses exhaust memory long before any entry count would notice.
+	//
+	// 0 means the default (DefaultBatchMaxQueuedMiB). Read it through
+	// BatchMaxQueuedBytes. Bounds: 64 MiB to 8192 MiB.
+	BatchMaxQueuedMiB int `yaml:"batch_max_queued_mib,omitempty"`
 
 	// Namespace configures Redis key prefixes for all data types.
 	// All components (miner, relayer, cache) read from this config to build keys.
@@ -341,7 +504,20 @@ type ServiceConfig struct {
 	PoolProfile string `yaml:"pool_profile,omitempty"`
 
 	// MaxBodySizeBytes overrides the default max body size for this service.
+	// It is the fallback MaxRequestBodySizeBytes resolves through.
 	MaxBodySizeBytes int64 `yaml:"max_body_size_bytes,omitempty"`
+
+	// MaxRequestBodySizeBytes overrides the request bound for this service.
+	// 0 means "fall back", never unlimited.
+	MaxRequestBodySizeBytes int64 `yaml:"max_request_body_size_bytes,omitempty"`
+
+	// MaxResponseBodySizeBytes overrides the response bound for this service.
+	// 0 means "fall back", never unlimited.
+	MaxResponseBodySizeBytes int64 `yaml:"max_response_body_size_bytes,omitempty"`
+
+	// ValidationQueueMaxMiB overrides default_validation_queue_max_mib for this
+	// service. 0 means "use the default", never unlimited.
+	ValidationQueueMaxMiB int `yaml:"validation_queue_max_mib,omitempty"`
 
 	// DefaultBackend specifies which backend to use when no Rpc-Type header is provided.
 	// Must match one of the keys in the Backends map.
@@ -489,6 +665,13 @@ type BackendHealthCheckConfig struct {
 	// ExpectedStatus is a list of acceptable HTTP status codes.
 	// If not set, any 2xx status code (200-299) is considered healthy.
 	ExpectedStatus []int `yaml:"expected_status,omitempty"`
+
+	// Headers are additional headers applied only to health check probe requests.
+	// They are merged on top of the pool-level BackendConfig.Headers, so a key
+	// present here overrides the same key from the pool for the probe only.
+	// Use this for probe-specific headers (e.g. a health-check auth token) that
+	// should not be sent on real relay traffic.
+	Headers map[string]string `yaml:"headers,omitempty"`
 }
 
 // MetricsConfig contains metrics server configuration.
@@ -509,68 +692,12 @@ type HealthCheckConfig struct {
 	Addr string `yaml:"addr"`
 }
 
-// KeysConfig contains key provider configuration for supplier signing keys.
-type KeysConfig struct {
-	// KeysFile is the path to a supplier-keys.yaml file with hex-encoded keys.
-	KeysFile string `yaml:"keys_file,omitempty"`
-
-	// KeysDir is a directory containing individual key files.
-	KeysDir string `yaml:"keys_dir,omitempty"`
-
-	// Keyring configuration for Cosmos SDK keyring.
-	Keyring *KeyringConfig `yaml:"keyring,omitempty"`
-}
-
-// KeyringConfig contains Cosmos SDK keyring configuration.
-type KeyringConfig struct {
-	// Backend is the keyring backend type: "file", "os", "test", "memory"
-	Backend string `yaml:"backend"`
-
-	// Dir is the directory containing the keyring (for "file" backend).
-	Dir string `yaml:"dir,omitempty"`
-
-	// AppName is the application name for the keyring.
-	// Default: "pocket"
-	AppName string `yaml:"app_name,omitempty"`
-
-	// KeyNames is a list of key names to load from the keyring.
-	// If empty, all keys are loaded.
-	KeyNames []string `yaml:"key_names,omitempty"`
-}
-
-// SupplierCacheConfig contains configuration for the shared supplier state cache.
-type SupplierCacheConfig struct {
-	// KeyPrefix is the Redis key prefix for supplier state.
-	// Default: "ha:supplier"
-	KeyPrefix string `yaml:"key_prefix"`
-
-	// FailOpen determines behavior when Redis is unavailable.
-	// If true, accept relays when cache unavailable (safer for traffic).
-	// If false, reject relays when cache unavailable (safer for validation).
-	// Default: true (fail open - prioritize serving traffic)
-	FailOpen bool `yaml:"fail_open"`
-}
-
 // RelayMeterYAMLConfig contains YAML configuration for the relay meter.
 // This is converted to relayer.RelayMeterConfig when instantiating the RelayMeter.
 type RelayMeterYAMLConfig struct {
-	// Enabled enables relay metering and rate limiting.
-	// Default: true
-	Enabled bool `yaml:"enabled"`
-
-	// RedisKeyPrefix is the prefix for Redis keys used by the relay meter.
-	// Default: "ha"
-	RedisKeyPrefix string `yaml:"redis_key_prefix"`
-
-	// FailBehavior determines behavior when Redis is unavailable.
-	// "open" - Allow relays when Redis down (prioritize availability)
-	// "closed" - Reject relays when Redis down (prioritize safety)
-	// Default: "open"
-	FailBehavior string `yaml:"fail_behavior"`
-
 	// CacheTTL is the TTL for all cached Redis data (streams, params, app stakes, meters).
 	// Redis TTL handles automatic expiration - no cleanup goroutines needed.
-	// Default: 2h (covers ~15 session lifecycles at 30s blocks)
+	// Default: 2h -- covers ~6 session lifecycles at a rough 60s/block mainnet estimate (20 blocks/session; real block time drifts with network conditions and differs per network -- this is illustrative margin, not a precise budget)
 	CacheTTL time.Duration `yaml:"cache_ttl"`
 }
 
@@ -597,31 +724,34 @@ type CacheWarmupConfig struct {
 
 // DefaultConfig returns a Config with sensible defaults.
 func DefaultConfig() Config {
-	return Config{
+	cfg := Config{
 		ListenAddr: "0.0.0.0:8080",
 		Redis: RedisConfig{
-			URL: "redis://localhost:6379",
+			URL:                    "redis://localhost:6379",
+			BatchPublishIntervalMs: DefaultBatchPublishIntervalMs,
+			BatchMaxQueuedMiB:      DefaultBatchMaxQueuedMiB,
+		},
+		Keys: config.KeysConfig{
+			HotReloadEnabled: true,
 		},
 		DefaultValidationMode:        ValidationModeOptimistic,
 		DefaultRequestTimeoutSeconds: 30,
 		DefaultMaxBodySizeBytes:      10 * 1024 * 1024, // 10MB
+		DefaultValidationQueueMaxMiB: DefaultValidationQueueMaxMiB,
 		Metrics: MetricsConfig{
 			Enabled: true,
 			Addr:    "0.0.0.0:9090",
 		},
 		Pprof: config.PprofConfig{
 			Enabled: true, // Enable by default for debugging
-			Addr:    "0.0.0.0:6060",
+			Addr:    config.DefaultPprofAddr,
 		},
 		HealthCheck: HealthCheckConfig{
 			Enabled: true,
 			Addr:    "0.0.0.0:8081",
 		},
 		RelayMeter: RelayMeterYAMLConfig{
-			Enabled:        true,
-			RedisKeyPrefix: "ha",
-			FailBehavior:   "open",
-			CacheTTL:       2 * time.Hour, // Covers ~15 session lifecycles at 30s blocks
+			CacheTTL: 2 * time.Hour, // Covers ~6 session lifecycles at a rough 60s/block mainnet estimate (20 blocks/session; real block time drifts with network conditions and differs per network -- this is illustrative margin, not a precise budget)
 		},
 		HTTPTransport: HTTPTransportConfig{
 			MaxIdleConns:                 500,  // Total idle connections across all hosts (5x for 1000+ RPS)
@@ -662,6 +792,34 @@ func DefaultConfig() Config {
 			MinSizeBytes: 1024,
 		},
 	}
+
+	// Simulation defaults to disabled; ApplyDefaults still fills in its
+	// numeric knobs so a config that only sets `simulation.enabled: true`
+	// (with no identities pre-populated at this point) gets sane
+	// top-level defaults immediately. Per-identity defaults are re-applied
+	// in Config.Validate after YAML unmarshalling populates Identities.
+	cfg.Simulation.ApplyDefaults()
+
+	return cfg
+}
+
+// Warnings returns one line per key the file carries that this struct does not
+// declare -- typos, settings this project retired, and keys that were never
+// fields at all.
+//
+// It exists because there was nowhere to put such a notice: LoadConfig has no
+// logger and Validate returns only an error, so the choice used to be "fail the
+// boot" or "say nothing". Callers -- the relayer at startup and
+// `relayer validate` -- decide what the finding means.
+//
+// This used to be a hand-written branch per retired setting, one tombstone
+// struct field each. Those fields were deleted: a field per retired key is
+// config that configures nothing, and it could never cover the case that
+// actually bit us, which was a key that was never a field. The sentence that
+// says what each removal CHANGED for the operator now lives in
+// config.retiredKeys and is attached to the generic finding.
+func (c *Config) Warnings() []string {
+	return c.unknownKeys
 }
 
 // Validate validates the configuration and returns an error if invalid.
@@ -670,12 +828,48 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("listen_addr is required")
 	}
 
+	if err := c.Logging.Validate(); err != nil {
+		return err
+	}
+
 	if c.Redis.URL == "" {
 		return fmt.Errorf("redis.url is required")
 	}
 
+	// The namespace is validated here rather than where keys are built, because
+	// the failure it catches is a config that would relocate the whole keyspace:
+	// it has to stop startup, not surface as a cache miss.
+	if err := c.Redis.Namespace.Validate(); err != nil {
+		return err
+	}
+
 	if _, err := url.Parse(c.Redis.URL); err != nil {
 		return fmt.Errorf("invalid redis.url: %w", err)
+	}
+
+	// Exactly one key source. See keys.ValidateKeySources: both is refused so
+	// nothing has to pick a winner at runtime, and zero is refused because a
+	// relayer with no signing key rejects every relay while looking healthy.
+	keyringBackend := ""
+	if c.Keys.Keyring != nil {
+		keyringBackend = c.Keys.Keyring.Backend
+	}
+	if err := keys.ValidateKeySources(c.Keys.KeysFile, keyringBackend); err != nil {
+		return err
+	}
+	// The relayer validated the backend nowhere: a typo surfaced later as
+	// "unsupported keyring backend" from the provider, without saying what is
+	// valid. Same check as the miner, from the same list.
+	if keyringBackend != "" {
+		if err := keys.ValidateKeyringBackend(keyringBackend); err != nil {
+			return err
+		}
+		if err := keys.ValidatePassphraseSource(keyringBackend, keys.PassphraseSource{
+			File: c.Keys.Keyring.PassphraseFile,
+			Env:  c.Keys.Keyring.PassphraseEnv,
+		}); err != nil {
+			return err
+		}
 	}
 
 	// Validate Redis pool settings (all are optional, 0 = use defaults)
@@ -684,6 +878,18 @@ func (c *Config) Validate() error {
 	}
 	if c.Redis.MinIdleConns < 0 {
 		return fmt.Errorf("redis.min_idle_conns must be >= 0 (0 = use default)")
+	}
+	if c.Redis.BatchPublishIntervalMs != 0 &&
+		(c.Redis.BatchPublishIntervalMs < 500 || c.Redis.BatchPublishIntervalMs > 10000) {
+		return fmt.Errorf(
+			"redis.batch_publish_interval_ms must be 0 (the default, %d) or between 500 and 10000, got %d",
+			DefaultBatchPublishIntervalMs, c.Redis.BatchPublishIntervalMs)
+	}
+	if c.Redis.BatchMaxQueuedMiB != 0 &&
+		(c.Redis.BatchMaxQueuedMiB < 64 || c.Redis.BatchMaxQueuedMiB > 8192) {
+		return fmt.Errorf(
+			"redis.batch_max_queued_mib must be 0 (the default, %d) or between 64 and 8192, got %d",
+			DefaultBatchMaxQueuedMiB, c.Redis.BatchMaxQueuedMiB)
 	}
 	if c.Redis.PoolTimeoutSeconds < 0 {
 		return fmt.Errorf("redis.pool_timeout_seconds must be >= 0 (0 = use default)")
@@ -714,6 +920,28 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("invalid default_validation_mode: %s", c.DefaultValidationMode)
 	}
 
+	// The validation-queue bounds, global and per service. Out of range is an
+	// error and not a silent clamp: a number the operator wrote and the relayer
+	// ignored is how a bound ends up meaning something other than it says.
+	if c.DefaultValidationQueueMaxMiB != 0 &&
+		(c.DefaultValidationQueueMaxMiB < MinValidationQueueMaxMiB ||
+			c.DefaultValidationQueueMaxMiB > MaxValidationQueueMaxMiB) {
+		return fmt.Errorf(
+			"default_validation_queue_max_mib must be 0 (the default, %d) or between %d and %d, got %d",
+			DefaultValidationQueueMaxMiB, MinValidationQueueMaxMiB, MaxValidationQueueMaxMiB,
+			c.DefaultValidationQueueMaxMiB)
+	}
+	for id, svc := range c.Services {
+		if svc.ValidationQueueMaxMiB != 0 &&
+			(svc.ValidationQueueMaxMiB < MinValidationQueueMaxMiB ||
+				svc.ValidationQueueMaxMiB > MaxValidationQueueMaxMiB) {
+			return fmt.Errorf(
+				"services.%s.validation_queue_max_mib must be 0 (the default, %d) or between %d and %d, got %d",
+				id, DefaultValidationQueueMaxMiB, MinValidationQueueMaxMiB, MaxValidationQueueMaxMiB,
+				svc.ValidationQueueMaxMiB)
+		}
+	}
+
 	// Validate and auto-populate timeout profiles
 	if err := c.ValidateTimeoutProfiles(); err != nil {
 		return err
@@ -722,6 +950,15 @@ func (c *Config) Validate() error {
 	// Validate and auto-populate pool profiles
 	if err := c.ValidatePoolProfiles(); err != nil {
 		return err
+	}
+
+	// Re-apply simulation defaults now that YAML unmarshalling has
+	// populated Identities (the DefaultConfig-time ApplyDefaults call only
+	// saw an empty identity list), then validate. ApplyDefaults is
+	// idempotent, so this is safe even when defaults were already applied.
+	c.Simulation.ApplyDefaults()
+	if err := c.Simulation.Validate(); err != nil {
+		return fmt.Errorf("invalid simulation config: %w", err)
 	}
 
 	return nil
@@ -743,6 +980,21 @@ func (c *Config) validateServiceConfig(id string, svc ServiceConfig) error {
 
 	// Validate each backend
 	for rpcType, backend := range svc.Backends {
+		// The backend map key IS the transport type, and it must be one of the
+		// known types — relays are routed to a backend by exact type match with
+		// no fallback, so a key like `ws` (a common abbreviation of `websocket`)
+		// configures a backend nothing will ever route to, and the relay is
+		// rejected at request time with a cryptic transport error. Reject it
+		// here, at load, naming the valid keys.
+		if !isKnownBackendType(rpcType) {
+			return fmt.Errorf(
+				"service[%s].backends[%s]: unknown backend type %q (valid: %s, %s, %s, %s, %s)%s",
+				id, rpcType, rpcType,
+				BackendTypeJSONRPC, BackendTypeREST, BackendTypeWebSocket, BackendTypeGRPC, BackendTypeCometBFT,
+				backendTypeHint(rpcType),
+			)
+		}
+
 		hasURL := backend.URL != ""
 		hasURLs := len(backend.URLs) > 0
 
@@ -760,6 +1012,9 @@ func (c *Config) validateServiceConfig(id string, svc ServiceConfig) error {
 		if hasURL {
 			if _, err := url.Parse(backend.URL); err != nil {
 				return fmt.Errorf("service[%s].backends[%s].url is invalid: %w", id, rpcType, err)
+			}
+			if err := validateBackendURLScheme(id, rpcType, backend.URL); err != nil {
+				return err
 			}
 		}
 
@@ -834,12 +1089,167 @@ func (c *Config) GetServiceTimeoutProfile(serviceID string) *TimeoutProfile {
 	return nil
 }
 
-// GetServiceMaxBodySize returns the max body size for a service.
+// DefaultValidationQueueMaxMiB is the per-service validation-queue bound used
+// when the config leaves default_validation_queue_max_mib at 0 or omits it, and
+// when a service does not override it.
+const DefaultValidationQueueMaxMiB = 128
+
+// MinValidationQueueMaxMiB and MaxValidationQueueMaxMiB bound what an operator
+// may configure, like the publish queue's 64..8192. The floor below is derived
+// per service on top of this one and can raise it further.
+const (
+	MinValidationQueueMaxMiB = 64
+	MaxValidationQueueMaxMiB = 8192
+)
+
+// ValidationQueueFloorBytes is the smallest bound that still lets a service
+// serve ONE relay of its largest allowed size.
+//
+// A single queued relay retains the request body TWICE -- once as the body and
+// once as the RelayRequest's Payload, which the unmarshal COPIES rather than
+// aliases (poktroll x/service/types/relay.pb.go, `m.Payload = append(...)`) --
+// plus one response, bounded by that same service (the pool is shared, the
+// limit is not).
+// Below this, the service refuses relays it was configured to accept: its own
+// traffic, rejected by its own bound.
+func (c *Config) ValidationQueueFloorBytes(serviceID string) int64 {
+	return 2*c.GetServiceMaxRequestBodySize(serviceID) + c.GetServiceMaxResponseBodySize(serviceID)
+}
+
+// ValidationQueueMaxBytes is the EFFECTIVE bound for one service: its override
+// if it has one, otherwise the default, raised to the floor when it sits below
+// it.
+//
+// Raised, not refused. A bound under the floor makes that service reject 100%
+// of its relays forever, and refusing to start would turn one dead service into
+// a dead relayer. The caller that wants to TELL the operator uses
+// ValidationQueueReport, which reports the same computation.
+func (c *Config) ValidationQueueMaxBytes(serviceID string) int64 {
+	mib := c.DefaultValidationQueueMaxMiB
+	if svc, ok := c.Services[serviceID]; ok && svc.ValidationQueueMaxMiB > 0 {
+		mib = svc.ValidationQueueMaxMiB
+	}
+	if mib <= 0 {
+		mib = DefaultValidationQueueMaxMiB
+	}
+	configured := int64(mib) << 20
+	if floor := c.ValidationQueueFloorBytes(serviceID); configured < floor {
+		return floor
+	}
+	return configured
+}
+
+// GetServiceMaxBodySize returns the max body size for a service under the
+// original single knob. Both directions resolve through it, so it is the reason
+// a config written before the split keeps the behaviour it had.
 func (c *Config) GetServiceMaxBodySize(serviceID string) int64 {
 	if svc, ok := c.Services[serviceID]; ok && svc.MaxBodySizeBytes > 0 {
 		return svc.MaxBodySizeBytes
 	}
 	return c.DefaultMaxBodySizeBytes
+}
+
+// BodySizeSource names where an effective bound came from. It exists so the
+// startup log can answer the only question an operator has about a new key:
+// whether the one they wrote is the one that applied.
+type BodySizeSource string
+
+const (
+	// BodySizeFromServiceRequestOverride: services.<id>.max_request_body_size_bytes.
+	BodySizeFromServiceRequestOverride BodySizeSource = "service.max_request_body_size_bytes"
+	// BodySizeFromServiceResponseOverride: services.<id>.max_response_body_size_bytes.
+	BodySizeFromServiceResponseOverride BodySizeSource = "service.max_response_body_size_bytes"
+	// BodySizeFromServiceLegacy: services.<id>.max_body_size_bytes, the pre-split key.
+	BodySizeFromServiceLegacy BodySizeSource = "service.max_body_size_bytes"
+	// BodySizeFromDefaultRequest: default_max_request_body_size_bytes.
+	BodySizeFromDefaultRequest BodySizeSource = "default_max_request_body_size_bytes"
+	// BodySizeFromDefaultResponse: default_max_response_body_size_bytes.
+	BodySizeFromDefaultResponse BodySizeSource = "default_max_response_body_size_bytes"
+	// BodySizeFromLegacyDefault: default_max_body_size_bytes, the pre-split key.
+	BodySizeFromLegacyDefault BodySizeSource = "default_max_body_size_bytes"
+)
+
+// ResolveMaxRequestBodySize returns the request bound for one service and the
+// key it came from, most specific first.
+func (c *Config) ResolveMaxRequestBodySize(serviceID string) (int64, BodySizeSource) {
+	if svc, ok := c.Services[serviceID]; ok {
+		if svc.MaxRequestBodySizeBytes > 0 {
+			return svc.MaxRequestBodySizeBytes, BodySizeFromServiceRequestOverride
+		}
+		if svc.MaxBodySizeBytes > 0 {
+			return svc.MaxBodySizeBytes, BodySizeFromServiceLegacy
+		}
+	}
+	if c.DefaultMaxRequestBodySizeBytes > 0 {
+		return c.DefaultMaxRequestBodySizeBytes, BodySizeFromDefaultRequest
+	}
+	return c.DefaultMaxBodySizeBytes, BodySizeFromLegacyDefault
+}
+
+// GetServiceMaxRequestBodySize is ResolveMaxRequestBodySize without the source,
+// for the hot path that only needs the number.
+func (c *Config) GetServiceMaxRequestBodySize(serviceID string) int64 {
+	size, _ := c.ResolveMaxRequestBodySize(serviceID)
+	return size
+}
+
+// ResolveMaxResponseBodySize returns the response bound for one service and the
+// key it came from, most specific first -- the mirror of the request side.
+//
+// The shared BufferPool is not an obstacle to this being per-service: the pool
+// recycles buffers, and the bound is a limit passed per read
+// (BufferPool.ReadWithBufferLimit). Only the pool's own fallback bound is
+// fleet-wide, and that is MaxResponseBodySizeAcrossServices.
+func (c *Config) ResolveMaxResponseBodySize(serviceID string) (int64, BodySizeSource) {
+	if svc, ok := c.Services[serviceID]; ok {
+		if svc.MaxResponseBodySizeBytes > 0 {
+			return svc.MaxResponseBodySizeBytes, BodySizeFromServiceResponseOverride
+		}
+		if svc.MaxBodySizeBytes > 0 {
+			return svc.MaxBodySizeBytes, BodySizeFromServiceLegacy
+		}
+	}
+	if c.DefaultMaxResponseBodySizeBytes > 0 {
+		return c.DefaultMaxResponseBodySizeBytes, BodySizeFromDefaultResponse
+	}
+	return c.DefaultMaxBodySizeBytes, BodySizeFromLegacyDefault
+}
+
+// GetServiceMaxResponseBodySize is ResolveMaxResponseBodySize without the source.
+func (c *Config) GetServiceMaxResponseBodySize(serviceID string) int64 {
+	size, _ := c.ResolveMaxResponseBodySize(serviceID)
+	return size
+}
+
+// MaxResponseBodySizeAcrossServices is the largest response bound any service
+// allows. It is the buffer pool's own fallback bound, for a read that names no
+// service.
+func (c *Config) MaxResponseBodySizeAcrossServices() int64 {
+	max, _ := c.ResolveMaxResponseBodySize("")
+	for serviceID := range c.Services {
+		if size := c.GetServiceMaxResponseBodySize(serviceID); size > max {
+			max = size
+		}
+	}
+	return max
+}
+
+// MaxRequestBodySizeAcrossServices is the largest request bound any service
+// allows.
+//
+// It is the bound the FIRST read of an HTTP relay body uses, and it has to be
+// the maximum rather than the default: the service is not known until the body
+// has been read and parsed, so a first stage bounded by the default rejects --
+// as unknown/unknown, before the service ID exists -- every relay of a service
+// that legitimately allows more.
+func (c *Config) MaxRequestBodySizeAcrossServices() int64 {
+	max, _ := c.ResolveMaxRequestBodySize("")
+	for serviceID := range c.Services {
+		if size := c.GetServiceMaxRequestBodySize(serviceID); size > max {
+			max = size
+		}
+	}
+	return max
 }
 
 // getMaxServiceTimeout returns the maximum timeout across all services.
@@ -1007,40 +1417,20 @@ func (c *Config) ValidateTimeoutProfiles() error {
 	return nil
 }
 
-// GetBackendConfig returns the BackendConfig for a service and RPC type,
-// using the same fallback chain as GetPool (exact -> default_backend -> jsonrpc -> rest -> any).
-// Returns nil if no backend config is found after all fallbacks.
-// Use this to access pool-level shared config (headers, auth) alongside GetPool().
+// GetBackendConfig returns the BackendConfig for a service and a concrete
+// backend/transport type, by EXACT match only — the same strict contract as
+// GetPool, and paired with it (this supplies the headers/auth/base_path for the
+// pool GetPool returns, so the two must resolve to the SAME backend). The old
+// "any available" tier here was especially unsafe: it returned a backend chosen
+// by non-deterministic map iteration, so a request could get different config
+// on different calls. See GetPool for why cross-transport fallback is wrong.
 func (c *Config) GetBackendConfig(serviceID, rpcType string) *BackendConfig {
 	svc, svcExists := c.Services[serviceID]
 	if !svcExists {
 		return nil
 	}
 
-	// Direct lookup
 	if backend, ok := svc.Backends[rpcType]; ok {
-		return &backend
-	}
-
-	// Fallback: default_backend
-	if svc.DefaultBackend != "" {
-		if backend, ok := svc.Backends[svc.DefaultBackend]; ok {
-			return &backend
-		}
-	}
-
-	// Fallback: jsonrpc
-	if backend, ok := svc.Backends[BackendTypeJSONRPC]; ok {
-		return &backend
-	}
-
-	// Fallback: rest
-	if backend, ok := svc.Backends[BackendTypeREST]; ok {
-		return &backend
-	}
-
-	// Fallback: any available
-	for _, backend := range svc.Backends {
 		return &backend
 	}
 
@@ -1105,49 +1495,40 @@ func (c *Config) BuildPools() error {
 	return nil
 }
 
-// GetPool returns the pool for a service and RPC type, with fallback chain.
-// Fallback order: exact match -> default_backend -> jsonrpc -> rest -> any available.
-// Returns nil if no pool is found after all fallbacks.
+// GetPool returns the pool for a service and a concrete backend/transport type,
+// by EXACT match only. There is deliberately no cross-transport fallback.
+//
+// A relay's transport is a wire protocol, not a preference: a WebSocket relay
+// needs a ws:// backend and a persistent connection, a gRPC relay needs HTTP/2
+// framing, and neither can be served by the http:// backend a jsonrpc/rest pool
+// holds. The former fallback chain (default_backend -> jsonrpc -> rest -> any)
+// silently handed those requests an incompatible backend, which then failed
+// deep in the transport with a cryptic error (e.g. gorilla's "malformed ws or
+// wss URL") long after the point where the misconfiguration could be named. A
+// missing backend for a requested type is a configuration error; surfacing it
+// as nil here lets the caller reject cleanly.
+//
+// The one legitimate default — "no Rpc-Type header, use the service's
+// default_backend" — is resolved by the caller BEFORE this is called (see the
+// proxy's header handling), so by the time a type reaches GetPool it is always
+// concrete and must match exactly.
+//
+// A miss on a service that exists is recorded so operators can see relays being
+// rejected for a transport they never configured a backend for.
 func (c *Config) GetPool(serviceID, rpcType string) *pool.Pool {
 	if c.pools == nil {
 		return nil
 	}
 
-	// Direct lookup
-	key := serviceID + ":" + rpcType
-	if p, ok := c.pools[key]; ok {
+	if p, ok := c.pools[serviceID+":"+rpcType]; ok {
 		return p
 	}
 
-	// Fallback: default_backend
-	svc, svcExists := c.Services[serviceID]
-	if !svcExists {
-		return nil
+	// Only count a miss when the service itself exists; an unknown service is a
+	// routing miss, not a backend-transport misconfiguration.
+	if _, svcExists := c.Services[serviceID]; svcExists {
+		backendMissing.WithLabelValues(serviceID, rpcType).Inc()
 	}
-
-	if svc.DefaultBackend != "" {
-		if p, ok := c.pools[serviceID+":"+svc.DefaultBackend]; ok {
-			return p
-		}
-	}
-
-	// Fallback: jsonrpc
-	if p, ok := c.pools[serviceID+":"+BackendTypeJSONRPC]; ok {
-		return p
-	}
-
-	// Fallback: rest
-	if p, ok := c.pools[serviceID+":"+BackendTypeREST]; ok {
-		return p
-	}
-
-	// Fallback: any available
-	for backendType := range svc.Backends {
-		if p, ok := c.pools[serviceID+":"+backendType]; ok {
-			return p
-		}
-	}
-
 	return nil
 }
 
@@ -1189,6 +1570,9 @@ func validateBackendEndpoints(serviceID, rpcType string, endpoints []BackendEndp
 		if err != nil {
 			return fmt.Errorf("service[%s].backends[%s].urls[%d]: invalid URL %q: %w", serviceID, rpcType, i, ep.URL, err)
 		}
+		if err := validateBackendURLScheme(serviceID, rpcType, ep.URL); err != nil {
+			return err
+		}
 
 		// Normalize URL for duplicate detection: host + path (trim trailing slash)
 		normalized := parsed.Host + strings.TrimRight(parsed.Path, "/")
@@ -1216,12 +1600,26 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("failed to read config file: %w", err)
 	}
 
+	// Second pass over the same bytes, diagnostic only: the yaml.Unmarshal below
+	// is lenient and drops every key this struct does not declare, so the file
+	// and the process can disagree with no signal at all. What to DO with the
+	// finding belongs to the caller -- `validate` fails on it because validating
+	// is its whole job, and the serving binary warns and starts unless
+	// --strict-config was passed, because refusing to boot over a stale key turns
+	// a rolling deploy into an outage. See config.UnknownKeys.
+	//
+	// Computed here, ahead of the local named `config`, because that local
+	// shadows the shared package of the same name for the rest of the function.
+	unknownKeys := config.UnknownKeys(data, &Config{})
+
 	// Start with defaults
 	config := DefaultConfig()
 
 	if err := yaml.Unmarshal(data, &config); err != nil {
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
 	}
+
+	config.unknownKeys = unknownKeys
 
 	if err := config.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid config: %w", err)
@@ -1232,4 +1630,37 @@ func LoadConfig(path string) (*Config, error) {
 	}
 
 	return &config, nil
+}
+
+// DefaultBatchPublishIntervalMs is the batch interval used when the config leaves
+// redis.batch_publish_interval_ms at 0 or omits it.
+const DefaultBatchPublishIntervalMs = 1000
+
+// BatchPublishInterval is the effective batch interval: BatchPublishIntervalMs, or
+// DefaultBatchPublishIntervalMs when that is 0. It is the only reader of the field,
+// so a config built without DefaultConfig -- a test, or a YAML that omits the key
+// and is decoded without defaults -- still gets a batch and never a zero interval.
+func (r RedisConfig) BatchPublishInterval() time.Duration {
+	ms := r.BatchPublishIntervalMs
+	if ms == 0 {
+		ms = DefaultBatchPublishIntervalMs
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
+// DefaultBatchMaxQueuedMiB is the batch queue bound used when the config leaves
+// redis.batch_max_queued_mib at 0 or omits it. The dispatcher's heartbeat closes
+// admission after 3 s without Redis answering, so an outage alone fits: a 1000 rps
+// relayer for 3 s at 100 KB per relay is about 300 MB. The bound trips only on a
+// Redis that is up and slow for a sustained period.
+const DefaultBatchMaxQueuedMiB = 512
+
+// BatchMaxQueuedBytes is the effective queue bound in bytes: BatchMaxQueuedMiB, or
+// DefaultBatchMaxQueuedMiB when that is 0.
+func (r RedisConfig) BatchMaxQueuedBytes() int {
+	mib := r.BatchMaxQueuedMiB
+	if mib == 0 {
+		mib = DefaultBatchMaxQueuedMiB
+	}
+	return mib << 20
 }

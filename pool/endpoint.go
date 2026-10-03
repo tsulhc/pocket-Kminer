@@ -19,19 +19,54 @@ type BackendEndpoint struct {
 	// URL is the parsed backend URL.
 	URL *url.URL
 
-	// RawURL is the original URL string as provided in configuration.
+	// RawURL is the dialable URL string: the configured value with the gRPC
+	// conventions rewritten by NormalizeGRPCScheme. Every dialer, the health
+	// checker and the breaker logs read this, so it must be dialable rather
+	// than verbatim.
 	RawURL string
 
 	// Health state (atomic for lock-free concurrent access)
 	healthy             atomic.Bool
 	consecutiveFailures atomic.Int32
-	lastCheckUnixNano   atomic.Int64
 
 	// Recovery timeout: auto-recover unhealthy endpoints after this duration.
 	// Prevents circuit breaker death spiral when no active health checks are configured.
 	// Zero means no auto-recovery (rely on health checks or successful requests).
 	recoveryTimeout    time.Duration
 	unhealthySinceNano atomic.Int64
+
+	// pendingRecovery marks that IsHealthy auto-recovered this endpoint
+	// (half-open timeout) with no way to report it. RecordResult turns the
+	// mark into a TransitionEvent on the first success, so "BACKEND UP" is
+	// logged for auto-recoveries too, not only for traffic-driven ones.
+	pendingRecovery atomic.Bool
+}
+
+// NormalizeGRPCScheme rewrites the two gRPC configuration conventions into the
+// schemes net/http can actually dial. grpc:// and grpcs:// are how poktroll
+// writes a gRPC endpoint and what config.relayer.schema.yaml advertises for a
+// backend url; they are not network schemes. Anything else is returned
+// unchanged, so ws:// and wss:// reach the WebSocket dialer intact.
+//
+// It sits in the constructor because every consumer of an ENDPOINT -- the gRPC
+// relay path, the HTTP proxy path, the WebSocket path, the health checker and
+// the breaker logs -- reads RawURL or URL, and a rewrite applied per-path is a
+// rewrite one path will miss. Measured 2026-08-30: relayer/proxy.go and
+// relayer/healthcheck.go had no gRPC normalization at all, so a grpc:// backend
+// that the native gRPC path could dial was undialable for the other two.
+//
+// It is NOT the only call site, and saying so would be false: relay_grpc_service
+// falls back to the configured BackendConfig.URL when no pool is wired, which
+// never passes through this constructor, so that path calls this function
+// directly.
+func NormalizeGRPCScheme(rawURL string) string {
+	if rest, found := strings.CutPrefix(rawURL, "grpc://"); found {
+		return "http://" + rest
+	}
+	if rest, found := strings.CutPrefix(rawURL, "grpcs://"); found {
+		return "https://" + rest
+	}
+	return rawURL
 }
 
 // NewBackendEndpoint creates a new BackendEndpoint from a name and raw URL string.
@@ -42,6 +77,10 @@ func NewBackendEndpoint(name, rawURL string) (*BackendEndpoint, error) {
 	if strings.TrimSpace(rawURL) == "" {
 		return nil, fmt.Errorf("backend endpoint URL must not be empty")
 	}
+
+	// Rewrite the gRPC config conventions before anything reads the URL, so
+	// every consumer of RawURL/URL gets a form net/http can dial.
+	rawURL = NormalizeGRPCScheme(rawURL)
 
 	parsed, err := url.Parse(rawURL)
 	if err != nil {
@@ -90,10 +129,14 @@ func (ep *BackendEndpoint) IsHealthy() bool {
 	if ep.recoveryTimeout > 0 {
 		unhealthySince := ep.unhealthySinceNano.Load()
 		if unhealthySince > 0 && time.Since(time.Unix(0, unhealthySince)) >= ep.recoveryTimeout {
-			// Auto-recover: CAS ensures only one goroutine triggers recovery
+			// Auto-recover: CAS ensures only one goroutine triggers recovery.
+			// This runs on the selection path, which has nowhere to report a
+			// transition — leave a pending mark (and keep unhealthySinceNano
+			// so the downtime survives) for RecordResult to publish as a
+			// TransitionEvent on the first success.
 			if ep.healthy.CompareAndSwap(false, true) {
 				ep.consecutiveFailures.Store(0)
-				ep.unhealthySinceNano.Store(0)
+				ep.pendingRecovery.Store(true)
 			}
 			return ep.healthy.Load()
 		}
@@ -102,16 +145,44 @@ func (ep *BackendEndpoint) IsHealthy() bool {
 	return false
 }
 
+// CurrentlyHealthy is the pure read of the health flag: no half-open
+// auto-recovery, no side effects. Observers (the active health checker, the
+// status API) MUST use this instead of IsHealthy — computing "was it
+// unhealthy?" with IsHealthy() mutates the very state being observed and
+// swallows the observer's own recovery transition.
+func (ep *BackendEndpoint) CurrentlyHealthy() bool {
+	return ep.healthy.Load()
+}
+
+// ConsumePendingRecovery claims an unreported half-open auto-recovery, if there
+// is one, and reports whether it did.
+//
+// IsHealthy flips the endpoint healthy on the selection path, which has nowhere
+// to report a transition, and leaves the mark for whoever can. That is normally
+// RecordResult on the first success — but the active health checker's probe can
+// arrive first, and its SetHealthy clears the mark. Without this the transition
+// is then reported by nobody: the backend is up and the gauge still says down.
+//
+// The CAS makes exactly one caller win.
+func (ep *BackendEndpoint) ConsumePendingRecovery() bool {
+	return ep.pendingRecovery.CompareAndSwap(true, false)
+}
+
 // SetHealthy marks this endpoint as healthy and clears the unhealthy timestamp.
+// Callers (the active health checker) log their own transition, so any pending
+// auto-recovery report is dropped to avoid a duplicate "BACKEND UP".
 func (ep *BackendEndpoint) SetHealthy() {
 	ep.unhealthySinceNano.Store(0)
+	ep.pendingRecovery.Store(false)
 	ep.healthy.Store(true)
 }
 
 // SetUnhealthy marks this endpoint as unhealthy and records the timestamp
-// for recovery timeout tracking.
+// for recovery timeout tracking. A pending (unreported) auto-recovery dies
+// with the new outage — the operator sees the DOWN, not a stale UP.
 func (ep *BackendEndpoint) SetUnhealthy() {
 	ep.unhealthySinceNano.Store(time.Now().UnixNano())
+	ep.pendingRecovery.Store(false)
 	ep.healthy.Store(false)
 }
 
@@ -140,18 +211,4 @@ func (ep *BackendEndpoint) SetRecoveryTimeout(d time.Duration) {
 // RecoveryTimeout returns the configured recovery timeout.
 func (ep *BackendEndpoint) RecoveryTimeout() time.Duration {
 	return ep.recoveryTimeout
-}
-
-// SetLastCheck records the time of the last health check.
-func (ep *BackendEndpoint) SetLastCheck(t time.Time) {
-	ep.lastCheckUnixNano.Store(t.UnixNano())
-}
-
-// LastCheck returns the time of the last health check.
-func (ep *BackendEndpoint) LastCheck() time.Time {
-	ns := ep.lastCheckUnixNano.Load()
-	if ns == 0 {
-		return time.Time{}
-	}
-	return time.Unix(0, ns)
 }

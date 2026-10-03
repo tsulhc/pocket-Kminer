@@ -174,7 +174,10 @@ func (rp *relayProcessor) ProcessRelay(
 	// Check mining difficulty using the difficulty at session start height
 	isApplicable, err := rp.checkMiningDifficulty(ctx, serviceID, relayHash[:], sessionStartHeight)
 	if err != nil {
-		rp.logger.Warn().
+		// FAILS OPEN: the relay is mined as applicable. Debug is per-request,
+		// so the counter is the only signal that difficulty is unresolvable.
+		difficultyQueryFailures.WithLabelValues(serviceID).Inc()
+		rp.logger.Debug().
 			Err(err).
 			Str(logging.FieldServiceID, serviceID).
 			Msg("failed to check mining difficulty, assuming applicable")
@@ -186,16 +189,15 @@ func (rp *relayProcessor) ProcessRelay(
 		sessionCtx := logging.SessionContextPartial(sessionID, serviceID, supplierAddr, appAddress, sessionEndHeight)
 		logging.WithSessionContext(rp.logger.Debug(), sessionCtx).
 			Msg("relay does not meet mining difficulty, skipping")
-		relaysSkippedDifficulty.WithLabelValues(serviceID).Inc()
+		relaysSkippedDifficulty.WithLabelValues(serviceID, RPCTypeFrom(ctx)).Inc()
 		return nil, nil
 	}
 
 	// Build mined relay message
-	computeUnits := rp.getComputeUnits(ctx, serviceID, sessionStartHeight)
 	msg := &transport.MinedRelayMessage{
 		RelayHash:               relayHash[:],
 		RelayBytes:              relayBz,
-		ComputeUnitsPerRelay:    computeUnits,
+		ComputeUnitsPerRelay:    rp.getComputeUnits(ctx, serviceID, sessionStartHeight),
 		SessionId:               sessionID,
 		SessionStartHeight:      sessionStartHeight,
 		SessionEndHeight:        sessionEndHeight,
@@ -289,15 +291,6 @@ func (rp *relayProcessor) getComputeUnits(ctx context.Context, serviceID string,
 	return provider.GetServiceComputeUnits(ctx, serviceID, sessionStartHeight)
 }
 
-// BaseDifficultyProvider always returns the base difficulty (all relays applicable).
-// Useful for testing or when on-chain difficulty queries are not available.
-type BaseDifficultyProvider struct{}
-
-// GetTargetHash returns the base difficulty hash (sessionStartHeight is ignored).
-func (p *BaseDifficultyProvider) GetTargetHash(ctx context.Context, serviceID string, sessionStartHeight int64) ([]byte, error) {
-	return protocol.BaseRelayDifficultyHashBz, nil
-}
-
 // ServiceDifficultyQueryClient queries on-chain service difficulty at a specific height.
 type ServiceDifficultyQueryClient interface {
 	// GetServiceRelayDifficulty returns the relay mining difficulty for a service at a given session start height.
@@ -338,7 +331,10 @@ func (p *QueryDifficultyProvider) GetTargetHash(ctx context.Context, serviceID s
 
 	target, err := p.queryClient.GetServiceRelayDifficulty(ctx, serviceID, sessionStartHeight)
 	if err != nil {
-		p.logger.Warn().
+		// Falls back to base difficulty (every relay applicable) — same
+		// fail-open, same need for a counter.
+		difficultyQueryFailures.WithLabelValues(serviceID).Inc()
+		p.logger.Debug().
 			Err(err).
 			Str(logging.FieldServiceID, serviceID).
 			Int64("session_start_height", sessionStartHeight).
@@ -351,6 +347,5 @@ func (p *QueryDifficultyProvider) GetTargetHash(ctx context.Context, serviceID s
 
 // Verify interface compliance.
 var _ RelayProcessor = (*relayProcessor)(nil)
-var _ DifficultyProvider = (*BaseDifficultyProvider)(nil)
 var _ DifficultyProvider = (*QueryDifficultyProvider)(nil)
 var _ ServiceComputeUnitsProvider = (*serviceCacheComputeUnitsProvider)(nil)

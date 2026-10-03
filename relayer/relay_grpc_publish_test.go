@@ -4,56 +4,59 @@ package relayer
 
 import (
 	"context"
-	"errors"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
-	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/cosmos/cosmos-sdk/crypto/keys/secp256k1"
 	cryptotypes "github.com/cosmos/cosmos-sdk/crypto/types"
-	"github.com/pokt-network/shannon-sdk/types"
-	"github.com/stretchr/testify/require"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/metadata"
-	"google.golang.org/grpc/status"
-
 	servicetypes "github.com/pokt-network/poktroll/x/service/types"
 	sessiontypes "github.com/pokt-network/poktroll/x/session/types"
+	sdktypes "github.com/pokt-network/shannon-sdk/types"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/pokt-network/pocket-relay-miner/pool"
-	transporttypes "github.com/pokt-network/pocket-relay-miner/transport"
+	"github.com/pokt-network/pocket-relay-miner/transport"
+	redisutil "github.com/pokt-network/pocket-relay-miner/transport/redis"
 )
 
-const testGRPCSupplier = "pokt1supplier"
-
+// recordingProcessor is a RelayProcessor test double that captures the exact
+// respBody handed to ProcessRelay and always returns a non-nil mined message so
+// the caller proceeds to publish. It lets the publish/mining routing be asserted
+// without pulling in difficulty checks or compute-unit config.
 type recordingProcessor struct {
-	mu             sync.Mutex
-	calls          int
-	lastReqBody    []byte
-	lastRespBody   []byte
-	lastContextErr error
-	hasDeadline    bool
-	remaining      time.Duration
-	message        *transporttypes.MinedRelayMessage
-	err            error
+	calls        atomic.Int32
+	lastReqBody  []byte
+	lastRespBody []byte
+	// lastPublishBudget is time.Until(publishCtx deadline) captured at the
+	// moment ProcessRelay runs. It measures how much of grpcPublishTimeout is
+	// actually left for publishing AFTER the backend forward.
+	lastPublishBudget      time.Duration
+	lastPublishHasDeadline bool
 }
 
-func (p *recordingProcessor) ProcessRelay(ctx context.Context, reqBody, respBody []byte, _ string, _ string, _ int64) (*transporttypes.MinedRelayMessage, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.calls++
+func (p *recordingProcessor) ProcessRelay(
+	ctx context.Context,
+	reqBody, respBody []byte,
+	supplierAddr, serviceID string,
+	_ int64,
+) (*transport.MinedRelayMessage, error) {
+	p.calls.Add(1)
+	if dl, ok := ctx.Deadline(); ok {
+		p.lastPublishHasDeadline = true
+		p.lastPublishBudget = time.Until(dl)
+	}
+	// Copy: forwardToBackend's buffer pool may recycle the backing array.
 	p.lastReqBody = append([]byte(nil), reqBody...)
 	p.lastRespBody = append([]byte(nil), respBody...)
-	p.lastContextErr = ctx.Err()
-	if deadline, ok := ctx.Deadline(); ok {
-		p.hasDeadline = true
-		p.remaining = time.Until(deadline)
-	}
-	return p.message, p.err
+	return &transport.MinedRelayMessage{
+		SupplierOperatorAddress: supplierAddr,
+		ServiceId:               serviceID,
+	}, nil
 }
 
 func (p *recordingProcessor) GetServiceDifficulty(context.Context, string, int64) ([]byte, error) {
@@ -62,281 +65,234 @@ func (p *recordingProcessor) GetServiceDifficulty(context.Context, string, int64
 
 func (p *recordingProcessor) SetDifficultyProvider(DifficultyProvider) {}
 
-func (p *recordingProcessor) snapshot() (int, []byte, []byte, error, bool, time.Duration) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.calls, append([]byte(nil), p.lastReqBody...), append([]byte(nil), p.lastRespBody...), p.lastContextErr, p.hasDeadline, p.remaining
-}
-
+// recordingPublisher counts Publish calls so a test can prove a relay was (or
+// was NOT) sent to the WAL.
 type recordingPublisher struct {
-	mu             sync.Mutex
-	calls          int
-	lastMessage    *transporttypes.MinedRelayMessage
-	lastContextErr error
-	hasDeadline    bool
-	remaining      time.Duration
-	publishError   error
+	calls atomic.Int32
 }
 
-func (p *recordingPublisher) Publish(ctx context.Context, message *transporttypes.MinedRelayMessage) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.calls++
-	p.lastMessage = message
-	p.lastContextErr = ctx.Err()
-	if deadline, ok := ctx.Deadline(); ok {
-		p.hasDeadline = true
-		p.remaining = time.Until(deadline)
-	}
-	return p.publishError
-}
-
-func (p *recordingPublisher) PublishBatch(context.Context, []*transporttypes.MinedRelayMessage) error {
+func (p *recordingPublisher) Publish(context.Context, *transport.MinedRelayMessage) error {
+	p.calls.Add(1)
 	return nil
 }
 
 func (p *recordingPublisher) Close() error { return nil }
 
-func (p *recordingPublisher) snapshot() (int, *transporttypes.MinedRelayMessage, error, bool, time.Duration) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.calls, p.lastMessage, p.lastContextErr, p.hasDeadline, p.remaining
-}
-
+// mockServerStream is a minimal grpc.ServerStream: it hands the handler a fixed
+// RelayRequest, records every message the handler sends back, and exposes an
+// incoming-metadata context.
 type mockServerStream struct {
-	ctx     context.Context
-	request *servicetypes.RelayRequest
-	sent    []interface{}
-	onSend  func()
-	mu      sync.Mutex
+	ctx  context.Context
+	req  *servicetypes.RelayRequest
+	sent []interface{}
 }
 
-func (s *mockServerStream) SetHeader(metadata.MD) error  { return nil }
-func (s *mockServerStream) SendHeader(metadata.MD) error { return nil }
-func (s *mockServerStream) SetTrailer(metadata.MD)       {}
-func (s *mockServerStream) Context() context.Context     { return s.ctx }
-func (s *mockServerStream) SendMsg(message interface{}) error {
-	s.mu.Lock()
-	s.sent = append(s.sent, message)
-	onSend := s.onSend
-	s.mu.Unlock()
-	if onSend != nil {
-		onSend()
-	}
+func (m *mockServerStream) SetHeader(metadata.MD) error  { return nil }
+func (m *mockServerStream) SendHeader(metadata.MD) error { return nil }
+func (m *mockServerStream) SetTrailer(metadata.MD)       {}
+func (m *mockServerStream) Context() context.Context     { return m.ctx }
+
+func (m *mockServerStream) SendMsg(msg interface{}) error {
+	m.sent = append(m.sent, msg)
 	return nil
 }
-func (s *mockServerStream) RecvMsg(message interface{}) error {
-	request, ok := message.(*servicetypes.RelayRequest)
+
+func (m *mockServerStream) RecvMsg(msg interface{}) error {
+	rr, ok := msg.(*servicetypes.RelayRequest)
 	if !ok {
-		return errors.New("unexpected receive type")
+		return nil
 	}
-	*request = *s.request
-	return nil
+	bz, err := m.req.Marshal()
+	if err != nil {
+		return err
+	}
+	return rr.Unmarshal(bz)
 }
 
-func newGRPCTestFixture(t *testing.T, statusCode int, body string, processor *recordingProcessor, publisher *recordingPublisher) (*RelayGRPCService, *mockServerStream) {
-	return newGRPCTestFixtureWithDelay(t, statusCode, body, 0, processor, publisher)
+// grpcPublishFixture wires a RelayGRPCService with a real signer, a recording
+// processor and publisher, a pool that resolves to backendURL, and a relay
+// pipeline whose validator accepts and whose meter is real: the service refuses
+// every relay without one. The request names ownerTestAppAddr, the only app that
+// meter knows, so relays are charged rather than served unmetered.
+type grpcPublishFixture struct {
+	svc       *RelayGRPCService
+	proc      *recordingProcessor
+	pub       *recordingPublisher
+	stream    *mockServerStream
+	supplier  string
+	serviceID string
+	pipeline  *RelayPipeline
+	redis     *redisutil.Client
+	charges   *chargeWriter
 }
 
-func newGRPCTestFixtureWithDelay(t *testing.T, statusCode int, body string, delay time.Duration, processor *recordingProcessor, publisher *recordingPublisher) (*RelayGRPCService, *mockServerStream) {
+func newGRPCPublishFixture(t *testing.T, backendURL string) *grpcPublishFixture {
 	t.Helper()
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if delay > 0 {
-			time.Sleep(delay)
-		}
-		w.WriteHeader(statusCode)
-		_, _ = w.Write([]byte(body))
-	}))
-	t.Cleanup(backend.Close)
 
-	endpoint, err := pool.NewBackendEndpoint("test", backend.URL)
-	require.NoError(t, err)
-	backendPool := pool.NewPool("svc:jsonrpc", []*pool.BackendEndpoint{endpoint}, &pool.FirstHealthySelector{}, "first_healthy(test)")
-	privateKey := secp256k1.GenPrivKey()
-	signer, err := NewResponseSigner(testLogger(), map[string]cryptotypes.PrivKey{testGRPCSupplier: privateKey})
+	const supplier = "pokt1testsupplieroperator"
+	const serviceID = "develop-http"
+
+	keys := map[string]cryptotypes.PrivKey{supplier: secp256k1.GenPrivKey()}
+	rs, err := NewResponseSigner(testLogger(), keys)
 	require.NoError(t, err)
 
-	req, reqBz, err := types.SerializeHTTPRequest(&http.Request{
-		Method: http.MethodPost,
-		URL:    mustParseURL(t, "http://relay/"),
-		Header: http.Header{"Content-Type": []string{"application/json"}},
-		Body:   http.NoBody,
+	proc := &recordingProcessor{}
+	pub := &recordingPublisher{}
+
+	endpoint, err := pool.NewBackendEndpoint("backend", backendURL)
+	require.NoError(t, err)
+	healthyPool := pool.NewPool(
+		"test-pool",
+		[]*pool.BackendEndpoint{endpoint},
+		&pool.FirstHealthySelector{},
+		"first_healthy(test)",
+	)
+
+	pipeline, redisClient, _, charges := newOwnerTestPipelineWithCharges(t)
+
+	svc := NewRelayGRPCService(testLogger(), RelayGRPCServiceConfig{
+		ServiceConfigs: map[string]ServiceConfig{serviceID: {}},
+		ResponseSigner: rs,
+		Publisher:      pub,
+		RelayProcessor: proc,
+		RelayPipeline:  pipeline,
+		GetPool: func(string, string) *pool.Pool {
+			return healthyPool
+		},
 	})
+
+	// A minimal but valid inner request: DeserializeHTTPRequest must parse it.
+	poktReq := &sdktypes.POKTHTTPRequest{
+		Method: http.MethodPost,
+		Url:    "/",
+		BodyBz: []byte(`{"jsonrpc":"2.0","method":"eth_blockNumber","id":1}`),
+	}
+	payloadBz, err := proto.Marshal(poktReq)
 	require.NoError(t, err)
-	require.NotNil(t, req)
 
 	relayRequest := &servicetypes.RelayRequest{
 		Meta: servicetypes.RelayRequestMetadata{
 			SessionHeader: &sessiontypes.SessionHeader{
-				ApplicationAddress:      "pokt1application",
-				ServiceId:               "svc",
-				SessionId:               "session",
-				SessionStartBlockHeight: 1,
-				SessionEndBlockHeight:   10,
+				ApplicationAddress:      ownerTestAppAddr,
+				ServiceId:               serviceID,
+				SessionId:               "test-session-id",
+				SessionStartBlockHeight: 100,
+				SessionEndBlockHeight:   110,
 			},
-			SupplierOperatorAddress: testGRPCSupplier,
+			SupplierOperatorAddress: supplier,
 		},
-		Payload: reqBz,
+		Payload: payloadBz,
 	}
-	_ = req
 
+	// rpc-type "3" == JSON_RPC: a non-gRPC relay routed over the plain HTTP client.
 	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("rpc-type", "3"))
-	stream := &mockServerStream{ctx: ctx, request: relayRequest}
-	serviceConfig := RelayGRPCServiceConfig{
-		ServiceConfigs: map[string]ServiceConfig{
-			"svc": {Backends: map[string]BackendConfig{BackendTypeJSONRPC: {URL: backend.URL}}},
-		},
-		ResponseSigner: signer,
-		RelayProcessor: processor,
-		GetPool: func(string, string) *pool.Pool {
-			return backendPool
-		},
+
+	return &grpcPublishFixture{
+		svc:       svc,
+		proc:      proc,
+		pub:       pub,
+		stream:    &mockServerStream{ctx: ctx, req: relayRequest},
+		supplier:  supplier,
+		serviceID: serviceID,
+		pipeline:  pipeline,
+		redis:     redisClient,
+		charges:   charges,
 	}
-	if publisher != nil {
-		serviceConfig.Publisher = publisher
-	}
-	service := NewRelayGRPCService(testLogger(), serviceConfig)
-	return service, stream
 }
 
-func mustParseURL(t *testing.T, raw string) *url.URL {
-	t.Helper()
-	parsed, err := url.Parse(raw)
-	require.NoError(t, err)
-	return parsed
-}
-
+// TestHandleSendRelay_TransportErrorNotPublished proves the gRPC error path does
+// NOT mine or publish when the backend forward fails at the transport level
+// (connection refused). This mirrors the HTTP path (proxy.go): on a forward
+// error it returns an error to the client and publishes nothing -- a relay the
+// backend never answered must never reach the WAL. The client still receives a
+// signed error response.
 func TestHandleSendRelay_TransportErrorNotPublished(t *testing.T) {
-	processor := &recordingProcessor{message: &transporttypes.MinedRelayMessage{}}
-	publisher := &recordingPublisher{}
-	service, stream := newGRPCTestFixture(t, http.StatusOK, "ok", processor, publisher)
-	endpoint, err := pool.NewBackendEndpoint("dead", "http://127.0.0.1:1")
-	require.NoError(t, err)
-	deadPool := pool.NewPool("svc:jsonrpc", []*pool.BackendEndpoint{endpoint}, &pool.FirstHealthySelector{}, "first_healthy(test)")
-	service.getPool = func(string, string) *pool.Pool { return deadPool }
+	// 127.0.0.1:1 refuses connections: forwardToBackend returns a transport error
+	// (err != nil), not a backend HTTP status.
+	fx := newGRPCPublishFixture(t, "http://127.0.0.1:1")
 
-	require.NoError(t, service.handleSendRelay(stream))
-	calls, _, _, _, _, _ := processor.snapshot()
-	publishCalls, _, _, _, _ := publisher.snapshot()
-	require.Zero(t, calls)
-	require.Zero(t, publishCalls)
-	require.Len(t, stream.sent, 1)
+	err := fx.svc.handleSendRelay(fx.stream)
+	require.NoError(t, err, "handler returns nil after serving the client an error response")
+
+	require.Equal(t, int32(0), fx.proc.calls.Load(),
+		"a transport-failed relay must NOT be processed for mining")
+	require.Equal(t, int32(0), fx.pub.calls.Load(),
+		"a transport-failed relay must NOT be published to the WAL")
+	require.Len(t, fx.stream.sent, 1, "client still gets exactly one (error) response")
 }
 
+// TestHandleSendRelay_SuccessMinesRawBackendBody proves the success path hands
+// ProcessRelay the RAW backend response body -- the same input the HTTP path
+// mines -- and NOT the already-marshaled signed RelayResponse. Passing the
+// wrapped RelayResponse would make PayloadHash cover the wrong bytes (a
+// RelayResponse-inside-a-RelayResponse), diverging from HTTP.
 func TestHandleSendRelay_SuccessMinesRawBackendBody(t *testing.T) {
-	const body = `{"jsonrpc":"2.0","result":"0x10","id":1}`
-	processor := &recordingProcessor{message: &transporttypes.MinedRelayMessage{ServiceId: "svc"}}
-	publisher := &recordingPublisher{}
-	service, stream := newGRPCTestFixture(t, http.StatusOK, body, processor, publisher)
+	backendBody := []byte(`{"jsonrpc":"2.0","result":"0x10","id":1}`)
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(backendBody)
+	}))
+	defer backend.Close()
 
-	require.NoError(t, service.handleSendRelay(stream))
-	calls, reqBody, respBody, contextErr, _, _ := processor.snapshot()
-	publishCalls, _, _, _, _ := publisher.snapshot()
-	require.Equal(t, 1, calls)
-	require.Equal(t, body, string(respBody))
-	require.NoError(t, contextErr)
-	require.Equal(t, 1, publishCalls)
-	decoded := &servicetypes.RelayRequest{}
-	require.NoError(t, decoded.Unmarshal(reqBody))
-	require.Equal(t, testGRPCSupplier, decoded.Meta.SupplierOperatorAddress)
+	fx := newGRPCPublishFixture(t, backend.URL)
+
+	err := fx.svc.handleSendRelay(fx.stream)
+	require.NoError(t, err)
+
+	require.Equal(t, int32(1), fx.proc.calls.Load(), "a served relay must be processed once")
+	require.Equal(t, int32(1), fx.pub.calls.Load(), "a served relay must be published once")
+
+	require.Equal(t, backendBody, fx.proc.lastRespBody,
+		"ProcessRelay must receive the raw backend body (parity with the HTTP path), "+
+			"not the marshaled RelayResponse")
+
+	// Guard: the marshaled RelayResponse the client received is a strict superset
+	// of the backend body (adds meta + signature), so equality above cannot pass
+	// by accident.
+	require.NotEqual(t, len(backendBody), len(fx.proc.lastRespBody)+1,
+		"sanity: backend body and wrapped response differ in length")
+	require.Len(t, fx.stream.sent, 1, "client gets exactly one signed response")
+
+	// The published request bytes must be the marshaled RelayRequest.
+	var gotReq servicetypes.RelayRequest
+	require.NoError(t, gotReq.Unmarshal(fx.proc.lastReqBody))
+	require.Equal(t, fx.supplier, gotReq.Meta.SupplierOperatorAddress)
 }
 
-func TestHandleSendRelay_Backend4xxWithBodyIsPublished(t *testing.T) {
-	const body = `{"error":"bad request"}`
-	processor := &recordingProcessor{message: &transporttypes.MinedRelayMessage{ServiceId: "svc"}}
-	publisher := &recordingPublisher{}
-	service, stream := newGRPCTestFixture(t, http.StatusBadRequest, body, processor, publisher)
-
-	require.NoError(t, service.handleSendRelay(stream))
-	_, _, respBody, _, _, _ := processor.snapshot()
-	publishCalls, _, _, _, _ := publisher.snapshot()
-	require.Equal(t, body, string(respBody))
-	require.Equal(t, 1, publishCalls)
-}
-
-func TestHandleSendRelay_Backend5xxNotPublished(t *testing.T) {
-	processor := &recordingProcessor{message: &transporttypes.MinedRelayMessage{}}
-	publisher := &recordingPublisher{}
-	service, stream := newGRPCTestFixture(t, http.StatusInternalServerError, "failure", processor, publisher)
-
-	err := service.handleSendRelay(stream)
-	require.Error(t, err)
-	require.Equal(t, codes.Unavailable, status.Code(err))
-	calls, _, _, _, _, _ := processor.snapshot()
-	publishCalls, _, _, _, _ := publisher.snapshot()
-	require.Zero(t, calls)
-	require.Zero(t, publishCalls)
-}
-
-func TestHandleSendRelay_NotApplicableNotPublished(t *testing.T) {
-	processor := &recordingProcessor{}
-	publisher := &recordingPublisher{}
-	service, stream := newGRPCTestFixture(t, http.StatusOK, "ok", processor, publisher)
-
-	require.NoError(t, service.handleSendRelay(stream))
-	calls, _, _, _, _, _ := processor.snapshot()
-	publishCalls, _, _, _, _ := publisher.snapshot()
-	require.Equal(t, 1, calls)
-	require.Zero(t, publishCalls)
-}
-
-func TestHandleSendRelay_NilPublisherDoesNotPanic(t *testing.T) {
-	processor := &recordingProcessor{message: &transporttypes.MinedRelayMessage{}}
-	service, stream := newGRPCTestFixture(t, http.StatusOK, "ok", processor, nil)
-
-	require.NoError(t, service.handleSendRelay(stream))
-	calls, _, _, _, _, _ := processor.snapshot()
-	require.Equal(t, 1, calls)
-}
-
-func TestHandleSendRelay_PublishFailureDoesNotChangeServedResponse(t *testing.T) {
-	processor := &recordingProcessor{message: &transporttypes.MinedRelayMessage{}}
-	publisher := &recordingPublisher{publishError: errors.New("publisher unavailable")}
-	service, stream := newGRPCTestFixture(t, http.StatusOK, "ok", processor, publisher)
-
-	require.NoError(t, service.handleSendRelay(stream))
-	publishCalls, _, _, _, _ := publisher.snapshot()
-	require.Equal(t, 1, publishCalls)
-	require.Len(t, stream.sent, 1)
-}
-
+// TestHandleSendRelay_PublishBudgetFreshAfterSlowBackend proves the detached
+// publish context gets its full grpcPublishTimeout budget measured from PUBLISH
+// time, not from handler entry. The budget must not be consumed by backend
+// latency: an already-served relay that took a while at the backend must still
+// have (nearly) the whole publish window left, or a slow-but-successful relay
+// silently fails to reach the WAL (lost reward) -- a divergence from the HTTP
+// path, which publishes on a fresh context created after the backend returns.
 func TestHandleSendRelay_PublishBudgetFreshAfterSlowBackend(t *testing.T) {
-	processor := &recordingProcessor{message: &transporttypes.MinedRelayMessage{}}
-	publisher := &recordingPublisher{}
-	service, stream := newGRPCTestFixtureWithDelay(t, http.StatusOK, "ok", 300*time.Millisecond, processor, publisher)
+	// A backend that takes a noticeable slice of wall-clock before answering.
+	// If publishCtx's clock starts at handler entry, this latency is charged
+	// against the 30s publish budget; if it starts at publish time, it is not.
+	const backendDelay = 300 * time.Millisecond
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(backendDelay)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","result":"0x1","id":1}`))
+	}))
+	defer backend.Close()
 
-	require.NoError(t, service.handleSendRelay(stream))
-	_, _, _, _, hasDeadline, remaining := processor.snapshot()
-	require.True(t, hasDeadline)
-	require.Greater(t, remaining, grpcPublishTimeout-100*time.Millisecond)
+	fx := newGRPCPublishFixture(t, backend.URL)
+
+	err := fx.svc.handleSendRelay(fx.stream)
+	require.NoError(t, err)
+	require.Equal(t, int32(1), fx.proc.calls.Load())
+	require.True(t, fx.proc.lastPublishHasDeadline, "publish context must carry a bounded deadline")
+
+	// The remaining budget at publish time must be within ~backendDelay of the
+	// full grpcPublishTimeout. Tolerance (100ms) comfortably covers the
+	// microsecond gap between the backend returning and publishCtx being
+	// created, but is far smaller than backendDelay, so the old
+	// created-at-entry behaviour (budget = 30s - ~300ms) fails this bound.
+	require.Greater(t, fx.proc.lastPublishBudget, grpcPublishTimeout-100*time.Millisecond,
+		"publish budget must be measured from publish time, not handler entry "+
+			"(got %s left of %s after a %s backend)", fx.proc.lastPublishBudget, grpcPublishTimeout, backendDelay)
 }
-
-func TestHandleSendRelay_ClientCancelAfterResponseStillPublishes(t *testing.T) {
-	processor := &recordingProcessor{message: &transporttypes.MinedRelayMessage{}}
-	publisher := &recordingPublisher{}
-	service, stream := newGRPCTestFixture(t, http.StatusOK, "ok", processor, publisher)
-	parentCtx, cancel := context.WithCancel(stream.ctx)
-	stream.ctx = parentCtx
-	stream.onSend = cancel
-
-	require.NoError(t, service.handleSendRelay(stream))
-	_, _, _, processorContextErr, _, _ := processor.snapshot()
-	publishCalls, _, publisherContextErr, _, _ := publisher.snapshot()
-	require.NoError(t, processorContextErr)
-	require.Equal(t, 1, publishCalls)
-	require.NoError(t, publisherContextErr)
-}
-
-func TestHandleSendRelay_PublishContextHasDeadline(t *testing.T) {
-	processor := &recordingProcessor{message: &transporttypes.MinedRelayMessage{}}
-	publisher := &recordingPublisher{}
-	service, stream := newGRPCTestFixture(t, http.StatusOK, "ok", processor, publisher)
-
-	require.NoError(t, service.handleSendRelay(stream))
-	_, _, _, _, processorHasDeadline, _ := processor.snapshot()
-	_, _, _, publisherHasDeadline, _ := publisher.snapshot()
-	require.True(t, processorHasDeadline)
-	require.True(t, publisherHasDeadline)
-}
-
-var _ grpc.ServerStream = (*mockServerStream)(nil)

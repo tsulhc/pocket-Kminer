@@ -4,10 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"strings"
+	"sync"
 	"time"
 
 	servicetypes "github.com/pokt-network/poktroll/x/service/types"
+	sdktypes "github.com/pokt-network/shannon-sdk/types"
 
 	"github.com/pokt-network/pocket-relay-miner/client/relay_client"
 	"github.com/pokt-network/pocket-relay-miner/logging"
@@ -38,19 +39,56 @@ type RelayResult struct {
 	StatusCode   int // HTTP status code (if applicable)
 }
 
-// CheckRelayResponseError checks if a RelayResponse contains an error.
-// This checks the payload for JSON-RPC errors (best-effort).
+// maxErrorBodyBytes bounds how much of a backend error body is echoed into an
+// error message, so a large upstream body cannot bloat CLI/log output.
+const maxErrorBodyBytes = 200
+
+// CheckRelayResponseError checks if a RelayResponse carries a backend or
+// application error.
 //
-// Returns:
-// - error if the response contains a JSON-RPC error
-// - nil if the response is successful or payload is not JSON-RPC
+// A relay's Payload is NOT raw JSON: the relayer wraps the backend's HTTP
+// response in a shannon-sdk POKTHTTPResponse (protobuf) before signing it
+// (see relayer/signer.go, BuildErrorRelayResponse / SerializeHTTPResponse). The
+// previous implementation ran json.Unmarshal directly on that protobuf blob,
+// which always failed silently and left this check dead: a signed HTTP 500
+// error response was reported as a success. We therefore deserialize the
+// POKTHTTPResponse first and inspect the real backend status and body:
+//
+//  1. POKTHTTPResponse decodes (the common case):
+//     a. StatusCode >= 400 -> backend/transport error (the signed error
+//     response the relayer emits when the backend fails).
+//     b. StatusCode < 400  -> apply the JSON-RPC error check to BodyBz (the
+//     actual backend body), not to the protobuf envelope.
+//     c. otherwise -> no error.
+//  2. POKTHTTPResponse does NOT decode -> fall back to a best-effort JSON-RPC
+//     check on the raw payload. This covers payloads that are not wrapped
+//     POKTHTTPResponses (e.g. WebSocket subscription frames).
+//
+// Returns nil when no error is detectable.
 func CheckRelayResponseError(response *servicetypes.RelayResponse) error {
 	if response == nil {
 		return fmt.Errorf("nil relay response")
 	}
 
-	// Try to parse payload as JSON-RPC to check for errors
-	// This is best-effort - not all payloads are JSON-RPC
+	// The relay payload wraps the backend's HTTP response in a protobuf
+	// POKTHTTPResponse. Decode it so the real status and body are inspected,
+	// not the protobuf envelope.
+	if poktResp, err := sdktypes.DeserializeHTTPResponse(response.Payload); err == nil {
+		if poktResp.StatusCode >= 400 {
+			return fmt.Errorf("backend HTTP %d: %s", poktResp.StatusCode, truncateForError(poktResp.BodyBz))
+		}
+		return checkJSONRPCError(poktResp.BodyBz)
+	}
+
+	// Fallback: payload is not a wrapped POKTHTTPResponse (e.g. a WebSocket
+	// subscription frame). Best-effort JSON-RPC check on the raw bytes.
+	return checkJSONRPCError(response.Payload)
+}
+
+// checkJSONRPCError performs a best-effort JSON-RPC error inspection on a body.
+// Not all bodies are JSON-RPC; a parse failure or an absent error field yields
+// nil.
+func checkJSONRPCError(bodyBz []byte) error {
 	var jsonRPCResp struct {
 		Error *struct {
 			Code    int    `json:"code"`
@@ -58,13 +96,51 @@ func CheckRelayResponseError(response *servicetypes.RelayResponse) error {
 		} `json:"error,omitempty"`
 	}
 
-	if err := json.Unmarshal(response.Payload, &jsonRPCResp); err == nil {
+	if err := json.Unmarshal(bodyBz, &jsonRPCResp); err == nil {
 		if jsonRPCResp.Error != nil {
 			return fmt.Errorf("JSON-RPC error %d: %s", jsonRPCResp.Error.Code, jsonRPCResp.Error.Message)
 		}
 	}
 
 	return nil
+}
+
+// truncateForError renders a backend error body for inclusion in an error
+// message, capped at maxErrorBodyBytes.
+func truncateForError(bodyBz []byte) string {
+	if len(bodyBz) > maxErrorBodyBytes {
+		return string(bodyBz[:maxErrorBodyBytes])
+	}
+	return string(bodyBz)
+}
+
+// buildRelayRequest builds a relay request for the given service+supplier,
+// routing through the simulated-relay path
+// (relay_client.RelayClient.BuildSimulatedRelayRequest — locally ring-signed,
+// NO chain query) when --simulate is set, or the normal chain-backed path
+// (BuildRelayRequest) otherwise.
+//
+// Every relay-building call site (diagnostic AND load test, across all five
+// transports) goes through this single branch, so --simulate is picked up
+// everywhere without duplicating the check at each call site.
+func buildRelayRequest(
+	ctx context.Context,
+	client *relay_client.RelayClient,
+	serviceID string,
+	supplierAddr string,
+	payloadBz []byte,
+) (*servicetypes.RelayRequest, []byte, error) {
+	if RelaySimulate {
+		return client.BuildSimulatedRelayRequest(
+			RelaySimAppPubKey,
+			RelaySimGatewayPubKeys,
+			serviceID,
+			supplierAddr,
+			payloadBz,
+			time.Now(),
+		)
+	}
+	return client.BuildRelayRequest(ctx, serviceID, supplierAddr, payloadBz)
 }
 
 // BuildAndSendRelay is a helper function that builds, sends, and verifies a relay.
@@ -94,7 +170,7 @@ func BuildAndSendRelay(
 
 	// Step 1: Build and sign relay request
 	buildStart := time.Now()
-	relayRequest, relayRequestBz, err := client.BuildRelayRequest(ctx, RelayServiceID, RelaySupplierAddr, payloadBz)
+	relayRequest, relayRequestBz, err := buildRelayRequest(ctx, client, RelayServiceID, RelaySupplierAddr, payloadBz)
 	if err != nil {
 		result.Error = fmt.Errorf("failed to build relay request: %w", err)
 		result.TotalDuration = time.Since(totalStart)
@@ -188,7 +264,7 @@ func DisplayDiagnosticResult(client *relay_client.RelayClient, result *RelayResu
 			// Try to pretty-print JSON
 			var jsonData interface{}
 			if err := json.Unmarshal(result.Response.Payload, &jsonData); err == nil {
-				prettyJSON, _ := json.MarshalIndent(jsonData, "", "  ")
+				prettyJSON, _ := json.MarshalIndent(jsonData, "", "  ") //nolint:errcheck // Marshal fails only on channels, funcs, complex, NaN/Inf or cycles (encoding/json); none is reachable from this value
 				fmt.Printf("%s\n", prettyJSON)
 			} else {
 				// Not JSON or parse error - print raw
@@ -205,127 +281,62 @@ func DisplayDiagnosticResult(client *relay_client.RelayClient, result *RelayResu
 	fmt.Printf("\n")
 }
 
-// LoadTestStats tracks statistics for load testing.
-type LoadTestStats struct {
-	TotalRequests    int64
-	SuccessCount     int64
-	FailureCount     int64
-	ValidationFailed int64 // Failed signature verification
-	ErrorResponses   int64 // RelayResponse contained error
-	NetworkErrors    int64 // Network/transport errors
+// runLoadTest runs the shared worker-pool load-test scaffold used by the HTTP,
+// gRPC, and WebSocket load tests. It owns the bounded worker pool (semaphore +
+// WaitGroup), optional RPS pacing, the metrics lifecycle, and result output.
+//
+// Protocol-specific concerns (connection setup/teardown, building/sending/
+// verifying a single relay, and per-protocol log fields) are provided by the
+// caller:
+//   - startLog: invoked once, just before workers spawn, to emit the
+//     protocol-specific "starting ..." log line.
+//   - workerFn: invoked once per request inside an acquired worker slot; it is
+//     responsible for sending one relay and recording the outcome on metrics.
+//
+// Workers run with at most `concurrency` in flight. When `rps > 0`, request
+// launches are paced by a ticker so the aggregate launch rate approaches rps.
+func runLoadTest(
+	count, concurrency, rps int,
+	metrics *RelayMetrics,
+	startLog func(),
+	workerFn func(reqNum int),
+) {
+	// Worker pool pattern with semaphore
+	semaphore := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
 
-	TotalLatency   time.Duration
-	MinLatency     time.Duration
-	MaxLatency     time.Duration
-	LatencyBuckets map[string]int64 // e.g., "0-10ms", "10-50ms", etc.
-}
-
-// NewLoadTestStats creates a new load test statistics tracker.
-func NewLoadTestStats() *LoadTestStats {
-	return &LoadTestStats{
-		MinLatency: time.Hour, // Start with very high value
-		LatencyBuckets: map[string]int64{
-			"0-10ms":     0,
-			"10-50ms":    0,
-			"50-100ms":   0,
-			"100-500ms":  0,
-			"500-1000ms": 0,
-			"1000ms+":    0,
-		},
-	}
-}
-
-// RecordResult records a relay result in the statistics.
-func (s *LoadTestStats) RecordResult(result *RelayResult) {
-	s.TotalRequests++
-
-	if result.Success {
-		s.SuccessCount++
-	} else {
-		s.FailureCount++
-
-		// Categorize failure type
-		if result.Error != nil {
-			errMsg := result.Error.Error()
-			if contains(errMsg, "signature verification") {
-				s.ValidationFailed++
-			} else if contains(errMsg, "relay response contains error") || contains(errMsg, "JSON-RPC error") {
-				s.ErrorResponses++
-			} else {
-				s.NetworkErrors++
-			}
-		}
+	// Create rate limiter if RPS targeting is enabled
+	rateLimiter := NewRateLimiter(rps)
+	if rateLimiter != nil {
+		defer rateLimiter.Stop()
 	}
 
-	// Track latency
-	latency := result.TotalDuration
-	s.TotalLatency += latency
+	startLog()
 
-	if latency < s.MinLatency {
-		s.MinLatency = latency
-	}
-	if latency > s.MaxLatency {
-		s.MaxLatency = latency
-	}
+	metrics.Start()
 
-	// Update latency buckets
-	ms := latency.Milliseconds()
-	switch {
-	case ms < 10:
-		s.LatencyBuckets["0-10ms"]++
-	case ms < 50:
-		s.LatencyBuckets["10-50ms"]++
-	case ms < 100:
-		s.LatencyBuckets["50-100ms"]++
-	case ms < 500:
-		s.LatencyBuckets["100-500ms"]++
-	case ms < 1000:
-		s.LatencyBuckets["500-1000ms"]++
-	default:
-		s.LatencyBuckets["1000ms+"]++
-	}
-}
+	// Spawn workers
+	for i := 0; i < count; i++ {
+		// Wait for rate limiter if enabled (pace request launches)
+		WaitForRateLimit(rateLimiter)
 
-// DisplayLoadTestSummary prints a formatted summary of load test results.
-func (s *LoadTestStats) DisplayLoadTestSummary(duration time.Duration) {
-	fmt.Printf("\n=== Load Test Summary ===\n")
-	fmt.Printf("Total Requests: %d\n", s.TotalRequests)
-	fmt.Printf("Successful: %d (%.2f%%)\n", s.SuccessCount, float64(s.SuccessCount)/float64(s.TotalRequests)*100)
-	fmt.Printf("Failed: %d (%.2f%%)\n", s.FailureCount, float64(s.FailureCount)/float64(s.TotalRequests)*100)
+		wg.Add(1)
+		semaphore <- struct{}{} // Acquire slot
 
-	if s.FailureCount > 0 {
-		fmt.Printf("\n=== Failure Breakdown ===\n")
-		fmt.Printf("Validation Failed: %d\n", s.ValidationFailed)
-		fmt.Printf("Error Responses: %d\n", s.ErrorResponses)
-		fmt.Printf("Network Errors: %d\n", s.NetworkErrors)
+		go func(reqNum int) {
+			defer wg.Done()
+			defer func() { <-semaphore }() // Release slot
+
+			workerFn(reqNum)
+		}(i)
 	}
 
-	fmt.Printf("\n=== Latency ===\n")
-	if s.TotalRequests > 0 {
-		avgLatency := s.TotalLatency / time.Duration(s.TotalRequests)
-		fmt.Printf("Min: %v\n", s.MinLatency)
-		fmt.Printf("Avg: %v\n", avgLatency)
-		fmt.Printf("Max: %v\n", s.MaxLatency)
-	}
+	// Wait for all workers to finish
+	wg.Wait()
+	metrics.End()
 
-	fmt.Printf("\n=== Latency Distribution ===\n")
-	for _, bucket := range []string{"0-10ms", "10-50ms", "50-100ms", "100-500ms", "500-1000ms", "1000ms+"} {
-		count := s.LatencyBuckets[bucket]
-		pct := float64(count) / float64(s.TotalRequests) * 100
-		fmt.Printf("%12s: %6d (%.1f%%)\n", bucket, count, pct)
-	}
-
-	fmt.Printf("\n=== Performance ===\n")
-	rps := float64(s.TotalRequests) / duration.Seconds()
-	fmt.Printf("Duration: %v\n", duration)
-	fmt.Printf("Throughput: %.2f RPS\n", rps)
-
-	fmt.Printf("\n")
-}
-
-// contains is a helper function to check if a string contains a substring.
-func contains(s, substr string) bool {
-	return strings.Contains(s, substr)
+	// Display results
+	fmt.Println(metrics.GetSummary())
 }
 
 // NewRateLimiter creates a rate limiter for RPS targeting.

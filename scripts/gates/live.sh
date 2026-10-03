@@ -1,0 +1,1391 @@
+#!/usr/bin/env bash
+#
+# Gate: live validation on the Tilt localnet. Tens of minutes, needs a cluster.
+#
+# Proves the money path end to end: relays are served and signed, the miner
+# consumes them off the WAL, and the resulting claim -- and its proof, when one
+# is required -- are INCLUDED ON-CHAIN. Nothing below infers success from a
+# Redis key or an HTTP status.
+#
+# Usage:
+#   scripts/gates/live.sh                     # verify, load, wait, assert
+#   scripts/gates/live.sh --preflight-only    # check readiness and stop
+#   scripts/gates/live.sh --relays 600 --concurrency 10
+#   scripts/gates/live.sh --service develop-grpc
+#
+# This gate NEVER starts or stops anything. If the localnet is not up it says
+# what to run and exits non-zero. Bringing the cluster up takes ports and
+# containers that another session on this machine may be using, so that
+# decision stays with the person at the keyboard.
+#
+# Three things that will otherwise waste an afternoon, all learned the hard way:
+#
+#   * Load goes through the relay CLI at :8180, NEVER the gateway. The gateway
+#     answers a relayer 503 with 200 and an empty body, so a gateway-side run
+#     reports 20000/20000 OK with an empty WAL.
+#   * There is an economic cap of roughly 115-130 mined relays per supplier per
+#     session (~109s). Past it the relayer correctly returns 429 and only the
+#     first session claims, which looks like a broken pipeline and is not. The
+#     defaults here stay under it; --all-suppliers spreads the rest.
+#   * Tilt's port-forward is sometimes IPv6-only. curl to localhost still works
+#     while the Go CLI fails with "connect: connection refused" and the load
+#     test reports 0%. Detected in preflight and worked around.
+
+set -uo pipefail
+
+# shellcheck source=scripts/gates/lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
+gate_repo_root
+
+# ---------------------------------------------------------------------------
+# Configuration
+CONCURRENCY="${CONCURRENCY:-10}"
+SERVICE_FILTER="${SERVICE_FILTER:-}"
+RELAYER_PORT="${RELAYER_PORT:-8180}"
+VALIDATOR_RPC="${VALIDATOR_RPC:-http://localhost:26657}"
+# Prometheus, for the ANNOUNCED-drop accounting below. Only used to explain a
+# shortfall; if it is unreachable the assertion stays strict, which is the
+# safe direction (a real loss must never be excused by a scrape failure).
+PROMETHEUS_URL="${PROMETHEUS_URL:-http://localhost:9091}"
+# How long to wait for the claim and proof windows to close and the settlement
+# to land. Left empty here on purpose -- SETTLE_TIMEOUT_MIN or --timeout-min
+# (checked below, in the arg loop) both win outright if given; otherwise it is
+# DERIVED, later, from the chain's own session/claim/proof block counts and
+# the miner's block_time_seconds (see gate_settle_timeout_min in lib.sh, right
+# before it is first used) -- a fixed number in minutes was only ever right at
+# whatever clock it was written against.
+SETTLE_TIMEOUT_MIN_DEFAULT=45
+SETTLE_TIMEOUT_MIN="${SETTLE_TIMEOUT_MIN:-}"
+POLL_INTERVAL_S="${POLL_INTERVAL_S:-15}"
+
+preflight_only=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+    --preflight-only) preflight_only=1; shift ;;
+    --relays | --concurrency | --service | --timeout-min)
+        # Guard the shift: with a missing value, `shift 2` on one remaining
+        # argument fails silently under `set -u` without -e and the loop
+        # re-reads the same flag forever at 100% CPU.
+        if [ $# -lt 2 ]; then
+            printf '%s requires a value\n' "$1" >&2
+            exit 2
+        fi
+        case "$1" in
+        # --relays sizes the per-transport load and --service narrows the
+        # matrix to every cell of one service. Both map onto the env knobs
+        # the script actually consumes -- they used to parse into variables
+        # nothing read, so the usage advertised no-ops.
+        --relays) RELAYS_PER_TRANSPORT="$2" ;;
+        --concurrency) CONCURRENCY="$2" ;;
+        --service) SERVICE_FILTER="$2" ;;
+        --timeout-min) SETTLE_TIMEOUT_MIN="$2" ;;
+        esac
+        shift 2
+        ;;
+    -h | --help)
+        sed -n '2,32p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+        exit 0
+        ;;
+    *) printf 'unknown argument: %s\n' "$1" >&2; exit 2 ;;
+    esac
+done
+
+# ---------------------------------------------------------------------------
+gate_step "preflight: tooling"
+
+for tool in kubectl jq curl go python3; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+        gate_fail "$tool is not installed"
+    fi
+done
+[ "$gate_failed" -ne 0 ] && gate_verdict "live"
+gate_pass "kubectl, jq, curl, go, python3 present"
+
+# ---------------------------------------------------------------------------
+gate_step "preflight: cluster"
+
+# The localnet runs in kind. Any other context is either a mistake or, worse,
+# a real cluster -- this gate sends load and must never be pointed at one.
+current_ctx="$(kubectl config current-context 2>/dev/null || true)"
+case "$current_ctx" in
+kind-*)
+    gate_pass "kubectl context is $current_ctx"
+    ;;
+"")
+    gate_fail "no kubectl context is set"
+    ;;
+*)
+    gate_fail "kubectl context is '$current_ctx', which is not a kind cluster"
+    printf '         this gate sends load; refusing to run outside kind\n'
+    ;;
+esac
+[ "$gate_failed" -ne 0 ] && gate_verdict "live"
+
+pods="$(kubectl get pods --no-headers 2>/dev/null || true)"
+if [ -z "$pods" ]; then
+    gate_fail "no pods in the current namespace -- the localnet is not up"
+    printf '         bring it up yourself with: %stilt up -f Tiltfile --stream%s\n' \
+        "$GATE_BOLD" "$GATE_RESET"
+    printf '         (this gate does not start anything: the cluster takes ports\n'
+    printf '          and containers another session on this machine may be using)\n'
+    gate_verdict "live"
+fi
+
+# The fleet must be SETTLED before load: a rollout in progress (Tilt rebuild,
+# manual restart) means relays land while consumers are being replaced, and the
+# short localnet claim/proof windows turn ordinary handover latency into
+# missed windows. The rule: live validation runs if and only if no more
+# changes are in flight and every pod is on the current ReplicaSet.
+for dep in relayer miner; do
+    if rollout_out="$(kubectl rollout status "deployment/${dep}" --timeout=5s 2>&1)"; then
+        gate_pass "${dep}: rollout settled"
+    else
+        gate_fail "${dep}: rollout in progress -- run the gate only once the fleet is settled"
+        gate_detail "$rollout_out" 3
+    fi
+done
+[ "$gate_failed" -ne 0 ] && gate_verdict "live"
+
+for app in relayer miner validator; do
+    running="$(printf '%s\n' "$pods" | awk -v a="$app" '$1 ~ a && $3 == "Running" {n++} END {print n+0}')"
+    if [ "$running" -gt 0 ]; then
+        gate_pass "$app: $running pod(s) Running"
+    else
+        gate_fail "$app: no Running pod"
+    fi
+done
+[ "$gate_failed" -ne 0 ] && gate_verdict "live"
+
+# ---------------------------------------------------------------------------
+gate_step "preflight: endpoints"
+
+# Tilt's port-forward sometimes binds IPv6 only. curl to "localhost" resolves
+# to ::1 and succeeds while the Go CLI dials 127.0.0.1 and fails, which shows
+# up as a load test that reports 0% and no other symptom.
+relayer_url="http://localhost:${RELAYER_PORT}"
+if command -v ss >/dev/null 2>&1; then
+    listeners="$(ss -lntH "sport = :${RELAYER_PORT}" 2>/dev/null || true)"
+    if [ -n "$listeners" ] && ! printf '%s\n' "$listeners" | grep -qE '(0\.0\.0\.0|127\.0\.0\.1):'"${RELAYER_PORT}"; then
+        relayer_url="http://[::1]:${RELAYER_PORT}"
+        gate_skip "port ${RELAYER_PORT} is IPv6-only; using ${relayer_url}"
+    fi
+fi
+
+if curl -fsS --max-time 5 "${relayer_url}/health" >/dev/null 2>&1; then
+    gate_pass "relayer healthy at ${relayer_url}"
+else
+    gate_fail "relayer does not answer /health at ${relayer_url}"
+fi
+
+height_before="$(curl -fsS --max-time 5 "${VALIDATOR_RPC}/status" 2>/dev/null |
+    jq -r '.result.sync_info.latest_block_height // empty')"
+if [ -n "$height_before" ]; then
+    gate_pass "chain at height ${height_before}"
+else
+    gate_fail "validator RPC ${VALIDATOR_RPC} did not report a height"
+fi
+[ "$gate_failed" -ne 0 ] && gate_verdict "live"
+
+# A chain that is up but not producing blocks never closes a claim window, so
+# the run would burn the whole timeout and report a false negative.
+sleep 3
+height_after="$(curl -fsS --max-time 5 "${VALIDATOR_RPC}/status" 2>/dev/null |
+    jq -r '.result.sync_info.latest_block_height // empty')"
+if [ "${height_after:-0}" -gt "${height_before:-0}" ] 2>/dev/null; then
+    gate_pass "chain is producing blocks (${height_before} -> ${height_after})"
+else
+    gate_skip "no new block in 3s -- may be mid-block, continuing"
+fi
+
+# ---------------------------------------------------------------------------
+gate_step "preflight: binary"
+
+# The gate's working directory, and it is KEPT. Everything this run can be audited
+# from lives in it: the binary under test, the counter snapshots taken BEFORE the load
+# (announced drops, difficulty failures, relays skipped by difficulty), the load
+# matrix, the miner's session states, and settlement_events.jsonl -- which is where
+# every uPOKT figure this gate asserts comes from.
+#
+# It used to be an unconditional `mktemp -d` plus `trap rm -rf`, so the instant the
+# gate finished, the evidence for every assertion it had just made was gone. That is
+# worst on a gate that FAILS: the one run somebody needs to diagnose destroyed its own
+# inputs, and the only way to look was to re-run and hope it broke the same way.
+#
+# The BINARY is deliberately NOT kept: it is 185 MB (measured 2026-09-19) and it is
+# reproducible with `go build` at the recorded commit, while the TSVs and the JSONL
+# are not reproducible at all. Keeping ten runs of evidence costs a few hundred KB;
+# keeping ten binaries would cost 1.85 GB, so the binary goes to its own temporary
+# directory and is deleted on exit.
+#
+# GATE_EVIDENCE_DIR moves the location; GATE_EVIDENCE_KEEP (default 10) is how many
+# past runs survive, so this grows bounded instead of forever.
+#
+# The directory and the timestamp format are the ones gate_keep_evidence already uses
+# (lib.sh), on purpose: that helper keeps a FAILING gate's raw log beside these, under
+# the same path, and its date is LOCAL. Two date conventions in one directory make a
+# listing sort wrongly, and the pruning below sorts by name -- so this follows the
+# neighbour rather than introducing UTC next to it.
+#
+# The prefix is `live-run-`, not `live-`, and the pruning matches DIRECTORIES only.
+# gate_keep_evidence names its files "<gate>-<date>.log" in this same directory, so the
+# day this gate calls it with the name "live" there would be a live-<date>.log sitting
+# next to these -- and a `live-*` glob would delete the raw log of a RED run, which is
+# the exact thing this change exists to stop.
+LIVE_EVIDENCE_ROOT=${GATE_EVIDENCE_DIR:-scripts/localonly/_state/gate-evidence}
+BIN_DIR="${LIVE_EVIDENCE_ROOT}/live-run-$(date +%Y%m%d-%H%M%S)"
+if mkdir -p "$BIN_DIR" 2>/dev/null; then
+    LIVE_BIN_TMP="$(mktemp -d)"
+    trap 'rm -rf "$LIVE_BIN_TMP"; printf "\n[evidence] %s\n" "$BIN_DIR"' EXIT
+    # Prune oldest first, keeping the most recent N. A non-numeric KEEP falls back to
+    # the default rather than deleting everything.
+    keep=${GATE_EVIDENCE_KEEP:-10}
+    case $keep in ''|*[!0-9]*) keep=10;; esac
+    [ "$keep" -lt 1 ] && keep=1
+    find "$LIVE_EVIDENCE_ROOT" -maxdepth 1 -type d -name 'live-run-*' 2>/dev/null |
+        sort | head -n "-${keep}" |
+        while IFS= read -r old; do [ -n "$old" ] && rm -rf -- "$old"; done
+else
+    # A checkout without scripts/localonly (CI, a bare clone) still has to run the
+    # gate, so fall back to a temporary directory -- and SAY that the evidence is
+    # about to be deleted, instead of silently losing it the way this used to.
+    BIN_DIR="$(mktemp -d)"
+    LIVE_BIN_TMP="$BIN_DIR"
+    trap 'rm -rf "$BIN_DIR"' EXIT
+    gate_detail "no evidence directory (${LIVE_EVIDENCE_ROOT} not writable) -- using a temporary one, evidence WILL be deleted on exit"
+fi
+BIN="${LIVE_BIN_TMP}/pocket-relay-miner"
+if build_out="$(go build -o "$BIN" . 2>&1)"; then
+    gate_pass "built the CLI under test"
+else
+    gate_fail "could not build the CLI:"
+    gate_detail "$build_out"
+    gate_verdict "live"
+fi
+
+# STAKED suppliers only: the registry also lists not_staked leftovers, and a
+# relay pinned to one of those is answered 503 ("supplier ... is not_staked").
+# The count also feeds the thin-load warning and the settlement filter.
+suppliers="$("$BIN" redis supplier --list 2>/dev/null | awk '/^pokt/ && $2 == "active" {print $1}')"
+supplier_count="$(printf '%s\n' "$suppliers" | grep -c '^pokt' || true)"
+if [ "$supplier_count" -gt 0 ]; then
+    gate_pass "${supplier_count} supplier(s) registered"
+else
+    gate_fail "no suppliers in the registry -- the miner has not registered any"
+fi
+[ "$gate_failed" -ne 0 ] && gate_verdict "live"
+
+if [ "$preflight_only" -eq 1 ]; then
+    printf '\n%spreflight only%s -- the localnet is ready for a live run\n' \
+        "$GATE_BOLD" "$GATE_RESET"
+    gate_verdict "live (preflight)"
+fi
+
+# Every transport the relayer serves, each against its staked localnet service.
+# One transport per line: a change can break one routing path while the others
+# stay green, or -- worse -- serve a transport's relays without publishing them
+# to the WAL, so they are never mined or paid. Both failure modes are invisible
+# to a single-service run. The matrix also covers both validation modes for
+# free: develop-http runs optimistic, every other service runs eager, so a
+# mode-specific regression shows up as exactly one column failing.
+#
+# Load shapes per transport:
+#   jsonrpc/websocket/grpc  --load-test (concurrent, end-to-end verified)
+#   stream                  --batches (load-test unsupported). Billing model
+#                           pinned live 2026-08-18: one stream REQUEST bills ONE
+#                           relay -- the SMST leaf is the signed request, so the
+#                           batch count does not multiply billing.
+#   cometbft                sequential single relays; one request bills one relay.
+run_transport_load() {
+    local mode="$1" service="$2" out rc
+    local -a extra_args=()
+    # One gRPC cell drives a NON-default method, so --grpc-method is exercised
+    # against the real relayer instead of only in unit tests. It rides an
+    # existing cell rather than firing extra probe relays: the settlement
+    # assertion compares billed against what this ledger recorded as served, so
+    # any relay sent outside the load phase would surface as "foreign traffic"
+    # and fail the money assertion for the wrong reason.
+    #
+    # HealthCheck is one of the four methods tilt/backend-server/pb/demo.proto
+    # serves, and it takes a request with no fields, so the default empty
+    # --grpc-request-hex is correct. If --grpc-method regresses, this cell goes
+    # red on verification or on served==billed -- which is the whole point:
+    # before this, the custom-method path had no gate at any level.
+    if [ "$mode" = "grpc" ] && [ "$service" = "${GRPC_CUSTOM_METHOD_SERVICE:-develop-grpc-optimistic}" ]; then
+        extra_args=(--grpc-method "${GRPC_CUSTOM_METHOD:-/demo.DemoService/HealthCheck}")
+    fi
+    case "$mode" in
+    jsonrpc | websocket | grpc)
+        out="$("$BIN" relay "$mode" --localnet --service "$service" \
+            --relayer-url "$relayer_url" \
+            --load-test -n "$RELAYS_PER_TRANSPORT" --concurrency "$CONCURRENCY" \
+            --all-suppliers "${extra_args[@]}" 2>&1)"
+        rc=$?
+        ;;
+    stream | cometbft)
+        # Sequential single requests; each successful invocation is one billed
+        # relay. --all-suppliers does not apply (stream pins its supplier at
+        # the handshake), and with --localnet the CLI pins EVERY invocation to
+        # supplier1 when --supplier is absent -- successive requests do NOT
+        # spread on their own (the old comment claiming they did was false).
+        # All of this cell's relays go to ONE supplier, rotated per cell:
+        # concentration keeps the per-supplier-session count at 3 -- a
+        # 1-relay supplier-session is the regime where a claim can vanish
+        # between the WAL and the claim -- while rotating across cells stops
+        # every cell from stacking on supplier1's session budget.
+        out=""
+        rc=0
+        TRANSPORT_SENT=0
+        local -a sup_arr
+        # shellcheck disable=SC2206 # suppliers are newline-separated bech32 addresses, no globs
+        sup_arr=($suppliers)
+        local one sup
+        sup="${sup_arr[$((STREAM_CELL_IDX % ${#sup_arr[@]}))]}"
+        STREAM_CELL_IDX=$((STREAM_CELL_IDX + 1))
+        for _ in $(seq 1 "$STREAM_CELL_RELAYS"); do
+            if [ "$mode" = "stream" ]; then
+                one="$("$BIN" relay stream --localnet --service "$service" \
+                    --relayer-url "$relayer_url" --supplier "$sup" --batches 3 2>&1)" || rc=$?
+            else
+                one="$("$BIN" relay cometbft --localnet --service "$service" \
+                    --relayer-url "$relayer_url" --supplier "$sup" 2>&1)" || rc=$?
+            fi
+            out="${out}${one}"$'\n'
+            [ "$rc" -ne 0 ] && break
+            TRANSPORT_SENT=$((TRANSPORT_SENT + 1))
+        done
+        ;;
+    esac
+    TRANSPORT_OUT="$out"
+    return "$rc"
+}
+
+# transport_expected_count MODE -- how many relays the cell ASKED for. The gate
+# compares this against what came back: a relay that never got served is a loss
+# too, just one that happens before the claim path this gate measures, and
+# scoring the run against what succeeded would hide it by construction.
+transport_expected_count() {
+    case "$1" in
+    jsonrpc | websocket | grpc) printf '%s' "$RELAYS_PER_TRANSPORT" ;;
+    stream | cometbft) printf '%s' "$STREAM_CELL_RELAYS" ;;
+    esac
+}
+
+transport_success_count() {
+    local mode="$1" out="$2"
+    case "$mode" in
+    jsonrpc | websocket | grpc)
+        printf '%s\n' "$out" | awk -F': *' '/^Successful:/ {print $2; exit}'
+        ;;
+    stream | cometbft)
+        # Counted by the runner: one successful invocation = one billed relay.
+        printf '%s' "${TRANSPORT_SENT:-0}"
+        ;;
+    esac
+}
+
+# mode:service pairs. Override with MATRIX="jsonrpc:develop-http ..." to narrow.
+matrix_overridden="${MATRIX+1}"
+MATRIX="${MATRIX:-jsonrpc:develop-http jsonrpc:develop-http-eager websocket:develop-websocket websocket:develop-websocket-optimistic grpc:develop-grpc grpc:develop-grpc-optimistic stream:develop-stream stream:develop-stream-optimistic cometbft:develop-cometbft cometbft:develop-cometbft-optimistic}"
+RELAYS_PER_TRANSPORT="${RELAYS_PER_TRANSPORT:-60}"
+# stream/cometbft send one relay per invocation, three per cell.
+STREAM_CELL_RELAYS=3
+# Probes fired by the multi-backend distribution assert. They are REAL
+# signed relays and are billed, so the number appears in two assertions.
+BACKEND_PROBE_RELAYS=12
+STREAM_CELL_IDX=0
+
+# --service narrows the run to every cell of one service. Narrowing is
+# deliberate, so it also skips the completeness cross-check below.
+if [ -n "$SERVICE_FILTER" ]; then
+    narrowed=""
+    for pair in $MATRIX; do
+        case "${pair#*:}" in
+        "$SERVICE_FILTER") narrowed="${narrowed} ${pair}" ;;
+        esac
+    done
+    if [ -z "$narrowed" ]; then
+        printf 'no matrix cell matches --service %s\n' "$SERVICE_FILTER" >&2
+        exit 2
+    fi
+    MATRIX="${narrowed# }"
+    matrix_overridden=1
+fi
+
+# The default MATRIX must cover every staked develop-* service, and nothing
+# ties the hand-written list to what the Tiltfile actually stakes -- a cell
+# added to the mode matrix (or a renamed service) would simply never be loaded
+# or asserted, and the gate would stay green while a whole transport x mode
+# cell went unvalidated. Cross-check against the relayer's rendered config,
+# which lists exactly the services the localnet serves. A deliberate MATRIX
+# override skips this (narrowing is the override's purpose).
+if [ -z "$matrix_overridden" ]; then
+    staked_services="$(kubectl get configmap relayer-config -o jsonpath='{.data.config\.yaml}' 2>/dev/null |
+        python3 -c 'import sys,yaml; c=yaml.safe_load(sys.stdin) or {}; print("\n".join(sorted((c.get("services") or {}).keys())))' 2>/dev/null || true)"
+    if [ -z "$staked_services" ]; then
+        gate_fail "could not read the staked services from configmap relayer-config -- cannot prove the matrix is complete"
+    else
+        for svc in $staked_services; do
+            case "$svc" in
+            develop-*)
+                case " $MATRIX " in
+                *":${svc} "*) ;;
+                *) gate_fail "staked service ${svc} is missing from the gate MATRIX -- its transport x mode cell is unvalidated" ;;
+                esac
+                ;;
+            esac
+        done
+        for pair in $MATRIX; do
+            svc="${pair#*:}"
+            if ! printf '%s\n' "$staked_services" | grep -qx "$svc"; then
+                gate_fail "MATRIX cell ${pair} names a service that is not staked -- stale matrix entry"
+            fi
+        done
+        [ "$gate_failed" -eq 0 ] && gate_pass "MATRIX covers all $(printf '%s\n' "$staked_services" | grep -c 'develop-') staked develop-* services"
+    fi
+    [ "$gate_failed" -ne 0 ] && gate_verdict "live"
+fi
+
+# A single-relay-per-supplier claim can vanish between the WAL and the claim:
+# the supplier's entire 1-relay session goes unclaimed, with no drop counter and
+# no failure state. Reproduced at 1 relay/supplier regardless of session timing;
+# never observed at >=4 relays/supplier (300/300 billed). So when the load is
+# thin enough to reach that regime, say so -- an exact served==billed assertion
+# would then be measuring the thin-load behaviour rather than the change under
+# test.
+if [ "$RELAYS_PER_TRANSPORT" -lt $(( supplier_count * 2 )) ]; then
+    gate_skip "RELAYS_PER_TRANSPORT=${RELAYS_PER_TRANSPORT} gives <2 relays per supplier (${supplier_count} suppliers): too thin to assert exact billing, a 1-relay supplier-session can go unclaimed"
+fi
+# stream/cometbft cells ignore RELAYS_PER_TRANSPORT: each sends 3 sequential
+# relays pinned to ONE (per-cell rotated) supplier, so a session boundary can
+# split them 2+1 and leave a 1-relay supplier-session -- the unclaimed-session
+# regime the warning above cannot see for these transports.
+case " $MATRIX " in
+*" stream:"* | *" cometbft:"*)
+    gate_skip "stream/cometbft cells send 3 relays on one supplier: a session-boundary split can leave a 1-relay supplier-session, which is not asserted exactly"
+    ;;
+esac
+
+# Height at which THIS run's load begins: settlement events are later filtered
+# to sessions ending at or after it, so claims from earlier traffic on a shared
+# localnet (previous runs, bursts) cannot satisfy this run's expectations.
+# A failed fetch must be a hard stop: an empty value would degrade the filter
+# to ">= 0" and let ANY earlier session satisfy the exact-billing assertion.
+# GRANULARITY: the filter is per SESSION. Traffic sent earlier within the
+# session that is still open when this run starts (or one that closes right
+# at the boundary) shares its session_end with this run's relays and is
+# counted -- the billed>sent failure then reads "foreign traffic", which is
+# accurate. Leave at least one full session (20 blocks: ~10 min at the 30s
+# default of localnet.block_time_seconds) between a previous load and a gate run.
+load_start_height="$(curl -fsS --max-time 5 "${VALIDATOR_RPC}/status" 2>/dev/null |
+    jq -r '.result.sync_info.latest_block_height // empty')"
+if [ -z "$load_start_height" ]; then
+    gate_fail "could not read the chain height before loading -- the per-run settlement filter would be void"
+    gate_verdict "live"
+fi
+
+# Per-service expectation ledger: "mode service sent exact" per line. `exact`
+# marks transports whose accounting model is pinned (one request signs one
+# fresh relay, so served == billed). stream and cometbft are asserted as >=1
+# proven and REPORTED, to pin their model empirically before demanding it.
+matrix_ledger="${BIN_DIR}/matrix.tsv"
+: >"$matrix_ledger"
+
+# announced_drops SERVICE -- relays the miner explicitly refused for this
+# service because their claim window had already closed: such a relay can no
+# longer reach a claim, and the miner said so. That is an expected outcome, not
+# a loss to hunt.
+#
+# A relay dropped because its tree was already sealed is NOT announced. The
+# relayer stops accepting a session when its grace period ends, the claim window
+# opens after that, and the miner seals the tree only once what was delivered
+# live is processed or its height cap is reached. In a healthy run no relay is
+# dropped as sealed; one that is was served and will never be billed, so it
+# must stay unexplained.
+#
+# It reads a COUNTER, which accumulates across runs, so every call is a delta
+# against the snapshot taken before the load. Prints 0 when Prometheus cannot be
+# reached, on purpose: the shortfall then stays unexplained and the assertion
+# fails, because a scrape failure must never excuse a real loss.
+#
+# The regex is anchored, so it does NOT match claim_window_closed_redelivered:
+# a REDELIVERED copy dropped late was delivered before, to a consumer that did
+# not finish it, so it cannot explain a missing relay (L3 of df5441c,
+# 2026-09-11: a relay lost in a handoff read as accounted).
+announced_drop_reasons='claim_window_closed'
+
+announced_drops_now() {
+    curl -fsS --max-time 5 --get "${PROMETHEUS_URL}/api/v1/query" \
+        --data-urlencode "query=sum by (service_id) (ha_miner_relays_rejected_total{reason=~\"${announced_drop_reasons}\"})" 2>/dev/null |
+        jq -r '.data.result[]? | "\(.metric.service_id)\t\(.value[1])"' 2>/dev/null || true
+}
+
+drops_before="${BIN_DIR}/announced_drops_before.tsv"
+announced_drops_now >"$drops_before" || : >"$drops_before"
+
+# The relayer's mining-difficulty check FAILS OPEN: when the target hash cannot
+# be resolved the relay is mined as applicable anyway, and
+# relayer/relay_processor.go:177 says so in as many words -- "the counter is the
+# only signal that difficulty is unresolvable". Nothing read that counter until
+# this gate did, which meant a run with the difficulty filter completely broken
+# was INDISTINGUISHABLE from a healthy one: every relay applicable, sent ==
+# num_relays, green. The gate was asserting the filter's outcome while never
+# checking the filter ran.
+#
+# Read as a delta over this run, like the drops above, because it is a counter.
+difficulty_failures_now() {
+    curl -fsS --max-time 5 --get "${PROMETHEUS_URL}/api/v1/query" \
+        --data-urlencode "query=sum by (service_id) (ha_relayer_difficulty_query_failures_total)" 2>/dev/null |
+        jq -r '.data.result[]? | "\(.metric.service_id)\t\(.value[1])"' 2>/dev/null || true
+}
+
+# Relays the filter DECLINED to mine. At base difficulty every relay is
+# applicable, so this is 0 and its value is as a tripwire: a non-zero count here
+# on a base-difficulty localnet means the effective target hash is not base, and
+# then the per-service `sent == num_relays` assertion below is comparing across
+# a filter and would fail for a reason that is not a loss.
+skipped_difficulty_now() {
+    curl -fsS --max-time 5 --get "${PROMETHEUS_URL}/api/v1/query" \
+        --data-urlencode "query=sum by (service_id) (ha_relayer_relays_skipped_difficulty_total)" 2>/dev/null |
+        jq -r '.data.result[]? | "\(.metric.service_id)\t\(.value[1])"' 2>/dev/null || true
+}
+
+# WHY THE REJECTION REASON IS READ FROM THE METRIC AND NOT FROM THE LOG: a relay
+# rejection is a per-request condition, so the logging policy puts it at Debug and
+# the alertable signal is the metric with its bounded `reason` label. A relayer
+# running at Info therefore fails a load with NOTHING in the log to say why.
+# Measured 2026-09-19: develop-cometbft went red on one rejection, the log had no
+# line for it, and the reason (`meter_error`) only surfaced by querying Prometheus
+# by hand afterwards. Whatever a red asserts, the gate must carry its own evidence.
+rejections_for_service() {
+    curl -fsS --max-time 5 --get "${PROMETHEUS_URL}/api/v1/query" \
+        --data-urlencode "query=sum by (reason) (ha_relayer_relays_rejected_total{service_id=\"$1\"})" 2>/dev/null |
+        jq -r '.data.result[]? | "\(.metric.reason)=\(.value[1])"' 2>/dev/null | paste -sd' ' - || true
+}
+
+# UNORDERED-NONCE COLLISIONS. A cosmos-sdk unordered tx is keyed by
+# (timeout.UnixNano, sender); the anchor is the chain's latest_block_time and
+# does not move inside a block, so several txs for one supplier in one block
+# used to carry the same nonce and all but one were rejected. Measured live
+# 2026-09-03: three sessions in claim_tx_error, one EXPIRED claim, one slashing
+# event.
+#
+# The gate already fails on claim_tx_error, but that is the SYMPTOM: it says a
+# session failed, not why, and it fires just as readily for a dozen unrelated
+# causes. This reads the cause.
+#
+# It reads the METRIC and not the log on purpose. The log line is a Warn on a
+# per-request path, which this repo's logging policy may legitimately demote to
+# Debug -- a grep would then pass in silence. And matching the RawLog text would
+# be the substring classification the tx layer is being rewritten to remove.
+#
+# codespace+code, not text: code 18 in codespace "sdk" is ErrInvalidRequest,
+# which for OUR transactions means a reused unordered nonce or "ttl exceeds
+# 10m0s" -- both our own defect, so the pair is the right granularity here. A
+# deadline already passed is NOT in this bucket: it is rejected seven decorators
+# earlier, under code 30 when the timeout HEIGHT passed and code 42 when the
+# timeout TIMESTAMP did. See tx/metrics.go for why, and for the version caveat.
+#
+# NEITHER OF THOSE TWO IS COUNTED BY ANY CHECK IN THIS FILE. The 30 in
+# particular only became reachable once the client started setting a timeout
+# height, and it means a claim or proof window closed before the node saw the
+# transaction -- lost work, which is precisely what a live gate ought to see.
+# Extending this check is a decision of its own and is recorded in the queue;
+# it is named here so the absence is not read as coverage.
+#
+# THE FAMILY IS ha_tx_*, NOT ha_miner_*. The tx package registers with
+# namespace "ha" and subsystem "tx", and MinerFactory adds no prefix of its own.
+# The first version of this check queried ha_miner_tx_*, which does not exist --
+# and a query for a series that does not exist returns ZERO, so the check read
+# "no collisions" forever and could never go red. Level 2 does not run this
+# file, so nothing caught it.
+nonce_rejections_now() {
+    curl -fsS --max-time 5 --get "${PROMETHEUS_URL}/api/v1/query" \
+        --data-urlencode 'query=sum(ha_tx_broadcast_rejections_total{codespace="sdk",code="18"})' 2>/dev/null |
+        jq -r '.data.result[0].value[1] // "0"' 2>/dev/null || echo 0
+}
+
+# POSITIVE CONTROL. Without it a run in which every supplier sent one tx per
+# block passes VACUOUSLY: the collision needs two txs from one sender against
+# one anchor, so a run that never produced two proves nothing about the fix.
+#
+# THE THRESHOLD IS 3, AND 2 WOULD BE A LIE. Measured on localnet 2026-09-04:
+# a healthy run produced exactly 2 broadcasts per supplier -- 15 claims and 15
+# proofs across 15 suppliers -- because a supplier normally sends ONE claim and
+# ONE proof, in different windows and therefore different blocks, which can
+# never share an anchor. A control set at 2 passes on that run and proves
+# nothing. The third transaction is the one that can only come from a retry, a
+# rebroadcast, or a second session-end group ready in the same block: the shapes
+# that actually collide.
+#
+# Its limit, stated rather than hidden: it still does not PROVE two txs shared a
+# block, only that the run produced a shape that can. Inducing the collision on
+# purpose belongs to the chaos matrix, not here; this control's job is to refuse
+# to call a run evidence when it was not.
+max_broadcasts_per_supplier_now() {
+    curl -fsS --max-time 5 --get "${PROMETHEUS_URL}/api/v1/query" \
+        --data-urlencode 'query=max(ha_tx_broadcasts_total)' 2>/dev/null |
+        jq -r '.data.result[0].value[1] // "0"' 2>/dev/null || echo 0
+}
+
+nonce_rejections_before="$(nonce_rejections_now)"
+broadcasts_before="$(max_broadcasts_per_supplier_now)"
+
+difficulty_failures_before="${BIN_DIR}/difficulty_failures_before.tsv"
+difficulty_failures_now >"$difficulty_failures_before" || : >"$difficulty_failures_before"
+skipped_difficulty_before="${BIN_DIR}/skipped_difficulty_before.tsv"
+skipped_difficulty_now >"$skipped_difficulty_before" || : >"$skipped_difficulty_before"
+
+# TOTAL_DELTA SNAPSHOT_FILE READER -- sums one counter family across services.
+counter_family_delta() {
+    local before_file="$1" reader="$2" total=0 svc before after
+    while IFS=$'\t' read -r svc after; do
+        [ -n "${svc:-}" ] || continue
+        before="$(awk -F'\t' -v s="$svc" '$1 == s {print int($2)}' "$before_file" | tail -1)"
+        total=$(( total + $(gate_counter_delta "${before:-0}" "$(printf '%d' "${after%%.*}" 2>/dev/null || echo 0)") ))
+    done < <("$reader")
+    printf '%s' "$total"
+}
+
+announced_drops() {
+    local svc="$1" before after
+    before="$(awk -F'\t' -v s="$svc" '$1 == s {print int($2)}' "$drops_before" | tail -1)"
+    after="$(announced_drops_now | awk -F'\t' -v s="$svc" '$1 == s {print int($2)}' | tail -1)"
+    gate_counter_delta "${before:-0}" "${after:-0}"
+}
+
+loaded_services=""
+for pair in $MATRIX; do
+    mode="${pair%%:*}"
+    service="${pair#*:}"
+
+    gate_step "load: ${mode} -> ${service} via ${relayer_url}"
+
+    if run_transport_load "$mode" "$service"; then
+        succeeded="$(transport_success_count "$mode" "$TRANSPORT_OUT")"
+        expected="$(transport_expected_count "$mode")"
+        unserved="$(gate_served_shortfall "${expected:-0}" "${succeeded:-0}")"
+        if [ "$unserved" -gt 0 ] && [ "${succeeded:-0}" -gt 0 ]; then
+            # Recorded in the ledger anyway: the settlement assert below still
+            # has something to say about the ones that DID get served, and the
+            # run is already failing.
+            gate_fail "${mode}: only ${succeeded} of ${expected} relays were served (${unserved} never made it) -- the loss is upstream of the claim path this gate measures"
+            gate_detail "$(printf '%s\n' "$TRANSPORT_OUT" | tail -15)"
+            # THE REASON LIVES IN THE METRIC, NOT THE LOG, and this branch needs it
+            # MORE than the failure branch below: here the CLI exited clean, so its
+            # output says nothing about why the relayer turned relays away. Measured
+            # 2026-09-19: 22 of 60 lost on develop-http-eager, and the cause
+            # (`meter_error`) only surfaced by querying Prometheus by hand -- which is
+            # exactly what the sibling branch had already been fixed to avoid.
+            SHORTFALL_REJECTS="$(rejections_for_service "$service")"
+            if [ -n "$SHORTFALL_REJECTS" ]; then
+                gate_detail "relayer rejections for ${service}: ${SHORTFALL_REJECTS}"
+            else
+                gate_detail "relayer rejections for ${service}: none recorded -- so the relays were lost BEFORE admission (client, network, or a path that counts nowhere)"
+            fi
+        fi
+        if [ "${succeeded:-0}" -gt 0 ]; then
+            gate_pass "${mode}: ${succeeded} relay(s)/batch(es) verified end to end"
+            loaded_services="${loaded_services} ${service}"
+            # Every transport's model is pinned to one request = one billed
+            # relay (stream/cometbft verified live 2026-08-18), so all rows
+            # get the exact served==billed assertion.
+            printf '%s\t%s\t%s\t1\n' "$mode" "$service" "$succeeded" >>"$matrix_ledger"
+        else
+            gate_fail "${mode}: the run exited clean but nothing was verified:"
+            gate_detail "$(printf '%s\n' "$TRANSPORT_OUT" | tail -15)"
+        fi
+    else
+        gate_fail "${mode}: the load run failed:"
+        # WHY THIS IS NOT A PLAIN `tail`: the relay CLI does not set SilenceUsage, so
+        # any RUNTIME failure prints `Error: <cause>` and then its whole flag list --
+        # and a tail of that keeps the last twenty flags and throws away the only line
+        # that says what happened. Measured 2026-09-19: a red on develop-stream
+        # reported nothing but `--ws-handshake string  websocket mode: ...`.
+        # So: if the output carries a usage block, show what came BEFORE it -- and read
+        # that text from its END, because cobra prints `Error: <cause>` IMMEDIATELY
+        # before the usage block, so the cause is its LAST line, never its first.
+        # Measured 2026-09-19 by this guard's own first version: it took the HEAD of the
+        # pre-usage text, the CLI's diagnostic banner is exactly 15 lines long, and the
+        # Error line sat on line 16 -- the same failure as the plain tail, mirrored.
+        if printf '%s\n' "$TRANSPORT_OUT" | grep -q '^Usage:'; then
+            PRE_USAGE="$(printf '%s\n' "$TRANSPORT_OUT" | sed -n '1,/^Usage:/p' | sed '$d')"
+            # ANCHOR ON CONTENT, NEVER ON A LINE COUNT. A fixed head/tail has now eaten
+            # the wrong thing three times: a `tail` ate the NAME of the failing check
+            # (it sat in the middle), then a `head -15` ate the cause (cobra prints
+            # `Error:` last, pressed against Usage, and the CLI banner is exactly 15
+            # lines). The count is never the fix for the count -- the error line is
+            # found by what it SAYS, and the surrounding lines are context, not source.
+            ERR_LINE="$(printf '%s\n' "$PRE_USAGE" | grep -m1 '^Error:' || true)"
+            if [ -n "$ERR_LINE" ]; then
+                gate_detail "$ERR_LINE"
+                gate_detail "$(printf '%s\n' "$PRE_USAGE" | grep -v '^Error:' | tail -12)"
+            else
+                gate_detail "$(printf '%s\n' "$PRE_USAGE" | tail -15)"
+                gate_detail "(no 'Error:' line before the usage block -- showed its tail instead)"
+            fi
+            gate_detail "(the CLI's flag list was cut: it prints usage on runtime errors too)"
+        else
+            gate_detail "$(printf '%s\n' "$TRANSPORT_OUT" | tail -15)"
+        fi
+        TRANSPORT_REJECTS="$(rejections_for_service "$service")"
+        if [ -n "$TRANSPORT_REJECTS" ]; then
+            gate_detail "relayer rejections for ${service}: ${TRANSPORT_REJECTS}"
+        else
+            gate_detail "relayer rejections for ${service}: none recorded -- so the failure is NOT an admission rejection (it says nothing about which of the other paths it is)"
+        fi
+    fi
+done
+
+if [ -z "$loaded_services" ]; then
+    gate_fail "no transport delivered a single relay"
+    gate_verdict "live"
+fi
+
+# ---------------------------------------------------------------------------
+# Multi-backend distribution (absorbed from the retired test-round-robin.sh,
+# which measured this through the gateway and could not tell a relayer 503 from a
+# served relay). The demo backend stamps backend_id into eth_blockNumber
+# responses; when the rendered config gives develop-http more than one
+# jsonrpc backend, a handful of signed single relays must land on more than
+# one of them, or the pool is not distributing.
+case " $MATRIX " in
+*" jsonrpc:develop-http "*)
+    # Capture the configmap FIRST: piping kubectl straight into python under
+    # pipefail makes a kubectl failure emit "0" twice (python prints 0 for
+    # empty stdin AND the || fallback fires on the pipeline status), and the
+    # doubled value blows up the -gt test, skipping this block silently.
+    rendered_relayer_config="$(kubectl get configmap relayer-config -o jsonpath='{.data.config\.yaml}' 2>/dev/null || true)"
+    if [ -z "$rendered_relayer_config" ]; then
+        gate_skip "could not read relayer-config for the distribution assert"
+        backend_count=0
+        lb_mode=""
+    else
+        backend_count="$(printf '%s' "$rendered_relayer_config" |
+            python3 -c 'import sys,yaml; c=yaml.safe_load(sys.stdin) or {}; b=(((c.get("services") or {}).get("develop-http") or {}).get("backends") or {}).get("jsonrpc") or {}; print(len(b.get("urls") or []))' 2>/dev/null || echo 0)"
+        lb_mode="$(printf '%s' "$rendered_relayer_config" |
+            python3 -c 'import sys,yaml; c=yaml.safe_load(sys.stdin) or {}; b=(((c.get("services") or {}).get("develop-http") or {}).get("backends") or {}).get("jsonrpc") or {}; print(b.get("load_balancing") or "round_robin")' 2>/dev/null || echo "")"
+    fi
+    # Only round_robin promises to SPREAD load; first_healthy with multiple
+    # urls is legitimate failover-only config where all relays landing on one
+    # backend is the correct behavior, not a distribution bug.
+    if [ "${backend_count:-0}" -gt 1 ] && [ "$lb_mode" != "round_robin" ]; then
+        gate_skip "develop-http has ${backend_count} backends but load_balancing=${lb_mode:-unknown}; distribution assert only applies to round_robin"
+    fi
+    if [ "${backend_count:-0}" -gt 1 ] && [ "$lb_mode" = "round_robin" ]; then
+        gate_step "assert: multi-backend distribution on develop-http (${backend_count} backends)"
+        seen_backends=""
+        rr_served=0
+        for _ in $(seq 1 "$BACKEND_PROBE_RELAYS"); do
+            rr_out="$("$BIN" relay jsonrpc --localnet --service develop-http \
+                --relayer-url "$relayer_url" 2>/dev/null)" && rr_served=$((rr_served + 1))
+            bid="$(printf '%s' "$rr_out" | grep -o '"backend_id":"[^"]*"' | head -1 | cut -d'"' -f4)"
+            [ -n "$bid" ] && case " $seen_backends " in
+            *" $bid "*) ;;
+            *) seen_backends="${seen_backends} ${bid}" ;;
+            esac
+        done
+        distinct="$(printf '%s\n' $seen_backends | grep -c . || true)"
+        probe_unserved="$(gate_served_shortfall "$BACKEND_PROBE_RELAYS" "${rr_served:-0}")"
+        if [ "$probe_unserved" -gt 0 ]; then
+            gate_fail "backend probe: only ${rr_served} of ${BACKEND_PROBE_RELAYS} relays were served"
+        fi
+        if [ "${distinct:-0}" -ge 2 ]; then
+            gate_pass "load spread across ${distinct} backends:${seen_backends}"
+        else
+            gate_fail "${BACKEND_PROBE_RELAYS} relays all landed on one backend (${seen_backends:-none}) with ${backend_count} configured -- pool not distributing"
+        fi
+        # These probes are REAL signed relays: they mine and bill in the same
+        # sessions the exact served==billed assertion counts. Add them to the
+        # ledger's develop-http row or the cell fails with billed>sent by
+        # exactly the probe count.
+        if [ "$rr_served" -gt 0 ]; then
+            awk -F'\t' -v OFS='\t' -v add="$rr_served" \
+                '$2 == "develop-http" { $3 += add } { print }' \
+                "$matrix_ledger" >"${matrix_ledger}.tmp" && mv "${matrix_ledger}.tmp" "$matrix_ledger"
+        fi
+    fi
+    ;;
+esac
+
+# ---------------------------------------------------------------------------
+gate_step "assert: the mining-difficulty filter actually ran"
+
+# This runs BEFORE the settlement wait on purpose: if the filter was down, the
+# per-service assertions below are comparing numbers the filter never touched,
+# and there is no reason to spend 25 minutes discovering that.
+#
+# "Zero failures" and "could not measure" MUST NOT produce the same signal.
+# Every query here returns empty when Prometheus is unreachable, and empty sums
+# to 0 -- which would read as a clean run. So liveness is asserted first, with a
+# counter that MUST have series after the load, and the outcome when it does not
+# is gate_nothing_measured, never a pass.
+#
+# relays_published_total is the liveness proxy because it is the one counter
+# that MUST have series after any successful load. The two difficulty counters
+# cannot serve as their own liveness check: they are per-service_id counters
+# that legitimately have NO series when nothing failed and nothing was skipped,
+# so "absent because all is well" and "absent because the metric was renamed"
+# are indistinguishable from the query alone.
+#
+# NOT COVERED, and said plainly rather than papered over: if either counter is
+# RENAMED, both queries go empty, both deltas sum to 0, and this block prints
+# two green lines while checking nothing. Verified 2026-08-30 -- no test in this
+# repository reads this file, so nothing ties the names below to the code that
+# declares them (internal/conventions/metrics_test.go freezes session_id labels
+# and counts references; it does not know this gate exists).
+prom_series_count() {
+    curl -fsS --max-time 5 --get "${PROMETHEUS_URL}/api/v1/query" \
+        --data-urlencode "query=count(ha_relayer_relays_published_total)" 2>/dev/null |
+        jq -r '.data.result[0].value[1] // "0"' 2>/dev/null || printf '0'
+}
+published_series="$(prom_series_count)"
+
+if [ "${published_series%%.*}" -lt 1 ] 2>/dev/null || [ -z "$published_series" ]; then
+    gate_nothing_measured "difficulty filter: Prometheus returned no relays_published series after a load that served relays -- the filter's counters cannot be read, so this run proves nothing about it"
+else
+    difficulty_failures="$(counter_family_delta "$difficulty_failures_before" difficulty_failures_now)"
+    skipped_difficulty="$(counter_family_delta "$skipped_difficulty_before" skipped_difficulty_now)"
+
+    if [ "${difficulty_failures:-0}" -gt 0 ]; then
+        gate_fail "difficulty filter: ${difficulty_failures} relay(s) could not resolve a target hash and were mined ANYWAY (it fails open, relay_processor.go:179 and :336) -- every assertion below about served==billed passed through a filter that was not working"
+    else
+        gate_pass "difficulty filter: resolved a target hash for every relay (0 query failures)"
+    fi
+
+    if [ "${skipped_difficulty:-0}" -gt 0 ]; then
+        gate_fail "difficulty filter: ${skipped_difficulty} relay(s) were filtered out as non-applicable, so this chain is NOT at base difficulty -- the exact served==billed assertions below do not hold across a filter and this gate does not yet cover that regime"
+    else
+        gate_pass "difficulty filter: base difficulty, 0 relays filtered -- served==billed is the right assertion for this run"
+    fi
+fi
+
+# SETTLE_TIMEOUT_MIN was left empty above unless SETTLE_TIMEOUT_MIN or
+# --timeout-min was given explicitly -- either one wins outright and skips
+# this. Otherwise derive it from the same chain params and validated
+# block_time_seconds the phase-regime assert above already knows how to read
+# (gate_settle_timeout_min in lib.sh). A run with illegible params falls back
+# to the historical default and SAYS SO -- it must never end up waiting on a
+# zero-minute deadline.
+if [ -z "$SETTLE_TIMEOUT_MIN" ]; then
+    settle_params_json="$(kubectl exec deploy/validator -c validator -- pocketd query shared params -o json 2>/dev/null)"
+    settle_session_blocks="$(printf '%s' "$settle_params_json" | jq -r '.params.num_blocks_per_session | tonumber? // empty' 2>/dev/null)"
+    settle_claim_open="$(printf '%s' "$settle_params_json" | jq -r '.params.claim_window_open_offset_blocks | tonumber? // empty' 2>/dev/null)"
+    settle_claim_close="$(printf '%s' "$settle_params_json" | jq -r '.params.claim_window_close_offset_blocks | tonumber? // empty' 2>/dev/null)"
+    settle_proof_open="$(printf '%s' "$settle_params_json" | jq -r '.params.proof_window_open_offset_blocks | tonumber? // empty' 2>/dev/null)"
+    settle_proof_close="$(printf '%s' "$settle_params_json" | jq -r '.params.proof_window_close_offset_blocks | tonumber? // empty' 2>/dev/null)"
+    settle_block_time="$(kubectl get configmap miner-config -o jsonpath='{.data.config\.yaml}' 2>/dev/null |
+        python3 -c 'import sys,yaml; c=yaml.safe_load(sys.stdin) or {}; v=c.get("block_time_seconds"); print(v if v is not None else "")' 2>/dev/null || true)"
+    SETTLE_TIMEOUT_MIN="$(gate_settle_timeout_min "$settle_session_blocks" "$settle_claim_open" "$settle_claim_close" \
+        "$settle_proof_open" "$settle_proof_close" "$settle_block_time")"
+    if [ -z "$SETTLE_TIMEOUT_MIN" ]; then
+        printf 'WARNING: could not derive SETTLE_TIMEOUT_MIN from the chain shared params and block_time_seconds -- falling back to the %s-minute default (pass --timeout-min to set it explicitly)\n' \
+            "$SETTLE_TIMEOUT_MIN_DEFAULT" >&2
+        SETTLE_TIMEOUT_MIN="$SETTLE_TIMEOUT_MIN_DEFAULT"
+    fi
+fi
+
+gate_step "settle: waiting for FINAL on-chain outcomes per service (up to ${SETTLE_TIMEOUT_MIN} min)"
+
+# What counts as proof that a relay earned money is the SETTLEMENT, not the
+# inclusion of the claim: a claim can land on-chain and still expire without
+# its proof, be discarded, or get its supplier slashed. This reads the terminal
+# events the chain emits in its EndBlocker via block_results, and it does so
+# directly against the validator -- the miner exports no series for a claim's
+# settlement (expiry, slashing, discard), only for its inclusion.
+scan_settlement_events() {
+    local from="$1" to="$2"
+    local h
+    for ((h = from; h <= to; h++)); do
+        curl -fsS --max-time 10 "${VALIDATOR_RPC}/block_results?height=${h}" 2>/dev/null |
+            jq -c --arg h "$h" '
+                (.result.finalize_block_events // [])[]
+                | select(.type | startswith("pocket.tokenomics.Event"))
+                | {height: $h, type: .type,
+                   attrs: (.attributes // [] | map({(.key): .value}) | add // {})}
+            ' 2>/dev/null || true
+    done
+}
+
+supplier_filter="$(printf '%s\n' "$suppliers" | paste -sd'|' -)"
+
+deadline=$(( $(date +%s) + SETTLE_TIMEOUT_MIN * 60 ))
+events_file="${BIN_DIR}/settlement_events.jsonl"
+: >"$events_file"
+resolved=0
+
+# The billing assertion is per service: every service the matrix loaded must
+# produce at least one claim settled as PROVEN. "Overall something settled" is
+# how a dead transport hides behind a healthy one.
+# billed_relays <svc> -- proven relays settled for the service, counting only
+# sessions that ended at or after this run's load started.
+billed_relays() {
+    # A settled claim is PAID with status 0 (PENDING_VALIDATION: the protocol
+    # did not require a proof for this claim) as well as 1 (VALIDATED). Only
+    # 2 (INVALID) is a bad settlement. Verified against poktroll v0.1.35
+    # x/proof/types: the enum has exactly those three values -- there is no 3.
+    jq -rs --arg svc "$1" --argjson minend "${load_start_height:-0}" '
+        [.[] | select(.type == "pocket.tokenomics.EventClaimSettled")
+             | select((.attrs.service_id // "" | gsub("\"";"")) == $svc)
+             | select(.attrs.claim_proof_status_int // "" | tostring | test("^\"?[01]\"?$"))
+             | select((.attrs.session_end_block_height // "0" | tostring | gsub("[^0-9]";"") | tonumber) >= $minend)]
+        | [length, ([.[].attrs.num_relays // "0" | tostring | gsub("[^0-9]";"") | tonumber] | add // 0)]
+        | @tsv' "$events_file" 2>/dev/null || printf '0\t0'
+}
+
+services_pending() {
+    local missing=""
+    while IFS=$'\t' read -r mode svc sent exact; do
+        [ -z "$svc" ] && continue
+        local proven_n relays_n
+        read -r proven_n relays_n <<<"$(billed_relays "$svc")"
+        if [ "$exact" = "1" ]; then
+            # The same verdict the final assertion reads (gate_exact_cell_state).
+            [ "$(gate_exact_cell_state "${sent:-0}" "${relays_n:-0}" "$(announced_drops "$svc")")" = "short" ] &&
+                missing="${missing} ${svc}(${relays_n:-0}/${sent})"
+        else
+            [ "${proven_n:-0}" -eq 0 ] && missing="${missing} ${svc}"
+        fi
+    done <"$matrix_ledger"
+    printf '%s' "$missing"
+}
+
+while [ "$(date +%s)" -lt "$deadline" ]; do
+    height_now="$(curl -fsS --max-time 5 "${VALIDATOR_RPC}/status" 2>/dev/null |
+        jq -r '.result.sync_info.latest_block_height // empty')"
+    [ -z "$height_now" ] && { sleep "$POLL_INTERVAL_S"; continue; }
+
+    scan_settlement_events "$height_before" "$height_now" \
+        | grep -E "$supplier_filter" >"$events_file" || true
+
+    missing="$(services_pending)"
+    if [ -z "$missing" ]; then
+        resolved=1
+        break
+    fi
+
+    printf '           height %s, still waiting for proven claims on:%s\n' "$height_now" "$missing"
+    sleep "$POLL_INTERVAL_S"
+done
+
+# ---------------------------------------------------------------------------
+gate_step "assert: final settlement outcome, per service"
+
+# The exercise unit for this gate is relays BILLED on-chain, which is the only
+# number that cannot be produced by a run that did nothing: a live gate that
+# settled zero relays has not exercised the money path, whatever its per-service
+# assertions say about the services it found. all.sh turns a zero into NOT RUN.
+billed_total=0
+
+while IFS=$'\t' read -r mode svc sent exact; do
+    [ -z "$svc" ] && continue
+    read -r proven_n relays_n <<<"$(billed_relays "$svc")"
+    billed_total=$((billed_total + ${relays_n:-0}))
+
+    if [ "$exact" = "1" ]; then
+        # The accounting model for this transport is one request = one billed
+        # relay (fresh ring signature per request, so no dedup collapse).
+        # Anything less than equality is silent partial loss: relays served to
+        # clients that never reached a claim.
+        # A shortfall is only acceptable to the extent the miner ANNOUNCED it. A
+        # relay that arrives after its tree was sealed, or after its claim
+        # window closed, cannot be paid and there is nothing to recover -- but
+        # it must have been counted. Anything the counters do not account for is
+        # the silent loss this gate exists to catch, and still fails. The
+        # verdict is the one the settlement wait used (gate_exact_cell_state).
+        dropped="$(announced_drops "$svc")"
+        case "$(gate_exact_cell_state "${sent:-0}" "${relays_n:-0}" "${dropped:-0}")" in
+        settled)
+            gate_pass "${svc} (${mode}): ${sent}/${sent} relays billed across ${proven_n} proven claim(s)"
+            ;;
+        over)
+            gate_fail "${svc} (${mode}): billed MORE than sent (${relays_n}/${sent}) -- foreign traffic or double count"
+            ;;
+        accounted)
+            gate_pass "${svc} (${mode}): ${relays_n}/${sent} relays billed across ${proven_n} proven claim(s)"
+            printf '         + %s dropped, announced as %s (accounted)\n' \
+                "$dropped" "$(printf '%s' "$announced_drop_reasons" | tr '|' '/')"
+            ;;
+        *)
+            unexplained="$(gate_unexplained_shortfall "$sent" "${relays_n:-0}" "${dropped:-0}")"
+            gate_fail "${svc} (${mode}): served ${sent}, billed ${relays_n:-0}, announced drops ${dropped:-0} -- ${unexplained} relay(s) LOST with no counter"
+            printf '         check the WAL (redis streams) and submissions for this service\n'
+            ;;
+        esac
+    else
+        if [ "${proven_n:-0}" -gt 0 ] && [ "${relays_n:-0}" -gt 0 ]; then
+            gate_pass "${svc} (${mode}): ${proven_n} claim(s) PROVEN, sent=${sent} billed=${relays_n} (model unpinned: reported, not asserted)"
+        else
+            gate_fail "${svc} (${mode}): served relays but NONE were billed (proven=${proven_n:-0})"
+        fi
+    fi
+done <"$matrix_ledger"
+
+gate_exercised coverage billed_relays "$billed_total"
+
+# Terminal-event assertions are scoped to THIS run's sessions, the same
+# session_end_block_height >= load_start_height filter the billed counter
+# uses (every one of these event types carries the field -- verified against
+# poktroll x/tokenomics event.pb.go). Without it, a claim from an EARLIER
+# run expiring while this gate polls fails THIS run: proof windows close 32
+# blocks (~16 min at the 30s default) after their session ends, well inside
+# our scan window, and the
+# supplier filter alone matches all localnet traffic. A missing attribute
+# counts as in-window: for a gate, a false red beats a silent pass.
+count_terminal_events() {
+    jq -rs --arg type "$1" --argjson minend "${load_start_height:-0}" '
+        [.[] | select(.type == $type)
+             | select((.attrs.session_end_block_height == null)
+                 or ((.attrs.session_end_block_height | tostring | gsub("[^0-9]";"") | if . == "" then "0" else . end | tonumber) >= $minend))]
+        | length' "$events_file" 2>/dev/null || echo 0
+}
+
+expired="$(count_terminal_events 'pocket.tokenomics.EventClaimExpired')"
+slashed="$(count_terminal_events 'pocket.tokenomics.EventSupplierSlashed')"
+discarded="$(count_terminal_events 'pocket.tokenomics.EventClaimDiscarded')"
+settled_invalid="$(jq -rs --argjson minend "${load_start_height:-0}" '
+    [.[] | select(.type == "pocket.tokenomics.EventClaimSettled")
+         | select(.attrs.claim_proof_status_int // "" | tostring | test("^\"?2\"?$"))
+         | select((.attrs.session_end_block_height == null)
+             or ((.attrs.session_end_block_height | tostring | gsub("[^0-9]";"") | if . == "" then "0" else . end | tonumber) >= $minend))]
+    | length' "$events_file" 2>/dev/null || echo 0)"
+
+total_expired=$(( ${settled_invalid:-0} + ${expired:-0} ))
+if [ "$total_expired" -eq 0 ]; then
+    gate_pass "no claim expired"
+else
+    gate_fail "${total_expired} claim(s) EXPIRED -- relays served and never paid"
+    jq -rs '.[] | select(.type == "pocket.tokenomics.EventClaimExpired")
+            | "           service=\(.attrs.service_id // "?") reason=\(.attrs.expiration_reason // "?") relays=\(.attrs.num_relays // "?")"' \
+        "$events_file" 2>/dev/null | head -10
+fi
+
+if [ "${slashed:-0}" -eq 0 ]; then
+    gate_pass "no supplier slashed"
+else
+    gate_fail "${slashed} SLASHING event(s) -- staked funds burned"
+fi
+[ "${discarded:-0}" -ne 0 ] && gate_fail "${discarded} claim(s) discarded without settling"
+
+# The miner's own terminal failure states, as corroboration: they should agree
+# with the chain, and a disagreement is itself the finding. One --json listing
+# per supplier, states counted with jq -- the previous form grepped for lines
+# starting with "session", which the CLI's table output never produces (rows
+# start with the bare hex session ID), so the check could never fire.
+fail_states_file="${BIN_DIR}/miner_session_states.txt"
+: >"$fail_states_file"
+for supplier in $suppliers; do
+    "$BIN" redis sessions --supplier "$supplier" --json 2>/dev/null |
+        jq -r '(if type == "array" then . else [] end)[] | .state // empty' 2>/dev/null
+done >>"$fail_states_file"
+# The unordered-nonce cause, read as a delta over this run.
+nonce_rejections_after="$(nonce_rejections_now)"
+broadcasts_after="$(max_broadcasts_per_supplier_now)"
+nonce_delta="$(awk -v a="$nonce_rejections_after" -v b="$nonce_rejections_before" 'BEGIN{printf "%d", a-b}')"
+broadcast_delta="$(awk -v a="$broadcasts_after" -v b="$broadcasts_before" 'BEGIN{printf "%d", a-b}')"
+
+if [ "$broadcast_delta" -lt 3 ]; then
+    gate_nothing_measured "busiest supplier broadcast ${broadcast_delta} transactions -- a plain claim+proof pair cannot share an anchor, so the nonce check was NOT exercised"
+elif [ "$nonce_delta" -gt 0 ]; then
+    gate_fail "${nonce_delta} transaction(s) rejected with sdk/code=18 -- a reused unordered nonce, or a ttl exceeding 10m: the only two our transactions can produce (an expired deadline is code 42, rejected earlier in the ante chain)"
+else
+    gate_pass "no sdk/code=18 rejections; busiest supplier broadcast ${broadcast_delta} transactions this run"
+fi
+
+# --- The transaction DEADLINE, and who decided it ----------------------------
+#
+# WHY THIS BLOCK EXISTS. Four commits changed how a claim/proof transaction
+# reaches the chain -- it now carries a timeout_height, that height is derived
+# from the window instead of configured, a node that already holds the tx is not
+# a failed resend, and a missing claim is re-sent on every block its window
+# allows. Measured 2026-09-09: this gate observed NONE of them. The three
+# metrics they emit had ZERO readers here, and code=30 and code=19 were unread
+# because the only rejection query filters code="18". A run would have gone
+# green without touching a line of it.
+#
+# READ THREE STATES, NEVER ONE. Every other Prometheus read in this file ends in
+# `// "0"` with a `|| echo 0` behind it, so ABSENT, GENUINELY-ZERO, BAD-JSON and
+# PROMETHEUS-DOWN all arrive as the same 0. Those three sites are each protected
+# by a positive control downstream (the >=3 broadcast floor, and the
+# published-series guard), so they are not defects today -- but this block adds
+# assertions whose healthy value IS zero, and a zero that cannot be told from a
+# dead instrument is exactly the false green the nonce check documents above.
+prom_scalar() {
+    # <query> -> the value, or ABSENT (no series), or UNREADABLE (no answer).
+    local q="$1" body rows
+    body="$(curl -fsS --max-time 5 --get "${PROMETHEUS_URL}/api/v1/query" \
+        --data-urlencode "query=$q" 2>/dev/null)" || { printf 'UNREADABLE'; return 0; }
+    printf '%s' "$body" | jq -e '.status == "success"' >/dev/null 2>&1 ||
+        { printf 'UNREADABLE'; return 0; }
+    rows="$(printf '%s' "$body" | jq -r '.data.result | length' 2>/dev/null)" ||
+        { printf 'UNREADABLE'; return 0; }
+    [ "${rows:-0}" -eq 0 ] 2>/dev/null && { printf 'ABSENT'; return 0; }
+    printf '%s' "$body" | jq -r '.data.result[0].value[1] // "UNREADABLE"' 2>/dev/null ||
+        printf 'UNREADABLE'
+}
+
+# assert_timeout_regime_per_phase asserts that each phase's broadcasts follow
+# ITS OWN derived regime, not a single expectation shared across phases. A
+# gate's own assertion is exercised the same way any other test is: pulled out
+# as its own function, not inlined, so a harness can extract it with sed and
+# run it against fabricated inputs -- never copied, since a copy drifts from
+# the original and the harness would then prove something that no longer
+# exists.
+#
+# Claim and proof measure DIFFERENT windows -- the widths lifecycle_callback.go
+# feeds to tx.WindowTimeout for each phase, one derived through
+# GetClaimWindowOpenHeight/GetClaimWindowCloseHeight and their proof-window
+# counterparts in poktroll's x/shared/types (exact offsets and the module
+# version this was checked against are in the commit, not repeated here where
+# they would rot the moment either side moves).
+#
+# The regime is counted where a transaction is SIGNED (tx), labeled by its type,
+# so a resend that signs is checked under its own phase -- it inherits the
+# original's budget from the rebroadcast entry -- and a re-injection of bytes
+# already signed counts nothing. There is no equality with broadcasts: those
+# count accepted sends, fresh or re-injected, and a signed transaction may be
+# refused, so the two differ legitimately (measured 2026-09-23: 1384 regimes,
+# 1304 broadcasts, the gap being 80 re-injections answered "already in the
+# mempool"). A path that signs without deriving a deadline is what this gate
+# exists to catch, and it shows as regime=unknown.
+assert_timeout_regime_per_phase() {
+    local regime_total="$1" broadcasts_total="$2" regime_unknown="$3"
+    local claim_ceiling="$4" claim_window="$5" proof_ceiling="$6" proof_window="$7"
+    local claim_window_blocks="$8" proof_window_blocks="$9" block_time_seconds="${10}"
+    local window_source_desc="${11}"
+
+    if [ "$regime_total" = "UNREADABLE" ] || [ "$broadcasts_total" = "UNREADABLE" ]; then
+        gate_nothing_measured "Prometheus did not answer for the timeout-regime or broadcast families -- the deadline rule cannot be read, so this run proves nothing about it"
+    elif [ "$regime_total" = "ABSENT" ] || [ "$broadcasts_total" = "ABSENT" ]; then
+        gate_nothing_measured "no ha_tx_timeout_regime_total / ha_tx_broadcasts_total series exist after a run that settled claims -- either nothing was broadcast or the counter is not wired; NOT evidence that the deadline rule ran"
+    elif [ "${regime_total%%.*}" -le 0 ] 2>/dev/null; then
+        gate_fail "0 signed transactions after a run that served relays -- those relays can only be paid through signed claims, so the deadline counter is not counting them"
+    elif [ -z "$claim_window_blocks" ] || [ -z "$proof_window_blocks" ] || [ -z "$block_time_seconds" ]; then
+        gate_nothing_measured "could not read the claim/proof window width from ${window_source_desc} or block_time_seconds from configmap miner-config -- the expected timeout regime cannot be derived, so this run's regime counts prove nothing about the deadline rule"
+    elif [ "$regime_unknown" != "ABSENT" ] && [ "${regime_unknown%%.*}" -gt 0 ] 2>/dev/null; then
+        gate_fail "${regime_unknown} transaction(s) fell to regime=unknown -- the window could not be derived, so the deadline came from the SDK ceiling instead of the claim/proof window"
+    else
+        local expected_claim expected_proof bad=""
+        expected_claim="$(gate_expected_timeout_regime "$claim_window_blocks" "$block_time_seconds")"
+        expected_proof="$(gate_expected_timeout_regime "$proof_window_blocks" "$block_time_seconds")"
+
+        if [ "$expected_claim" != "window" ] && [ "$expected_claim" != "ceiling" ]; then
+            gate_nothing_measured "could not derive the expected regime for the claim window (got: ${expected_claim}) -- the values reaching gate_expected_timeout_regime were not usable, so this run proves nothing about the deadline rule"
+            return
+        fi
+        if [ "$expected_proof" != "window" ] && [ "$expected_proof" != "ceiling" ]; then
+            gate_nothing_measured "could not derive the expected regime for the proof window (got: ${expected_proof}) -- the values reaching gate_expected_timeout_regime were not usable, so this run proves nothing about the deadline rule"
+            return
+        fi
+
+        if [ "$expected_claim" = "window" ] && [ "$claim_ceiling" != "ABSENT" ] && [ "${claim_ceiling%%.*}" -gt 0 ] 2>/dev/null; then
+            bad="${bad}claim/ceiling=${claim_ceiling} (expected window, ${claim_window_blocks} blocks x ${block_time_seconds}s); "
+        fi
+        if [ "$expected_claim" = "ceiling" ] && [ "$claim_window" != "ABSENT" ] && [ "${claim_window%%.*}" -gt 0 ] 2>/dev/null; then
+            bad="${bad}claim/window=${claim_window} (expected ceiling, ${claim_window_blocks} blocks x ${block_time_seconds}s); "
+        fi
+        if [ "$expected_proof" = "window" ] && [ "$proof_ceiling" != "ABSENT" ] && [ "${proof_ceiling%%.*}" -gt 0 ] 2>/dev/null; then
+            bad="${bad}proof/ceiling=${proof_ceiling} (expected window, ${proof_window_blocks} blocks x ${block_time_seconds}s); "
+        fi
+        if [ "$expected_proof" = "ceiling" ] && [ "$proof_window" != "ABSENT" ] && [ "${proof_window%%.*}" -gt 0 ] 2>/dev/null; then
+            bad="${bad}proof/window=${proof_window} (expected ceiling, ${proof_window_blocks} blocks x ${block_time_seconds}s); "
+        fi
+
+        if [ -n "$bad" ]; then
+            gate_fail "regime mismatch by phase: ${bad}-- unknown=0 held, but a phase's broadcasts did not follow its own derived regime"
+        else
+            gate_pass "all ${regime_total} signed transaction(s) took their deadline from the expected regime per phase (unknown=0, claim ${claim_window_blocks}x${block_time_seconds}s->${expected_claim}, proof ${proof_window_blocks}x${block_time_seconds}s->${expected_proof})"
+            gate_exercised coverage timeout_regime "${regime_total%%.*}"
+        fi
+    fi
+}
+
+gate_step "assert: every transaction got a deadline, and the window rule set it, per phase"
+
+regime_total="$(prom_scalar 'sum(ha_tx_timeout_regime_total)')"
+broadcasts_total="$(prom_scalar 'sum(ha_tx_broadcasts_total)')"
+regime_unknown="$(prom_scalar 'sum(ha_tx_timeout_regime_total{regime="unknown"})')"
+claim_ceiling="$(prom_scalar 'sum(ha_tx_timeout_regime_total{phase="claim",regime="ceiling"})')"
+claim_window="$(prom_scalar 'sum(ha_tx_timeout_regime_total{phase="claim",regime="window"})')"
+proof_ceiling="$(prom_scalar 'sum(ha_tx_timeout_regime_total{phase="proof",regime="ceiling"})')"
+proof_window="$(prom_scalar 'sum(ha_tx_timeout_regime_total{phase="proof",regime="window"})')"
+
+# The regime a broadcast falls into is NOT fixed to "ceiling must be 0": it is
+# window_blocks x block_time_seconds against the SDK's unordered-tx ceiling
+# (gate_expected_timeout_regime in lib.sh), and localnet's own clock knob
+# (localnet.block_time_seconds) decides which side of that line it lands on --
+# 30s stays under it, 60s (mainnet's clock) goes over. A fixed expectation was
+# only ever true at the clock this gate happened to be written against.
+#
+# Read from the CHAIN, not a file on disk: the localnet can run under more
+# than one profile, each with its own genesis, and a governance param change
+# moves the chain without moving any file this gate would otherwise read
+# separately from it. The miner itself only ever sees the chain's shared
+# params, so that is what this gate reads too -- and every field in that
+# response comes back as a STRING, validated as a positive integer before use.
+window_source_desc="chain shared params (validator pod)"
+shared_params_json="$(kubectl exec deploy/validator -c validator -- pocketd query shared params -o json 2>/dev/null)"
+claim_window_blocks="$(printf '%s' "$shared_params_json" | jq -r '.params.claim_window_close_offset_blocks | tonumber? // empty' 2>/dev/null)"
+proof_window_blocks="$(printf '%s' "$shared_params_json" | jq -r '.params.proof_window_close_offset_blocks | tonumber? // empty' 2>/dev/null)"
+case "$claim_window_blocks" in '' | *[!0-9]* | 0) claim_window_blocks="" ;; esac
+case "$proof_window_blocks" in '' | *[!0-9]* | 0) proof_window_blocks="" ;; esac
+block_time_seconds="$(kubectl get configmap miner-config -o jsonpath='{.data.config\.yaml}' 2>/dev/null |
+    python3 -c 'import sys,yaml; c=yaml.safe_load(sys.stdin) or {}; v=c.get("block_time_seconds"); print(v if v is not None else "")' 2>/dev/null || true)"
+# YAML renders an integer-valued float as "60.0", not "60" -- python's own
+# str() does that, no override needed to reproduce it -- and that string
+# fails bash's arithmetic context outright. Same validation as the window
+# widths, so a value shaped like that reads as unreadable rather than
+# reaching an arithmetic bash cannot do.
+case "$block_time_seconds" in '' | *[!0-9]* | 0) block_time_seconds="" ;; esac
+
+assert_timeout_regime_per_phase "$regime_total" "$broadcasts_total" "$regime_unknown" \
+    "$claim_ceiling" "$claim_window" "$proof_ceiling" "$proof_window" \
+    "$claim_window_blocks" "$proof_window_blocks" "$block_time_seconds" "$window_source_desc"
+
+gate_step "assert: nobody missed their window (sdk/code=30)"
+
+# code=30 is ErrTxTimeoutHeight: the chain refused the transaction because the
+# timeout_height had already passed. It is the failure mode the timeout_height
+# work can INTRODUCE, so a run that sets deadlines and never trips one is the
+# evidence that the deadlines are not too tight. Conditioned on broadcasts > 0
+# for the same reason as everything else here.
+window_expired="$(prom_scalar 'sum(ha_tx_broadcast_rejections_total{codespace="sdk",code="30"})')"
+if [ "$broadcasts_total" = "ABSENT" ] || [ "$broadcasts_total" = "UNREADABLE" ]; then
+    gate_nothing_measured "no broadcasts to judge -- a zero code=30 count says nothing when nothing was sent"
+elif [ "$window_expired" = "UNREADABLE" ]; then
+    gate_nothing_measured "Prometheus did not answer for the rejection family -- code=30 cannot be read"
+elif [ "$window_expired" != "ABSENT" ] && [ "${window_expired%%.*}" -gt 0 ] 2>/dev/null; then
+    gate_fail "${window_expired} transaction(s) rejected with sdk/code=30 -- the deadline had already passed when the chain saw them, so the window derivation is leaving no room"
+else
+    gate_pass "no sdk/code=30 rejections across ${broadcasts_total} broadcast(s) -- no deadline arrived expired"
+fi
+
+gate_step "report: the in-window resend path"
+
+# THIS BLOCK REPORTS AN ABSENCE AND JUDGES WHAT IT CAN READ. A healthy localnet
+# loses no transaction, so the resend path never runs and its counters never
+# come into existence: a missing series is a note, not a verdict. What is read
+# is judged -- a binary without the counter names, a resend that came back
+# failed, and a Prometheus that did not answer.
+#
+# Measured 2026-09-09, and it is why this block was rewritten: as a
+# gate_nothing_measured it turned the whole level RED on a clean run, which is
+# the other way to stop measuring -- a gate that is always red stops being read.
+#
+# BUT AN ABSENT SERIES HAS TWO CAUSES AND THEY LEAD OPPOSITE WAYS: nothing was
+# resent (normal), or nobody wired the counter (a regression that would go
+# silent forever). They are told apart by asking the BINARY UNDER TEST, not
+# Prometheus: the metric name is compiled in whether or not it ever fires. So a
+# missing name is a FAILURE and a missing series is a note.
+if ! grep -q 'claim_rebroadcasts_total' "$BIN" 2>/dev/null ||
+    ! grep -q 'proof_rebroadcasts_total' "$BIN" 2>/dev/null; then
+    gate_fail "the binary under test does not contain claim_rebroadcasts_total / proof_rebroadcasts_total -- the in-window resend counters are not wired, so a resend could never be seen by anything"
+else
+    claim_rb="$(prom_scalar 'sum(ha_miner_claim_rebroadcasts_total)')"
+    proof_rb="$(prom_scalar 'sum(ha_miner_proof_rebroadcasts_total)')"
+    # FAILED IS EVERYTHING NOT KNOWN TO BE HEALTHY, not a list of failures: a
+    # result value added later counts as failed until someone names it healthy,
+    # so the gate fails closed instead of reading zero for a value it never
+    # heard of. TestLiveGateHealthyRebroadcastResultsAreEmitted (miner/) pins
+    # every healthy name here to a literal the reconciler emits.
+    #
+    # ONE vector, not two sums added: `sum(A) + sum(B)` is empty whenever either
+    # side has no series, so failed claim resends with no proof series at all
+    # would read as nothing failed.
+    #
+    # rb_failed UNREADABLE sits in the FIRST branch, beside the families: when
+    # any of the three queries went unanswered, the other two saying "nothing
+    # was resent" cannot be told from an instrument that half failed.
+    rb_failed="$(prom_scalar 'sum({__name__=~"ha_miner_(claim|proof)_rebroadcasts_total",result!~"success|already_queued|not_required"})')"
+    if [ "$claim_rb" = "UNREADABLE" ] || [ "$proof_rb" = "UNREADABLE" ] || [ "$rb_failed" = "UNREADABLE" ]; then
+        gate_nothing_measured "Prometheus did not answer for the rebroadcast families -- this is the instrument failing, not a quiet run"
+    elif [ "$claim_rb" = "ABSENT" ] && [ "$proof_rb" = "ABSENT" ]; then
+        gate_pass "resend counters wired; no resend happened this run -- the resend BEHAVIOUR is therefore NOT observed live, and inducing it belongs to the chaos matrix"
+    elif [ "$rb_failed" != "ABSENT" ] && [ "${rb_failed%%.*}" -gt 0 ] 2>/dev/null; then
+        gate_fail "${rb_failed} in-window resend(s) came back failed (claim=${claim_rb}, proof=${proof_rb}) -- a resend that fails inside its own window is a claim or proof heading for forfeit"
+    else
+        gate_pass "in-window resends ran and none failed (claim=${claim_rb}, proof=${proof_rb})"
+        gate_exercised coverage rebroadcasts "1"
+    fi
+fi
+
+for state in claim_missing claim_tx_error proof_tx_error proof_window_closed claim_window_closed; do
+    n="$(grep -cx "$state" "$fail_states_file" 2>/dev/null || true)"
+    [ "${n:-0}" -gt 0 ] && gate_fail "miner reports ${n} session(s) in failure state '${state}'"
+done
+
+if [ "$resolved" -eq 0 ]; then
+    gate_fail "timed out after ${SETTLE_TIMEOUT_MIN} min with services still unpaid"
+fi
+
+# --- Settlement breakdown -----------------------------------------------------
+#
+# Reporting only. Nothing here fails the gate, and that is deliberate: the two
+# loss channels below are EXPECTED to read zero on a healthy localnet, so a
+# non-zero would be the finding while a zero proves nothing. Printing them keeps
+# "did not occur" and "was never looked at" from producing the same signal.
+#
+# The numbers are already on disk. scan_settlement_events captures every
+# attribute of every pocket.tokenomics.Event, so the settlement breakdown has
+# been collected on every run since that function existed -- only num_relays was
+# ever read out of it.
+#
+# THREE relay counts exist and they are not interchangeable:
+#
+#   sent (the CLI's count)   relays served, BEFORE the relayer's difficulty filter
+#   num_relays               leaves in the submitted tree, i.e. only the relays
+#                            whose hash matched the service's mining difficulty
+#   num_estimated_relays     num_relays x the difficulty multiplier, the chain's
+#                            estimate of the work actually done
+#
+# The gate's billing assertion compares sent against num_relays, which spans the
+# difficulty filter and is therefore only sound at BASE difficulty. Localnet runs
+# there (every service reports an unset target hash, which x/service resolves to
+# BaseRelayDifficultyHashBz, multiplier 1), so the two coincide and the assertion
+# holds. On a network with real difficulty it would not. Both are printed so the
+# day they diverge is visible rather than inferred.
+
+gate_step "settlement breakdown (fails only if jq itself broke; overservicing/deflation values are reporting-only)"
+sb_line="$(gate_settlement_breakdown "$events_file" "${load_start_height:-0}")"
+sb_rc=$?
+IFS=$'\t' read -r sb_claims sb_relays sb_estimated sb_claimed sb_settled sb_minted \
+    sb_overloss sb_deflation sb_over_events sb_spend_limit <<<"$sb_line"
+
+gate_detail "claims settled           ${sb_claims:-0}
+num_relays (tree leaves) ${sb_relays:-0}
+num_estimated_relays     ${sb_estimated:-0}
+claimed_upokt            ${sb_claimed:-0}
+settled_upokt            ${sb_settled:-0}
+minted_upokt             ${sb_minted:-0}" 12
+
+# gate_settlement_breakdown returns non-zero when jq itself failed to parse
+# the chain's events (schema change, malformed JSON) -- distinct from an
+# empty events file, which is not an error and is handled inside that
+# function. Failing loudly here, rather than reading the zeros it still
+# prints as "nothing happened", is the entire point of MEDIUM-3 (review
+# 2026-08-20): a parse failure and a genuinely quiet run must never look the
+# same on a money check.
+if [ "$sb_rc" -ne 0 ]; then
+    gate_fail "settlement breakdown: jq failed to parse ${events_file} (see error above) -- overservicing/deflation below are UNKNOWN, not zero"
+else
+    # Overservicing: the application's stake could not cover the claim, so the
+    # chain paid less than was claimed. It is money that did not arrive, and it
+    # does NOT show up in any relay count -- claimed and settled relay counts
+    # both stay put while the uPOKT shrinks, so a check that only counts relays
+    # cannot see it.
+    if [ "${sb_overloss:-0}" -gt 0 ] || [ "${sb_over_events:-0}" -gt 0 ]; then
+        gate_pass "overservicing OCCURRED: ${sb_overloss} uPOKT across ${sb_over_events} event(s), ${sb_spend_limit} from a per-session spend limit"
+    else
+        gate_pass "overservicing did not occur this run (0 events, 0 uPOKT) -- not evidence that it cannot"
+    fi
+
+    # Deflation is mint_ratio < 1, a governance parameter rather than a defect
+    # here. Reported separately so it is never mistaken for the line above.
+    if [ "${sb_deflation:-0}" -gt 0 ]; then
+        gate_pass "deflation (mint_ratio < 1): ${sb_deflation} uPOKT -- a governance parameter, not a fault"
+    else
+        gate_pass "no deflation this run (mint_ratio = 1)"
+    fi
+fi
+
+gate_verdict "live"

@@ -20,7 +20,14 @@ tilt/backend-server/pb/*.pb.go
 # IDE
 .idea/
 .vscode/
-.claude/
+
+# Agent state is machine-local: settings.local.json is a permission allowlist
+# that ends up holding operator hostnames and personal paths, and worktrees/ is
+# scratch. The one exception is skills/ -- this repository's own agent
+# instructions, reviewed as code like any other file. scripts/check-tracked-files.sh
+# enforces the exception so it cannot widen by accident.
+.claude/*
+!.claude/skills/
 
 # OS
 .DS_Store
@@ -32,11 +39,32 @@ reports
 # Log analysis (local only)
 logs-analysis/
 
-# Local-only scripts (ops, host-specific, monitoring playbooks, secrets)
+# Local-only working artifacts: ops scripts, host-specific config, secrets,
+# and every planning/spec/brainstorm document. Only user-facing docs are
+# tracked; design notes live here and never reach the repository.
 scripts/localonly/
 
-# GSD Planning
-.planning
+# Planning and design artifacts (GSD, superpowers, agent scratch)
+.planning/
+docs/superpowers/
 
-# Local tooling state
-.cortexkit/
+# Example signers: build output and installed dependencies. The examples are
+# source to read and copy; everything a toolchain generates from them stays out.
+examples/**/node_modules/
+examples/**/target/
+examples/**/__pycache__/
+examples/**/.ruff_cache/
+examples/**/.venv/
+# A compiled oracle, wherever a reader builds one. Note this must not swallow
+# examples/relay-signing/oracle/, which is the oracle's SOURCE and is tracked —
+# hence the per-language paths rather than a bare `oracle`.
+examples/**/oracle-bin
+examples/relay-signing/nodejs/oracle
+examples/relay-signing/python/oracle
+examples/relay-signing/rust/oracle
+# `go build ./examples/relay-signing/oracle` from the repo root drops a 5 MB
+# binary here. Root-anchored, so it cannot swallow the source dir above.
+/oracle
+
+# Python bytecode (scripts/dashboards)
+__pycache__/

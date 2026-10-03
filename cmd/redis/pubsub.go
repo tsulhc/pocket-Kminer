@@ -24,9 +24,7 @@ func PubSubCmd() *cobra.Command {
 
 Common channels:
   - ha:events:cache:{type}:invalidate - Cache invalidation events
-  - ha:events:supplier_update - Supplier registry updates
   - ha:meter:cleanup - Meter cleanup signals
-  - ha:events:session:rewardable - Session rewardability updates
 
 Press Ctrl+C to stop monitoring.`,
 		RunE: func(cmd *cobra.Command, args []string) error {

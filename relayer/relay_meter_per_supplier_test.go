@@ -4,10 +4,8 @@ package relayer
 
 import (
 	"context"
-	"fmt"
 	"testing"
 
-	"github.com/alicebob/miniredis/v2"
 	"github.com/stretchr/testify/require"
 
 	"github.com/pokt-network/pocket-relay-miner/logging"
@@ -23,6 +21,9 @@ func (s staticServiceFactor) GetServiceFactor(_ context.Context, _ string) (floa
 	return s.f, true
 }
 
+// Priced is always true here: a static factor is a price by construction.
+func (s staticServiceFactor) Priced() bool { return true }
+
 // TestCheckAndConsumeRelay_PerSupplierIsolation proves that two suppliers
 // serving the SAME session get INDEPENDENT meter state. The bug this
 // test guards against: a prior schema keyed the consumed counter and the
@@ -37,16 +38,9 @@ func (s staticServiceFactor) GetServiceFactor(_ context.Context, _ string) (floa
 // poktroll model: each supplier claims its portion of the app's stake
 // independently.
 func TestCheckAndConsumeRelay_PerSupplierIsolation(t *testing.T) {
-	mr, err := miniredis.Run()
-	require.NoError(t, err)
-	defer mr.Close()
 	ctx := context.Background()
 
-	redisClient, err := redisutil.NewClient(ctx, redisutil.ClientConfig{
-		URL: fmt.Sprintf("redis://%s", mr.Addr()),
-	})
-	require.NoError(t, err)
-	defer func() { _ = redisClient.Close() }()
+	redisClient, _ := newTestRedis(t)
 
 	// Deterministic cap. With appStake=1000 uPOKT, serviceFactor=0.5 →
 	// effectiveLimit = 500 uPOKT per supplier. Relay cost = 1 uPOKT
@@ -77,29 +71,33 @@ func TestCheckAndConsumeRelay_PerSupplierIsolation(t *testing.T) {
 		&fakeSharedParamCache{params: sharedParams},
 		nil, // serviceCache (unused — fallback compute_units=1)
 		staticServiceFactor{f: 0.5},
-		RelayMeterConfig{RedisKeyPrefix: "ha"},
+		RelayMeterConfig{},
 	)
 	require.NoError(t, meter.Start(ctx))
 	defer func() { _ = meter.Close() }()
+	charges := newChargeWriter(t, meter, redisClient)
 
 	sessionID := "sess-shared"
 	supplierA := "pokt1supplier_a"
 	supplierB := "pokt1supplier_b"
 	serviceID := "svc-x"
+	sessionStartHeight := int64(91)
 	sessionEndHeight := int64(100)
 
 	// Supplier A consumes up to its cap. Every call within the cap must
 	// return allowed=true.
 	for i := int64(0); i < perSupplierCap; i++ {
-		allowed, err := meter.CheckAndConsumeRelay(ctx, sessionID, appAddr, serviceID, supplierA, 0, sessionEndHeight, 0)
+		allowed, err := meter.CheckAndConsumeRelay(ctx, sessionID, appAddr, serviceID, supplierA, sessionStartHeight, sessionEndHeight, 0)
 		require.NoError(t, err, "unexpected error at supplier A relay #%d", i+1)
 		require.True(t, allowed, "supplier A relay #%d must be within cap (cap=%d)", i+1, perSupplierCap)
 	}
 
 	// One more relay on A MUST be rejected — cap exhausted.
-	allowed, err := meter.CheckAndConsumeRelay(ctx, sessionID, appAddr, serviceID, supplierA, 0, sessionEndHeight, 0)
+	allowed, err := meter.CheckAndConsumeRelay(ctx, sessionID, appAddr, serviceID, supplierA, sessionStartHeight, sessionEndHeight, 0)
 	require.NoError(t, err)
 	require.False(t, allowed, "supplier A must be rejected after %d relays (at cap)", perSupplierCap)
+
+	charges.flush()
 
 	// Inspect per-(session, supplier) state in Redis directly. A must be
 	// at its cap, B must be zero (or absent).
@@ -110,7 +108,7 @@ func TestCheckAndConsumeRelay_PerSupplierIsolation(t *testing.T) {
 
 	// Supplier B's counter must NOT exist yet — A's exhaustion must not
 	// pollute B's bucket.
-	bExists := mr.Exists(meter.consumedKey(sessionID, supplierB))
+	bExists := keyExists(t, redisClient, meter.consumedKey(sessionID, supplierB))
 	require.False(t, bExists,
 		"supplier B must not have a consumed counter before its first relay — "+
 			"the bug this test guards against is a shared counter keyed only by sessionID")
@@ -119,7 +117,7 @@ func TestCheckAndConsumeRelay_PerSupplierIsolation(t *testing.T) {
 	// must be allowed. With the pre-fix shared-counter schema, this call
 	// would see consumed=perSupplierCap and return false. With the
 	// per-(session, supplier) schema, B starts at zero.
-	allowed, err = meter.CheckAndConsumeRelay(ctx, sessionID, appAddr, serviceID, supplierB, 0, sessionEndHeight, 0)
+	allowed, err = meter.CheckAndConsumeRelay(ctx, sessionID, appAddr, serviceID, supplierB, sessionStartHeight, sessionEndHeight, 0)
 	require.NoError(t, err)
 	require.True(t, allowed,
 		"supplier B's first relay on the shared session must be allowed — "+
@@ -128,15 +126,17 @@ func TestCheckAndConsumeRelay_PerSupplierIsolation(t *testing.T) {
 	// B must be allowed up to ITS OWN cap (perSupplierCap - 1 more after
 	// the first call above).
 	for i := int64(1); i < perSupplierCap; i++ {
-		allowed, err := meter.CheckAndConsumeRelay(ctx, sessionID, appAddr, serviceID, supplierB, 0, sessionEndHeight, 0)
+		allowed, err := meter.CheckAndConsumeRelay(ctx, sessionID, appAddr, serviceID, supplierB, sessionStartHeight, sessionEndHeight, 0)
 		require.NoError(t, err)
 		require.True(t, allowed, "supplier B relay #%d must be within its own cap", i+1)
 	}
 
 	// B's (cap+1)th call must be rejected — B hit its own cap, NOT A's.
-	allowed, err = meter.CheckAndConsumeRelay(ctx, sessionID, appAddr, serviceID, supplierB, 0, sessionEndHeight, 0)
+	allowed, err = meter.CheckAndConsumeRelay(ctx, sessionID, appAddr, serviceID, supplierB, sessionStartHeight, sessionEndHeight, 0)
 	require.NoError(t, err)
 	require.False(t, allowed, "supplier B must be rejected after consuming its own per-supplier cap")
+
+	charges.flush()
 
 	// Final sanity: A and B counters live in distinct keys, both at cap.
 	consumedA, err = redisClient.Get(ctx, meter.consumedKey(sessionID, supplierA)).Int64()
@@ -152,16 +152,9 @@ func TestCheckAndConsumeRelay_PerSupplierIsolation(t *testing.T) {
 // The cleanup publisher now carries (sessionID, supplierAddress) so the
 // subscriber can scope the deletion correctly.
 func TestClearSessionMeter_PerSupplierIsolation(t *testing.T) {
-	mr, err := miniredis.Run()
-	require.NoError(t, err)
-	defer mr.Close()
 	ctx := context.Background()
 
-	redisClient, err := redisutil.NewClient(ctx, redisutil.ClientConfig{
-		URL: fmt.Sprintf("redis://%s", mr.Addr()),
-	})
-	require.NoError(t, err)
-	defer func() { _ = redisClient.Close() }()
+	redisClient, _ := newTestRedis(t)
 
 	app := &fakeAppClient{addr: "pokt1app_shared"}
 	app.stakeUpokt.Store(1000)
@@ -180,10 +173,11 @@ func TestClearSessionMeter_PerSupplierIsolation(t *testing.T) {
 		}},
 		nil,
 		staticServiceFactor{f: 0.5},
-		RelayMeterConfig{RedisKeyPrefix: "ha"},
+		RelayMeterConfig{},
 	)
 	require.NoError(t, meter.Start(ctx))
 	defer func() { _ = meter.Close() }()
+	charges := newChargeWriter(t, meter, redisClient)
 
 	sessionID := "sess-cleanup"
 	supplierA, supplierB := "pokt1sa", "pokt1sb"
@@ -191,24 +185,34 @@ func TestClearSessionMeter_PerSupplierIsolation(t *testing.T) {
 
 	// Prime both meters with a relay each so both keys exist in Redis.
 	for _, sup := range []string{supplierA, supplierB} {
-		allowed, err := meter.CheckAndConsumeRelay(ctx, sessionID, "pokt1app_shared", serviceID, sup, 0, 100, 0)
+		allowed, err := meter.CheckAndConsumeRelay(ctx, sessionID, "pokt1app_shared", serviceID, sup, 91, 100, 0)
 		require.NoError(t, err)
 		require.True(t, allowed)
 	}
+
+	charges.flush()
 
 	// Clear ONLY A's meter.
 	require.NoError(t, meter.ClearSessionMeter(ctx, sessionID, supplierA))
 
 	// A's keys must be gone.
-	require.False(t, mr.Exists(meter.consumedKey(sessionID, supplierA)),
+	require.False(t, keyExists(t, redisClient, meter.consumedKey(sessionID, supplierA)),
 		"A's consumed key must be deleted")
-	require.False(t, mr.Exists(meter.metaKey(sessionID, supplierA)),
+	require.False(t, keyExists(t, redisClient, meter.metaKey(sessionID, supplierA)),
 		"A's meta key must be deleted")
 
 	// B's keys must be untouched.
-	require.True(t, mr.Exists(meter.consumedKey(sessionID, supplierB)),
+	require.True(t, keyExists(t, redisClient, meter.consumedKey(sessionID, supplierB)),
 		"B's consumed key must survive A's cleanup — the bug to guard against "+
 			"is shared-sessionID cleanup clobbering a co-supplier's live meter")
-	require.True(t, mr.Exists(meter.metaKey(sessionID, supplierB)),
+	require.True(t, keyExists(t, redisClient, meter.metaKey(sessionID, supplierB)),
 		"B's meta key must survive A's cleanup")
+}
+
+// keyExists reports whether key is present, replacing miniredis's Exists.
+func keyExists(t *testing.T, client *redisutil.Client, key string) bool {
+	t.Helper()
+	n, err := client.Exists(context.Background(), key).Result()
+	require.NoError(t, err)
+	return n == 1
 }

@@ -4,6 +4,7 @@ package observability
 
 import (
 	"context"
+	"net"
 	"testing"
 	"time"
 
@@ -16,21 +17,36 @@ import (
 // TestNewServer creates a new observability server.
 func TestNewServer(t *testing.T) {
 	logger := logging.NewLoggerFromConfig(logging.DefaultConfig())
-	config := DefaultServerConfig()
-	config.MetricsAddr = ":0" // Use random available port
+	config := ServerConfig{
+		MetricsEnabled: false,
+		MetricsAddr:    ":0", // random available port
+		PprofEnabled:   false,
+		PprofAddr:      ":6060",
+	}
 
 	server := NewServer(logger, config)
 	require.NotNil(t, server, "Server should not be nil")
 	require.False(t, server.IsRunning(), "Server should not be running initially")
 }
 
-// TestDefaultServerConfig tests default configuration values.
-func TestDefaultServerConfig(t *testing.T) {
-	config := DefaultServerConfig()
-	require.True(t, config.MetricsEnabled, "Metrics should be enabled by default")
-	require.Equal(t, ":9090", config.MetricsAddr, "Default metrics address should be :9090")
-	require.False(t, config.PprofEnabled, "Pprof should be disabled by default")
-	require.Equal(t, ":6060", config.PprofAddr, "Default pprof address should be :6060")
+// TestServer_Start_MetricsWithoutRegistry pins the error path the nil-Registry
+// guard exists for: enabling metrics without one is a caller mistake and must
+// say so, rather than serve a default handler that double-registers runtime
+// metrics.
+func TestServer_Start_MetricsWithoutRegistry(t *testing.T) {
+	logger := logging.NewLoggerFromConfig(logging.DefaultConfig())
+	config := ServerConfig{
+		MetricsEnabled: false,
+		MetricsAddr:    ":9090",
+		PprofEnabled:   false,
+		PprofAddr:      ":6060",
+	}
+	config.MetricsEnabled = true
+	config.MetricsAddr = ":0"
+
+	err := NewServer(logger, config).Start(context.Background())
+	require.Error(t, err, "metrics enabled with no Registry must fail at Start")
+	require.Contains(t, err.Error(), "requires a Registry")
 }
 
 // TestServer_Start_Stop tests basic server lifecycle.
@@ -89,7 +105,12 @@ func TestServer_Start_AlreadyRunning(t *testing.T) {
 // TestServer_Stop_NotRunning tests that stopping a non-running server is safe.
 func TestServer_Stop_NotRunning(t *testing.T) {
 	logger := logging.NewLoggerFromConfig(logging.DefaultConfig())
-	config := DefaultServerConfig()
+	config := ServerConfig{
+		MetricsEnabled: false,
+		MetricsAddr:    ":9090",
+		PprofEnabled:   false,
+		PprofAddr:      ":6060",
+	}
 	config.MetricsAddr = ":0"
 	config.Registry = prometheus.NewRegistry() // Use isolated registry for tests
 
@@ -300,4 +321,16 @@ func TestServer_IsRunning(t *testing.T) {
 	err = server.Stop()
 	require.NoError(t, err)
 	require.False(t, server.IsRunning(), "Server should not be running after stop")
+}
+
+// A pprof server configured with no address listens on loopback only: it serves
+// heap and goroutine dumps. The miner reaches this fallback whenever its config
+// enables pprof without an addr.
+func TestNewServer_UnsetPprofAddrIsLoopback(t *testing.T) {
+	server := NewServer(logging.NewLoggerFromConfig(logging.DefaultConfig()), ServerConfig{PprofEnabled: true})
+	host, _, err := net.SplitHostPort(server.config.PprofAddr)
+	require.NoError(t, err)
+	ip := net.ParseIP(host)
+	require.NotNil(t, ip, "LINK pprof-fallback-loopback: %q has no IP literal host, so it listens on every interface", server.config.PprofAddr)
+	require.True(t, ip.IsLoopback(), "LINK pprof-fallback-loopback: %q is not loopback", server.config.PprofAddr)
 }

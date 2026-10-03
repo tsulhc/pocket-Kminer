@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/alicebob/miniredis/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
@@ -18,63 +17,42 @@ import (
 	"github.com/pokt-network/pocket-relay-miner/logging"
 	redisutil "github.com/pokt-network/pocket-relay-miner/transport/redis"
 	pocktclient "github.com/pokt-network/poktroll/pkg/client"
+	prooftypes "github.com/pokt-network/poktroll/x/proof/types"
 )
 
 // -----------------------------------------------------------------------------
 // isClaimNotFoundError — unit tests
 // -----------------------------------------------------------------------------
 
-func TestIsClaimNotFoundError_GrpcNotFound(t *testing.T) {
-	err := status.Error(codes.NotFound, "claim not found")
-	require.True(t, isClaimNotFoundError(err))
-}
+// isClaimNotFoundError delegates to query.IsEntityNotFound, whose own table in
+// query/errors_test.go pins the full policy (explicit gRPC NotFound only, bare and
+// wrapped; every transient failure fails open). Only the delegation is asserted here
+// so one behaviour change does not have to be edited into three test tables in
+// lockstep — the guard's decision tree is covered by runGuard below.
+func TestIsClaimNotFoundError_DelegatesToTheSharedPolicy(t *testing.T) {
+	require.True(t, isClaimNotFoundError(
+		fmt.Errorf("failed to query claim: %w", status.Error(codes.NotFound, "claim not found"))),
+		"an explicit NotFound, wrapped as query.GetClaim wraps it, means the claim is absent")
 
-func TestIsClaimNotFoundError_WrappedGrpcNotFound(t *testing.T) {
-	inner := status.Error(codes.NotFound, "claim not found")
-	wrapped := fmt.Errorf("failed to query claim: %w", inner)
-	require.True(t, isClaimNotFoundError(wrapped), "guard must unwrap fmt.Errorf-wrapped gRPC NotFound")
-}
+	require.False(t, isClaimNotFoundError(status.Error(codes.Unknown, "rpc error: header not found")),
+		"a transient failure carrying \"not found\" must never skip a proof")
 
-func TestIsClaimNotFoundError_TransientMessageFailsOpen(t *testing.T) {
-	err := errors.New("something: claim not found for session X")
-	require.False(t, isClaimNotFoundError(err))
-}
-
-func TestIsClaimNotFoundError_UnavailableIsFailOpen(t *testing.T) {
-	err := status.Error(codes.Unavailable, "chain RPC down")
-	require.False(t, isClaimNotFoundError(err), "Unavailable must NOT be treated as NotFound so the guard fails open")
-}
-
-func TestIsClaimNotFoundError_NilIsFalse(t *testing.T) {
 	require.False(t, isClaimNotFoundError(nil))
-}
-
-func TestIsClaimNotFoundError_ArbitraryErrorIsFalse(t *testing.T) {
-	require.False(t, isClaimNotFoundError(errors.New("connection refused")))
 }
 
 // -----------------------------------------------------------------------------
 // SessionCoordinator.OnClaimMissing — integration with miniredis
 // -----------------------------------------------------------------------------
 
-func setupTestCoordinator(t *testing.T) (*SessionCoordinator, *RedisSessionStore, *miniredis.Miniredis) {
+func setupTestCoordinator(t *testing.T) (*SessionCoordinator, *RedisSessionStore, *redisutil.Client) {
 	t.Helper()
 
-	mr, err := miniredis.Run()
-	require.NoError(t, err)
-	t.Cleanup(mr.Close)
-
-	ctx := context.Background()
-	client, err := redisutil.NewClient(ctx, redisutil.ClientConfig{
-		URL: fmt.Sprintf("redis://%s", mr.Addr()),
-	})
-	require.NoError(t, err)
+	client, _ := newTestRedis(t)
 
 	store := NewRedisSessionStore(
 		logging.NewLoggerFromConfig(logging.DefaultConfig()),
 		client,
 		SessionStoreConfig{
-			KeyPrefix:       "ha:miner:sessions",
 			SupplierAddress: "pokt1test",
 			SessionTTL:      1 * time.Hour,
 		},
@@ -86,7 +64,7 @@ func setupTestCoordinator(t *testing.T) (*SessionCoordinator, *RedisSessionStore
 		SMSTRecoveryConfig{SupplierAddress: "pokt1test"},
 	)
 
-	return coord, store, mr
+	return coord, store, client
 }
 
 func TestOnClaimMissing_MarksSessionTerminal(t *testing.T) {
@@ -354,4 +332,54 @@ func TestPreProofGuard_NilClient_NoCall(t *testing.T) {
 	}
 
 	require.False(t, runGuard(context.Background(), lc, snapshot))
+}
+
+// judgedProofCycle runs the REAL OnSessionsNeedProof for one session whose
+// claim the chain reports with the given proof status, and returns how many
+// proofs were signed and the cycle's result.
+func judgedProofCycle(t *testing.T, st prooftypes.ClaimProofStatus) (int, ProofCycleResult) {
+	t.Helper()
+	blocks := &heightedBlocks{}
+	blocks.currentHeight = 108
+	supplier := &flakySupplier{}
+	lc := &LifecycleCallback{
+		logger:         logging.NewLoggerFromConfig(logging.DefaultConfig()),
+		sharedClient:   &defaultParamsShared{},
+		blockClient:    blocks,
+		smstManager:    provingSMST{},
+		supplierClient: supplier,
+		serviceClient:  erroringService{},
+		proofQueryClient: &stubProofQueryClient{getClaimFn: func(context.Context, string, string) (pocktclient.Claim, error) {
+			return &prooftypes.Claim{ProofValidationStatus: st}, nil
+		}},
+		config: LifecycleCallbackConfig{ProofRetryAttempts: 1, ProofRetryDelay: time.Millisecond},
+	}
+	result, err := lc.OnSessionsNeedProof(context.Background(), []*SessionSnapshot{{
+		SessionID: "session-judged", SessionEndHeight: 100, SessionStartHeight: 81,
+		SupplierOperatorAddress: "pokt1judgedcycle", ServiceID: "svc", RelayCount: 10, TotalComputeUnits: 100,
+		State: SessionStateProving, ClaimedRootHash: make([]byte, SMSTRootLen),
+	}})
+	require.NoError(t, err)
+	return supplier.calls, result
+}
+
+// A session back in claimed after a kill between its proof's broadcast and the
+// write of its hash must not send the proof again once the chain validated it:
+// poktroll deletes the judged proof and would accept and charge a second one.
+func TestPreProofGuard_AValidatedProofIsNotSentAgain(t *testing.T) {
+	signed, result := judgedProofCycle(t, prooftypes.ClaimProofStatus_VALIDATED)
+	require.Zero(t, signed, "the chain already validated this proof: no second one is charged")
+	require.True(t, result.IsSettled("session-judged"), "and the session is settled, since its proof is on chain")
+}
+
+func TestPreProofGuard_AnInvalidProofIsNotSentAgain(t *testing.T) {
+	signed, result := judgedProofCycle(t, prooftypes.ClaimProofStatus_INVALID)
+	require.Zero(t, signed, "the same proof would be judged the same way")
+	require.False(t, result.IsSettled("session-judged"), "and a rejected proof is not a settlement")
+}
+
+func TestPreProofGuard_APendingClaimGetsItsProof(t *testing.T) {
+	signed, result := judgedProofCycle(t, prooftypes.ClaimProofStatus_PENDING_VALIDATION)
+	require.Equal(t, 1, signed, "control: a claim waiting for its proof gets it")
+	require.True(t, result.IsSettled("session-judged"))
 }

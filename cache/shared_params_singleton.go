@@ -18,16 +18,26 @@ import (
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 )
 
-const (
-	// Cache type for pub/sub and metrics
-	sharedParamsCacheType = "shared_params"
+// DefaultBlockTimeSeconds is the fallback block time used wherever an
+// operator has not explicitly configured one, for every consumer in this
+// process (miner and relayer alike). This is the ONLY place that value is
+// allowed to be a literal (Jorge, 2026-08-21, after finding it hardcoded
+// independently in 5 places -- miner/config.go, miner/deduplicator.go, and
+// three call sites in this package -- three of which had silently drifted
+// from what an operator's config actually said). Every other fallback in the
+// codebase must reference this constant rather than writing its own "30":
+// changing the default is then a one-line change instead of a grep-and-hope.
+//
+// The VALUE is deliberately not "corrected" to a measured mainnet number: a
+// single constant cannot be right for mainnet, beta/testnet, and localnet at
+// once, and mainnet's own real block time drifts with network conditions
+// rather than holding still. This is a last-resort fallback for an operator
+// who configured nothing, not a substitute for setting block_time_seconds
+// correctly for the target deployment (see config.miner.example.yaml).
+const DefaultBlockTimeSeconds int64 = 30
 
-	// Default block time if not configured (30 seconds for mainnet/testnet)
-	defaultBlockTimeSeconds = 30
-
-	// Number of sessions to keep params cached (safety buffer)
-	sessionTTLMultiplier = 2
-)
+// Cache type for pub/sub and metrics
+const sharedParamsCacheType = "shared_params"
 
 // sharedParamsCache implements SingletonEntityCache[*sharedtypes.Params]
 // for caching shared module parameters.
@@ -89,7 +99,7 @@ func NewSharedParamsCache(
 	blockTimeSeconds int64,
 ) SingletonEntityCache[*sharedtypes.Params] {
 	if blockTimeSeconds <= 0 {
-		blockTimeSeconds = defaultBlockTimeSeconds
+		blockTimeSeconds = DefaultBlockTimeSeconds
 	}
 
 	return &sharedParamsCache{
@@ -320,11 +330,19 @@ func (c *sharedParamsCache) WarmupFromRedis(ctx context.Context) error {
 func (c *sharedParamsCache) queryChainWithLock(ctx context.Context) (*sharedtypes.Params, error) {
 	lockKey := c.redisClient.KB().ParamsSharedLockKey()
 	// Try to acquire distributed lock
-	locked, err := c.redisClient.SetNX(ctx, lockKey, "1", 5*time.Second).Result()
+	lockToken := newLockToken()
+	locked, err := c.redisClient.SetNX(ctx, lockKey, lockToken, 5*time.Second).Result()
 	if err != nil {
 		return nil, fmt.Errorf("failed to acquire lock: %w", err)
 	}
-	defer c.redisClient.Del(ctx, lockKey)
+	// Release the lock only when this instance actually acquired it: an
+	// unconditional deferred Del from a contended loser deletes the WINNER's
+	// still-held lock on exit, letting a third instance acquire immediately
+	// and re-fire the duplicate chain query the lock exists to prevent
+	// (same fix as cache/keyed_query_lock.go).
+	if locked {
+		defer releaseCacheLock(ctx, c.redisClient, lockKey, lockToken)
+	}
 
 	if !locked {
 		// Another instance is querying, wait and retry L2
@@ -361,20 +379,18 @@ func (c *sharedParamsCache) queryChainWithLock(ctx context.Context) (*sharedtype
 // This avoids an extra gRPC call during refresh.
 // Formula: TTL = 2 × num_blocks_per_session × block_time_seconds
 func (c *sharedParamsCache) calculateTTLFromParams(params *sharedtypes.Params) time.Duration {
-	if params == nil {
-		return 10 * time.Minute // Default fallback
-	}
-
-	numBlocksPerSession := params.NumBlocksPerSession
-	ttlSeconds := int64(sessionTTLMultiplier*numBlocksPerSession) * c.blockTimeSeconds
+	// Same formula as SupplierCacheTTLFromParams (2 x num_blocks_per_session x
+	// block_time_seconds) -- shared, not reimplemented, so the two cannot
+	// silently drift apart the way this package's own duplicate copy did
+	// before this fix (review 2026-08-21).
+	ttl := SupplierCacheTTLFromParams(params, c.blockTimeSeconds)
 
 	c.logger.Debug().
-		Uint64("blocks_per_session", numBlocksPerSession).
 		Int64("block_time_seconds", c.blockTimeSeconds).
-		Int64("ttl_seconds", ttlSeconds).
+		Dur("ttl", ttl).
 		Msg("calculated shared params TTL")
 
-	return time.Duration(ttlSeconds) * time.Second
+	return ttl
 }
 
 // handleInvalidation handles cache invalidation events from pub/sub.

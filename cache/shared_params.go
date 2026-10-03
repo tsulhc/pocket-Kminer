@@ -9,7 +9,10 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
+	"github.com/puzpuzpuz/xsync/v4"
+
 	"github.com/pokt-network/pocket-relay-miner/logging"
+	redisutil "github.com/pokt-network/pocket-relay-miner/transport/redis"
 	"github.com/pokt-network/poktroll/pkg/client"
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 )
@@ -45,8 +48,8 @@ func (c *RedisSharedParamCache) storeLocal(key string, height int64, params *sha
 	if cutoff <= 0 {
 		return
 	}
-	c.localCache.Range(func(k, v any) bool {
-		if e, ok := v.(sharedParamLocalEntry); ok && e.height < cutoff {
+	c.localCache.Range(func(k string, e sharedParamLocalEntry) bool {
+		if e.height < cutoff {
 			c.localCache.Delete(k)
 		}
 		return true
@@ -56,7 +59,7 @@ func (c *RedisSharedParamCache) storeLocal(key string, height int64, params *sha
 // RedisSharedParamCache implements SharedParamCache using Redis as L2 cache.
 type RedisSharedParamCache struct {
 	logger       logging.Logger
-	redisClient  redis.UniversalClient
+	redisClient  *redisutil.Client
 	sharedClient client.SharedQueryClient
 	blockClient  client.BlockClient
 	config       CacheConfig
@@ -64,94 +67,64 @@ type RedisSharedParamCache struct {
 	// L1 local cache, keyed by height. Values are sharedParamLocalEntry so each
 	// is TTL-floored and the map is pruned to a bounded height window (it used to
 	// grow ~1 entry/block forever — only the latest few heights are ever read).
-	localCache sync.Map // map[string]sharedParamLocalEntry
+	localCache *xsync.Map[string, sharedParamLocalEntry]
 
 	// Cache keys helper
-	keys CacheKeys
 
 	// Lifecycle
-	mu       sync.RWMutex
-	closed   bool
-	cancelFn context.CancelFunc
-	wg       sync.WaitGroup
+	mu     sync.RWMutex
+	closed bool
 }
 
 // NewRedisSharedParamCache creates a new SharedParamCache backed by Redis.
 func NewRedisSharedParamCache(
 	logger logging.Logger,
-	redisClient redis.UniversalClient,
+	redisClient *redisutil.Client,
 	sharedClient client.SharedQueryClient,
 	blockClient client.BlockClient,
 	config CacheConfig,
 ) *RedisSharedParamCache {
-	if config.CachePrefix == "" {
-		config.CachePrefix = "ha:cache"
-	}
 	if config.TTLBlocks == 0 {
 		config.TTLBlocks = 1
 	}
 	if config.BlockTimeSeconds == 0 {
-		config.BlockTimeSeconds = 30
+		config.BlockTimeSeconds = DefaultBlockTimeSeconds
 	}
-	if config.LockTimeout == 0 {
+	// Below the floor is treated as unset, not honoured. A bare `LockTimeout: 5`
+	// on a time.Duration field is FIVE NANOSECONDS -- go-redis truncates it to
+	// PX 1 and the lock expires in about a millisecond, so it dedups nothing
+	// while every reader still pays the contended path. It was wired exactly
+	// that way in miner/leader_controller.go and the `== 0` check waved it
+	// through, because an absurd value is not a zero one. Measured 2026-08-28.
+	if config.LockTimeout < minLockTimeout {
 		config.LockTimeout = 5 * time.Second
 	}
 
 	return &RedisSharedParamCache{
+		localCache:   xsync.NewMap[string, sharedParamLocalEntry](),
 		logger:       logging.ForComponent(logger, logging.ComponentSharedParamCache),
 		redisClient:  redisClient,
 		sharedClient: sharedClient,
 		blockClient:  blockClient,
 		config:       config,
-		keys:         CacheKeys{Prefix: config.CachePrefix},
 	}
 }
 
-// Start begins the cache's background processes.
-func (c *RedisSharedParamCache) Start(ctx context.Context) error {
+// Start marks the cache as running. It spawns no background processes:
+// per-height entries are immutable on chain and age out via the L1 TTL
+// floor. A height-targeted invalidation subscriber used to run here, but its
+// only publisher was removed — keeping the subscriber cost every replica a
+// dedicated pub/sub connection on a channel nothing could publish to, while
+// implying a working invalidation mechanism that did not exist.
+func (c *RedisSharedParamCache) Start(_ context.Context) error {
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.closed {
-		c.mu.Unlock()
 		return fmt.Errorf("cache is closed")
 	}
 
-	ctx, c.cancelFn = context.WithCancel(ctx)
-	c.mu.Unlock()
-
-	// Subscribe to cache invalidation events
-	c.wg.Add(1)
-	go c.subscribeToInvalidations(ctx)
-
 	c.logger.Info().Msg("shared param cache started")
 	return nil
-}
-
-// subscribeToInvalidations listens for cache invalidation events from other instances.
-func (c *RedisSharedParamCache) subscribeToInvalidations(ctx context.Context) {
-	defer c.wg.Done()
-
-	channel := c.config.PubSubPrefix + ":invalidate:params"
-	pubsub := c.redisClient.Subscribe(ctx, channel)
-	defer func() { _ = pubsub.Close() }()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case msg := <-pubsub.Channel():
-			// Parse the height from the message
-			var height int64
-			if _, err := fmt.Sscanf(msg.Payload, "%d", &height); err != nil {
-				c.logger.Warn().Err(err).Str("payload", msg.Payload).Msg("invalid invalidation message")
-				continue
-			}
-
-			// Clear local cache for this height
-			key := c.keys.SharedParams(height)
-			c.localCache.Delete(key)
-			cacheInvalidations.WithLabelValues("shared_params", "pubsub").Inc()
-		}
-	}
 }
 
 // GetSharedParams returns the shared module parameters for the given block height.
@@ -165,11 +138,11 @@ func (c *RedisSharedParamCache) GetSharedParams(ctx context.Context, height int6
 	}
 	c.mu.RUnlock()
 
-	key := c.keys.SharedParams(height)
+	key := c.redisClient.KB().ParamsSharedAtHeightKey(height)
 
 	// L1: Check local cache (fresh within the TTL floor only).
-	if cached, ok := c.localCache.Load(key); ok {
-		if e, ok := cached.(sharedParamLocalEntry); ok && time.Since(e.cachedAt) < sharedParamsLocalTTL {
+	if e, ok := c.localCache.Load(key); ok {
+		if time.Since(e.cachedAt) < sharedParamsLocalTTL {
 			cacheHits.WithLabelValues("shared_params", CacheLevelL1).Inc()
 			cacheGetLatency.WithLabelValues("shared_params", CacheLevelL1).Observe(time.Since(start).Seconds())
 			return e.params, nil
@@ -208,11 +181,19 @@ func (c *RedisSharedParamCache) GetSharedParams(ctx context.Context, height int6
 
 // queryAndCacheParams queries the chain and caches the result.
 // Uses distributed locking to prevent thundering herd.
+//
+// The chain read MUST be GetParamsAtHeight(height), not GetParams(): the cache is
+// keyed by height and the entry is shared over Redis with every other replica.
+// Reading live params and storing them under a past height's key both returns the
+// wrong answer to the caller AND poisons that key fleet-wide until its TTL lapses.
+// (For the latest height the two are equivalent, which is why this was invisible
+// while GetLatestSharedParams was the only caller.)
 func (c *RedisSharedParamCache) queryAndCacheParams(ctx context.Context, height int64, key string) (*sharedtypes.Params, error) {
-	lockKey := c.keys.SharedParamsLock(height)
+	lockKey := c.redisClient.KB().ParamsSharedAtHeightLockKey(height)
 
 	// Try to acquire lock
-	locked, err := c.redisClient.SetNX(ctx, lockKey, "1", c.config.LockTimeout).Result()
+	lockToken := newLockToken()
+	locked, err := c.redisClient.SetNX(ctx, lockKey, lockToken, c.config.LockTimeout).Result()
 	if err != nil {
 		return nil, fmt.Errorf("failed to acquire lock: %w", err)
 	}
@@ -220,7 +201,7 @@ func (c *RedisSharedParamCache) queryAndCacheParams(ctx context.Context, height 
 	if locked {
 		// We got the lock - query chain
 		lockAcquisitions.WithLabelValues("shared_params", "acquired").Inc()
-		defer c.redisClient.Del(ctx, lockKey)
+		defer releaseCacheLock(ctx, c.redisClient, lockKey, lockToken)
 
 		chainQueries.WithLabelValues("shared_params").Inc()
 		chainStart := time.Now()
@@ -262,7 +243,8 @@ func (c *RedisSharedParamCache) queryAndCacheParams(ctx context.Context, height 
 		}
 	}
 
-	// Still not available - query chain directly
+	// Still not available - query chain directly at the requested height.
+	// Deliberately not cached: the lock holder owns populating this key.
 	params, fallbackErr := c.sharedClient.GetParamsAtHeight(ctx, height)
 	if fallbackErr != nil {
 		chainQueryErrors.WithLabelValues("shared_params").Inc()
@@ -279,35 +261,6 @@ func (c *RedisSharedParamCache) GetLatestSharedParams(ctx context.Context) (*sha
 	return c.GetSharedParams(ctx, latestBlock.Height())
 }
 
-// InvalidateSharedParams invalidates the cached shared params for a specific height.
-func (c *RedisSharedParamCache) InvalidateSharedParams(ctx context.Context, height int64) error {
-	c.mu.RLock()
-	if c.closed {
-		c.mu.RUnlock()
-		return fmt.Errorf("cache is closed")
-	}
-	c.mu.RUnlock()
-
-	key := c.keys.SharedParams(height)
-
-	// Clear L1
-	c.localCache.Delete(key)
-
-	// Clear L2
-	if err := c.redisClient.Del(ctx, key).Err(); err != nil {
-		return fmt.Errorf("failed to delete from Redis: %w", err)
-	}
-
-	// Notify other instances
-	channel := c.config.PubSubPrefix + ":invalidate:params"
-	if err := c.redisClient.Publish(ctx, channel, fmt.Sprintf("%d", height)).Err(); err != nil {
-		c.logger.Warn().Err(err).Msg("failed to publish invalidation")
-	}
-
-	cacheInvalidations.WithLabelValues("shared_params", "manual").Inc()
-	return nil
-}
-
 // WarmupFromRedis populates L1 cache from Redis for the latest block height.
 // Since shared params are indexed by height, we warm up the most recent params
 // which are most likely to be queried on startup.
@@ -319,7 +272,7 @@ func (c *RedisSharedParamCache) WarmupFromRedis(ctx context.Context) error {
 	height := latestBlock.Height()
 
 	// Try to load from Redis into L1
-	key := c.keys.SharedParams(height)
+	key := c.redisClient.KB().ParamsSharedAtHeightKey(height)
 	data, err := c.redisClient.Get(ctx, key).Bytes()
 	if err != nil {
 		if err == redis.Nil {
@@ -354,12 +307,6 @@ func (c *RedisSharedParamCache) Close() error {
 	}
 
 	c.closed = true
-
-	if c.cancelFn != nil {
-		c.cancelFn()
-	}
-
-	c.wg.Wait()
 
 	c.logger.Info().Msg("shared param cache closed")
 	return nil

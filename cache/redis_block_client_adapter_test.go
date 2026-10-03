@@ -111,12 +111,19 @@ func TestPublishToSubscribers_DropsWhenSubscriberFull(t *testing.T) {
 	}
 }
 
+// TestPublishToSubscribers_DropIsLoud verifies the fan-out drop is no longer
+// silent: when a subscriber's buffer is full, dropping the event must bump the
+// block_events_dropped_total{channel="fanout"} counter. A silent drop here is
+// exactly what hid the claim/proof-window stall at high supplier counts, so the
+// metric is the signal that makes a wedged subscriber visible.
 func TestPublishToSubscribers_DropIsLoud(t *testing.T) {
 	a := newBareAdapter(t)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 
+	// Single-slot buffer that we never drain: the first publish fills it, the
+	// second must drop (and count).
 	ch := a.Subscribe(ctx, 1)
 	require.NotNil(t, ch)
 
@@ -126,40 +133,27 @@ func TestPublishToSubscribers_DropIsLoud(t *testing.T) {
 	a.publishToSubscribers(&BlockEvent{Height: 2, Hash: []byte{0x00}, Timestamp: time.Unix(0, 0)})
 
 	after := testutil.ToFloat64(blockEventsDropped.WithLabelValues("fanout"))
-	assert.Equal(t, float64(1), after-before)
+	assert.Equal(t, float64(1), after-before, "exactly one fan-out drop must be counted")
 }
 
-func TestSubscribe_ContextCancelRemovesSubscriber(t *testing.T) {
-	a := newBareAdapter(t)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	ch := a.Subscribe(ctx, 1)
-	require.NotNil(t, ch)
-	require.Len(t, a.subscribers, 1)
-
-	cancel()
-
-	require.Eventually(t, func() bool {
-		a.subscribersMu.RLock()
-		defer a.subscribersMu.RUnlock()
-		return len(a.subscribers) == 0
-	}, time.Second, 10*time.Millisecond)
-
-	_, open := <-ch
-	require.False(t, open, "subscriber channel must be closed after context cancellation")
-
-	before := testutil.ToFloat64(blockEventsDropped.WithLabelValues("fanout"))
-	a.publishToSubscribers(&BlockEvent{Height: 10, Hash: []byte{0x01}, Timestamp: time.Unix(0, 0)})
-	after := testutil.ToFloat64(blockEventsDropped.WithLabelValues("fanout"))
-	assert.Equal(t, before, after, "removed subscribers must not count as dropped fan-out events")
-}
-
+// TestBlockEvents_GuardGatesForwarding locks in the discard-when-no-consumer
+// guard: a fresh adapter must NOT forward to blockEventsCh (so it never fills on
+// a process — the miner — that never wires BlockEvents()), and calling
+// BlockEvents() must flip the flag on so a real consumer (the relayer) starts
+// receiving.
 func TestBlockEvents_GuardGatesForwarding(t *testing.T) {
 	a := newBareAdapter(t)
 
-	assert.False(t, a.blockEventsRequested.Load())
+	assert.False(t, a.blockEventsRequested.Load(),
+		"fresh adapter must treat BlockEvents() as having no consumer (discard on arrival)")
+
+	// (newBareAdapter does not init blockEventsCh, so the returned channel is nil
+	// here; the flag flip is what this test pins.)
 	_ = a.BlockEvents()
-	assert.True(t, a.blockEventsRequested.Load())
+	assert.True(t, a.blockEventsRequested.Load(),
+		"calling BlockEvents() must mark a consumer so the event loop starts forwarding")
+
+	// Idempotent: a consumer loop re-evaluates BlockEvents() every iteration.
 	_ = a.BlockEvents()
 	assert.True(t, a.blockEventsRequested.Load())
 }

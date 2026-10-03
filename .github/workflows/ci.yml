@@ -1,24 +1,65 @@
 name: CI
 
 on:
+  # main and develop only. A topic branch is covered by pull_request below, and
+  # firing BOTH events for it is what produced a red X on green work: the two
+  # runs share a concurrency group, so one gets cancelled, and GitHub attaches
+  # the cancelled run's jobs to the PR's check list where they count as
+  # non-success. Measured on PR #37: 8 passing jobs from the pull_request run,
+  # plus 2 that finished and 6 that were cancelled from the push run -- the
+  # "10 successful, 6 cancelled" a reviewer sees, with nothing having failed.
   push:
     branches: ["main", "develop"]
+  # This filter matches the BASE branch. A PR stacked on another topic branch
+  # never matched ["main", "develop"], so seven of the eleven stacked PRs ran no
+  # CI at all and nobody noticed; the patterns below are what fixed that, and
+  # they are the half that matters.
   pull_request:
-    branches: ["main", "develop"]
+    branches: ["main", "develop", "chore/**", "feat/**", "fix/**"]
+  # Lets CI be re-run on any branch on demand, including a topic branch that has
+  # no PR yet:
+  #   gh workflow run CI --ref <branch>
+  # GitHub reads this trigger from the DEFAULT branch only, which is why this
+  # change has to land on main to have any effect anywhere else.
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+# Collapses SUCCESSIVE pushes to the same pull request, so only the newest run
+# survives. It no longer has to collapse a push run against a pull_request run
+# for the same commit -- the triggers above stop that pair from existing, which
+# is the point: a cancelled run is indistinguishable from a failed one on the
+# PR page. Both sides still name the branch the same way (github.ref_name is
+# "chore/x" on a push, matching head.ref on the pull_request; github.ref would
+# be "refs/heads/chore/x" and land in a second group).
+#
+# main never cancels: a run there is the record for a commit that is already
+# merged, and losing it to a later push leaves that commit unverified.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.head.ref || github.ref_name }}
+  cancel-in-progress: ${{ github.ref_name != 'main' }}
+
 jobs:
+  tracked-files:
+    name: Tracked Files
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Check no local-only files are tracked
+        run: ./scripts/check-tracked-files.sh
+
   lint:
     name: Lint
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
           go-version: "1.26.5"
           cache: true
@@ -33,10 +74,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
           go-version: "1.26.5"
           cache: true
@@ -52,42 +93,118 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
+    env:
+      # The runner is discarded after the job, and every container with it, so
+      # the testcontainers reaper protects nothing here; waiting for it to
+      # report ready failed a run on its own. Off CI it stays required
+      # (internal/testredis/exclusive.go).
+      TESTCONTAINERS_RYUK_DISABLED: "true"
+    services:
+      # Real Redis, because miniredis is not Redis where it matters. The
+      # XREADGROUP BLOCK semantics that hung shutdown behave differently in the
+      # fake, which is exactly why nothing caught that bug: tests that assert on
+      # blocking, PEL ageing or eviction have to run against the real server.
+      redis:
+        image: redis:8.10.1-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
           go-version: "1.26.5"
           cache: true
 
       - name: Run tests
         run: make test
+        env:
+          # The service above, not the gate's own container: CI has no Tilt
+          # fleet to collide with, so the mapped 6379 is fine here.
+          REDIS_TEST_URL: redis://127.0.0.1:6379
 
       - name: Run tests with coverage
         run: make test-coverage
+        env:
+          REDIS_TEST_URL: redis://127.0.0.1:6379
 
       - name: Upload coverage reports
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v7
         with:
-          file: ./coverage.out
+          files: ./coverage.out
           flags: unittests
           name: codecov-umbrella
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+  # CONTRIBUTING.md calls the race detector Rule #1 and says it cannot be broken.
+  # Until this job existed the rule was declared but never executed here: `make
+  # test` and `make test-coverage` do not pass -race, and the only target that
+  # did (`test_miner`) covered ./miner/... alone and was never invoked by CI.
+  #
+  # Kept as its own job rather than a step in `test`: -race roughly doubles the
+  # runtime, and a separate job runs it in parallel with the others instead of
+  # serialising it behind the coverage run.
+  race:
+    name: Race Detector
+    runs-on: ubuntu-latest
+    env:
+      # The runner is discarded after the job, and every container with it, so
+      # the testcontainers reaper protects nothing here; waiting for it to
+      # report ready failed a run on its own. Off CI it stays required
+      # (internal/testredis/exclusive.go).
+      TESTCONTAINERS_RYUK_DISABLED: "true"
+    services:
+      # Real Redis, because miniredis is not Redis where it matters. The
+      # XREADGROUP BLOCK semantics that hung shutdown behave differently in the
+      # fake, which is exactly why nothing caught that bug: tests that assert on
+      # blocking, PEL ageing or eviction have to run against the real server.
+      redis:
+        image: redis:8.10.1-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: "1.26.5"
+          cache: true
+
+      - name: Run tests under the race detector
+        run: ./scripts/gates/race.sh
+        env:
+          # Set, so the gate reuses the service above instead of starting a
+          # container of its own.
+          REDIS_TEST_URL: redis://127.0.0.1:6379
 
   build:
     name: Build
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
           go-version: "1.26.5"
           cache: true
@@ -104,12 +221,12 @@ jobs:
     needs: [lint, fmt, test]
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Extract version metadata
         id: meta
@@ -122,7 +239,7 @@ jobs:
           echo "build_date=${BUILD_DATE}" >> $GITHUB_OUTPUT
 
       - name: Build Docker image (AMD64)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           push: false
@@ -141,12 +258,12 @@ jobs:
     needs: [lint, fmt, test]
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Extract version metadata
         id: meta
@@ -159,7 +276,7 @@ jobs:
           echo "build_date=${BUILD_DATE}" >> $GITHUB_OUTPUT
 
       - name: Build Docker image (ARM64)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           push: false

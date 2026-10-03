@@ -7,6 +7,8 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
+
+	"github.com/pokt-network/pocket-relay-miner/logging"
 )
 
 // TestMinerRegistry tests that MinerRegistry is initialized.
@@ -361,4 +363,38 @@ func TestFactory_WithPrefix(t *testing.T) {
 		}
 	}
 	require.True(t, found, "Metric should have prefix")
+}
+
+// TestPanicRecoveriesTotal_ServedBySharedRegistry pins that the panic
+// counter is actually scrapeable: it used to live in the prometheus DEFAULT
+// registry, which no binary in this repo serves, so every recovered panic
+// incremented a counter nobody could ever see.
+func TestPanicRecoveriesTotal_ServedBySharedRegistry(t *testing.T) {
+	logging.PanicRecoveriesTotal.WithLabelValues("registry_test").Inc()
+
+	families, err := SharedRegistry.Gather()
+	require.NoError(t, err)
+	for _, fam := range families {
+		if fam.GetName() == "ha_panic_recoveries_total" {
+			return
+		}
+	}
+	t.Fatal("ha_panic_recoveries_total is not served by the shared registry")
+}
+
+// TestLogMessagesDroppedTotal_ServedBySharedRegistry pins that the async
+// log writer's drop counter is scrapeable: the diode callback also writes
+// to stderr, but stderr is invisible to Prometheus — if this metric fell
+// out of the shared registry, log loss under load could not be alerted on.
+func TestLogMessagesDroppedTotal_ServedBySharedRegistry(t *testing.T) {
+	logging.LogMessagesDroppedTotal.Add(1)
+
+	families, err := SharedRegistry.Gather()
+	require.NoError(t, err)
+	for _, fam := range families {
+		if fam.GetName() == "ha_log_messages_dropped_total" {
+			return
+		}
+	}
+	t.Fatal("ha_log_messages_dropped_total is not served by the shared registry")
 }

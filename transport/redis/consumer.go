@@ -3,8 +3,10 @@ package redis
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -15,58 +17,111 @@ import (
 
 var _ transport.MinedRelayConsumer = (*StreamsConsumer)(nil)
 
-// streamsReadBlockTimeout bounds how long an idle XREADGROUP may hold its
-// connection before returning redis.Nil. go-redis/v9 does not reliably abort an
-// already-blocked Redis read solely because the caller context was cancelled.
-// A finite server-side BLOCK therefore guarantees that Close can make progress.
+// blockInterval bounds how long an idle XREADGROUP waits before returning
+// redis.Nil so the loop can look at ctx.Done(). It is NOT a polling interval:
+// the read still returns the instant a relay arrives, so nothing about delivery
+// latency depends on this number. It is the upper bound on how long Close()
+// waits for the read loop to notice it should stop, so it is chosen small
+// enough to sit well inside a Kubernetes termination grace period and large
+// enough that an idle supplier's stream is not woken up for nothing.
+// A var, not a const, only so a test can shrink it: nothing in production
+// writes it.
+var blockInterval = 5 * time.Second
+
+// pendingPageSize bounds one XPENDING page during a reclaim scan.
 //
-// This remains push-based: Redis returns immediately when a relay is available;
-// the timeout only adds one idle command wake-up per consumer per second.
-const streamsReadBlockTimeout = time.Second
+// It is ONE constant on purpose. The page size and the "this was the last page"
+// test must agree: a COUNT larger than the termination threshold loops forever,
+// and a COUNT smaller than it stops the drain early, stranding pending entries
+// until the next tick -- silent relay loss with the shape of issue #25. They
+// used to be two independent literals.
+const pendingPageSize = 50
+
+// reapIdleMultiplier scales ClaimIdleTimeout into the silence a consumer record
+// must show before it is deleted.
+//
+// The reclaim already rescues a dead pod's deliveries after ONE ClaimIdleTimeout,
+// so by the time this threshold is reached the record is expected to be an empty
+// shell. The multiple buys margin for a consumer that is merely slow rather than
+// dead: deleting one that is about to act would destroy its pending entries, and
+// XGROUP DELCONSUMER offers no conditional form.
+const reapIdleMultiplier = 10
+
+// isStreamNotFoundError reports whether a Redis error indicates the stream (or
+// its consumer group) does not exist yet. Redis surfaces this as a "no such
+// key" error for missing keys and a "NOGROUP" error when the stream/group is
+// absent for group operations (XREADGROUP, XPENDING, XCLAIM, etc.).
+func isStreamNotFoundError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "no such key") || strings.Contains(msg, "NOGROUP")
+}
 
 // StreamsConsumer implements MinedRelayConsumer using Redis Streams with consumer groups.
 // It provides exactly-once delivery semantics within the consumer group.
-// PUSH architecture: a bounded BLOCK keeps zero delivery latency when data arrives
-// while guaranteeing an idle read periodically returns so shutdown can observe
-// context cancellation.
-// - Each consumer holds 1 connection while waiting on XREADGROUP
-// - Pool sizing: Allocate numSuppliers + 20 overhead for cache/pubsub
-// - Claims = money - the BLOCK timeout does not delay available messages
-// - Idle reads wake periodically to make shutdown bounded under go-redis/v9.
+// Push architecture: the blocking read returns the instant data arrives.
+//   - Each consumer holds 1 connection while parked on XREADGROUP
+//   - Pool sizing: Allocate numSuppliers + 20 overhead for cache/pubsub
+//   - A cancelled context does NOT interrupt a blocked call; the block
+//     elapsing is what lets the loop see it (see blockInterval)
+//   - Claims = money - we cannot afford ANY latency consuming relays.
 type StreamsConsumer struct {
 	logger     logging.Logger
 	client     redis.UniversalClient
 	config     transport.ConsumerConfig
 	streamName string // Single stream per supplier: ha:relays:{supplierAddr}
 
+	// ownPendingAfter and ownPendingDone are the read loop's progress through
+	// the entries pending under this consumer's name when it started (see
+	// deliverOwnPending). Only the read loop's goroutine touches them.
+	ownPendingAfter string
+	ownPendingDone  bool
+
+	// largestEntry is the biggest `data` field read lately, decaying slowly
+	// (see noteLargestEntry); zero until the first read. Atomic because the
+	// reclaim sizes its pages from it on another goroutine.
+	largestEntry atomic.Int64
+
+	// channelBytes is the relay bytes parsed and waiting in msgCh, the value
+	// consumer_channel_bytes shows, kept here so the read can size itself and
+	// a producer can wait while it is at readBudgetBytes (send).
+	channelBytes atomic.Int64
+
+	// sendWaitHook is nil in production; a test sets it before Consume to
+	// learn that a producer is waiting in send.
+	sendWaitHook func()
+
+	// space is signalled, without blocking, each time a relay leaves msgCh
+	// (MarkDelivered), to wake a producer waiting in send. One slot: a signal
+	// sent while nobody waits is kept for the next waiter, so none is lost.
+	space chan struct{}
+
 	// Message channel
 	msgCh chan transport.StreamMessage
 
-	// Claiming rate limit (prevent excessive claiming when stream is idle)
-	lastClaimTime time.Time
-	claimMu       sync.Mutex
+	// health, when set, pauses reading and reclaiming while Redis cannot take
+	// writes: entries stay in the stream and in the PEL, unacked and undeleted.
+	health *StoreHealth
+
+	// pause, when set, holds reading and reclaiming while it is Paused, for a
+	// condition of the process rather than of Redis.
+	pause IngestionPause
 
 	// Lifecycle management
 	mu       sync.RWMutex
 	closed   bool
 	cancelFn context.CancelFunc
 	wg       sync.WaitGroup
-
-	// xackDelFallbackOnce logs at most once when Redis does not support XACKDEL
-	// or rejects it. The fallback path uses XACK + XDEL, preserving the intended
-	// post-processing cleanup without spamming logs on every relay.
-	xackDelFallbackOnce sync.Once
 }
 
 // NewStreamsConsumer creates a new Redis Streams consumer.
-// XREADGROUP uses a short bounded BLOCK for zero-latency delivery of available
-// messages plus deterministic idle shutdown.
-// The discoveryInterval parameter is ignored (kept for API compatibility).
+// Push architecture: the blocking read delivers with no polling delay.
 func NewStreamsConsumer(
 	logger logging.Logger,
 	client redis.UniversalClient,
 	config transport.ConsumerConfig,
-	discoveryInterval time.Duration, // Ignored - kept for API compatibility
 ) (*StreamsConsumer, error) {
 	if config.StreamPrefix == "" {
 		return nil, fmt.Errorf("stream prefix is required")
@@ -82,7 +137,8 @@ func NewStreamsConsumer(
 	}
 
 	// Set defaults - VERY AGGRESSIVE for minimal latency
-	// TRUE PUSH: BLOCK 0 returns instantly when data arrives, holds connection when empty
+	// The blocking read returns instantly when data arrives, and holds the
+	// connection while the stream is empty.
 	// Claims = money, we cannot afford to be slow consuming relays
 	if config.BatchSize <= 0 {
 		config.BatchSize = 5000 // Large batch for throughput
@@ -91,12 +147,13 @@ func NewStreamsConsumer(
 	if config.ClaimIdleTimeout <= 0 {
 		config.ClaimIdleTimeout = 30000 // 30 seconds for claiming idle messages
 	}
-	if config.MaxRetries <= 0 {
-		config.MaxRetries = 3
-	}
 
-	// Channel buffer: 5000 messages to match batch size for smooth pipelining
-	channelBufferSize := int64(5000)
+	// Channel buffer: 5000 messages by default to match batch size for smooth
+	// pipelining; configurable for tests and constrained deployments.
+	channelBufferSize := config.ChannelBufferSize
+	if channelBufferSize <= 0 {
+		channelBufferSize = 5000
+	}
 
 	// Single stream per supplier (simplified architecture)
 	streamName := transport.SupplierStreamName(config.StreamPrefix, config.SupplierOperatorAddress)
@@ -107,6 +164,7 @@ func NewStreamsConsumer(
 		config:     config,
 		streamName: streamName,
 		msgCh:      make(chan transport.StreamMessage, channelBufferSize),
+		space:      make(chan struct{}, 1),
 	}, nil
 }
 
@@ -123,10 +181,43 @@ func (c *StreamsConsumer) Consume(ctx context.Context) <-chan transport.StreamMe
 	ctx, c.cancelFn = context.WithCancel(ctx)
 	c.mu.Unlock()
 
-	// Start consumer goroutine - consumer group creation happens in connectFn
-	// with proper exponential backoff retry via ReconnectionLoop
+	// Two producer goroutines feed msgCh: the blocking read loop and the
+	// reclaim ticker. The channel is closed by a third goroutine only after
+	// BOTH producers have returned — closing it from either producer would
+	// race the other's in-flight send (send on a closed channel panics and
+	// takes the whole process down).
+	producers := &sync.WaitGroup{}
+	producers.Add(2)
+
+	// Consumer group creation happens in connectFn with proper exponential
+	// backoff retry via ReconnectionLoop.
 	c.wg.Add(1)
-	go c.consumeLoop(ctx)
+	go func() {
+		defer c.wg.Done()
+		defer producers.Done()
+		c.consumeLoop(ctx)
+	}()
+
+	// Reclaim on a timer of its own. It used to be triggered only by XReadGroup
+	// returning redis.Nil, which the then-infinite block made impossible on a
+	// real server, so it was unreachable: a relay
+	// delivered to a consumer whose pod died before acking sat in that dead
+	// consumer's PEL forever, and its supplier's whole claim silently vanished
+	// (issue #25). The ticker runs regardless of what the read loop is doing,
+	// and it is the only trigger.
+	c.wg.Add(1)
+	go func() {
+		defer c.wg.Done()
+		defer producers.Done()
+		c.reclaimLoop(ctx)
+	}()
+
+	c.wg.Add(1)
+	go func() {
+		defer c.wg.Done()
+		producers.Wait()
+		close(c.msgCh)
+	}()
 
 	c.logger.Info().
 		Str("stream", c.streamName).
@@ -149,13 +240,104 @@ func (c *StreamsConsumer) ensureConsumerGroup(ctx context.Context) error {
 	return nil
 }
 
+// reclaimLoop periodically recovers messages stuck in dead consumers' PELs.
+// It runs as a producer on msgCh alongside consumeLoop; the channel close is
+// owned by the coordinator in Consume, never by either producer.
+//
+// It sweeps as soon as it starts and then every quarter of the idle timeout.
+// The first sweep used to come one full idle timeout after start, so a consumer
+// that lived less than that -- a supplier claimed and released every ~32 s, as
+// the L3 of df5441c saw on 2026-09-11 -- never swept at all, and entries it
+// released (unowned, by XNACK) waited for whoever outlived the timeout.
+// Sweeping more often takes nothing younger: the sweep itself only claims
+// entries idle past ClaimIdleTimeout. Reaping dead consumers stays on the full
+// timeout.
+// SetStoreHealth pauses this consumer while health says Redis cannot take writes.
+// Call it before Consume.
+func (c *StreamsConsumer) SetStoreHealth(health *StoreHealth) {
+	c.health = health
+}
+
+// IngestionPause holds a consumer's reads while Paused. PauseChanged returns a
+// channel closed the next time Paused may have changed.
+type IngestionPause interface {
+	Paused() bool
+	PauseChanged() <-chan struct{}
+}
+
+// SetIngestionPause holds this consumer's reads and reclaims while pause is
+// Paused. Call it before Consume.
+func (c *StreamsConsumer) SetIngestionPause(pause IngestionPause) {
+	c.pause = pause
+}
+
+// operable reports whether the consumer may read: Redis can take writes and
+// nothing holds ingestion.
+func (c *StreamsConsumer) operable() bool {
+	return c.health.Operable() && (c.pause == nil || !c.pause.Paused())
+}
+
+// waitOperable returns once Redis can take writes and nothing holds ingestion,
+// or with ctx's error. Reading is not refused under maxmemory, but what the
+// miner does with a read relay is a write, so reading while full only moves
+// relays from the stream into a PEL they cannot leave.
+func (c *StreamsConsumer) waitOperable(ctx context.Context) error {
+	for {
+		changed := c.health.Changed()
+		var pauseChanged <-chan struct{}
+		if c.pause != nil {
+			pauseChanged = c.pause.PauseChanged()
+		}
+		if c.operable() {
+			return nil
+		}
+		select {
+		case <-changed:
+		case <-pauseChanged:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+func (c *StreamsConsumer) reclaimLoop(ctx context.Context) {
+	idle := time.Duration(c.config.ClaimIdleTimeout) * time.Millisecond
+
+	// The read loop creates the group too, on its own goroutine, and may not
+	// have yet: a sweep against a missing group fails as "stream not found",
+	// which claimPendingMessages skips in silence, so the first sweep would do
+	// nothing. Creating it is idempotent.
+	if err := c.ensureConsumerGroup(ctx); err != nil && ctx.Err() == nil {
+		c.logger.Debug().Err(err).Msg("failed to ensure consumer group before the first reclaim sweep")
+	}
+	if c.operable() {
+		c.claimPendingMessages(ctx)
+	}
+
+	sweep := time.NewTicker(idle / 4)
+	defer sweep.Stop()
+	reap := time.NewTicker(idle)
+	defer reap.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-sweep.C:
+			if c.operable() {
+				c.claimPendingMessages(ctx)
+			}
+		case <-reap.C:
+			if c.health.Operable() {
+				c.reapDeadConsumers(ctx)
+			}
+		}
+	}
+}
+
 // consumeLoop is the main consumption loop with automatic reconnection.
 // This wraps the message consumption with exponential backoff reconnection,
 // matching the pattern in client/block_subscriber.go:145-194
 func (c *StreamsConsumer) consumeLoop(ctx context.Context) {
-	defer c.wg.Done()
-	defer close(c.msgCh)
-
 	// Create reconnection loop
 	reconnectLoop := NewReconnectionLoop(
 		c.logger,
@@ -166,8 +348,12 @@ func (c *StreamsConsumer) consumeLoop(ctx context.Context) {
 		func(ctx context.Context) error {
 			return c.ensureConsumerGroup(ctx)
 		},
-		// runFn: Consume messages until error or context cancellation
+		// runFn: hand over what is already pending under this consumer's
+		// name, once, then consume new messages until error or cancellation
 		func(ctx context.Context) error {
+			if err := c.deliverOwnPending(ctx); err != nil {
+				return err
+			}
 			return c.consumeMessagesUntilError(ctx)
 		},
 	)
@@ -178,48 +364,56 @@ func (c *StreamsConsumer) consumeLoop(ctx context.Context) {
 
 // consumeMessagesUntilError runs the message consumption loop until an error occurs.
 // Returns error to trigger reconnection via the reconnection loop.
-// PUSH SEMANTICS: Uses a finite server-side BLOCK.
-// - Returns INSTANTLY when data arrives (zero delivery latency)
-// - Wakes once per streamsReadBlockTimeout while idle
-// - After each wake, observes context cancellation and exits cleanly
+// The read blocks for blockInterval, then returns redis.Nil and loops.
+//   - Returns INSTANTLY when data arrives (zero latency)
+//   - Blocks for blockInterval when the stream is empty (no polling, and no
+//     indefinite park either)
+//   - A cancelled context is seen when that block elapses, NOT when it is
+//     cancelled: go-redis sets no read deadline from it
 //
-// Do not use BLOCK 0 here. go-redis/v9 can remain blocked in the socket read
-// after context cancellation, which previously pinned StreamsConsumer.Close()
-// and therefore whole-miner shutdown until systemd killed the process.
+// This is the most efficient approach - no polling, pure push.
 func (c *StreamsConsumer) consumeMessagesUntilError(ctx context.Context) error {
 	for {
-		// Keep the read server-blocking for push delivery, but give Redis a finite
-		// deadline. An idle timeout returns redis.Nil; the next loop iteration
-		// observes ctx cancellation before issuing another blocking read.
+		if err := c.waitOperable(ctx); err != nil {
+			return err
+		}
+		// Still push, not polling: the read returns the INSTANT data arrives, so
+		// delivery latency is unchanged by the block interval. The interval only
+		// bounds how long an IDLE read sits there.
+		//
+		// It is not zero, and cancelling the context is not what ends it.
+		// Verified against go-redis v9.17.2: for a blocking command, cmdTimeout
+		// returns 0 (redis.go:751); the context handed to the reader is
+		// context.Background() unless ContextTimeoutEnabled is set, which
+		// defaults to false (redis.go:764); and deadline(Background, 0) returns
+		// noDeadline (internal/pool/conn.go). So BLOCK 0 sets NO read deadline
+		// at all and the socket read blocks until Redis says something --
+		// Close() would cancel the context, then hang in wg.Wait() until a
+		// relay happened to arrive. On an idle supplier that is until
+		// Kubernetes runs out of grace and SIGKILLs the pod.
+		//
+		// Each blocked call holds one connection from the pool.
+		count := c.readCount()
+		consumerReadRequestedCount.WithLabelValues(c.config.SupplierOperatorAddress).Set(float64(count))
 		streams, err := c.client.XReadGroup(ctx, &redis.XReadGroupArgs{
 			Group:    c.config.ConsumerGroup,
 			Consumer: c.config.ConsumerName,
 			Streams:  []string{c.streamName, ">"},
-			Count:    c.config.BatchSize,
-			Block:    streamsReadBlockTimeout,
+			Count:    count,
+			Block:    blockInterval,
 		}).Result()
-
 		if err != nil {
-			// A finite BLOCK may return redis.Nil at the same time shutdown cancels
-			// the context, so always prefer the lifecycle signal.
+			// The block elapsing is how a cancelled context becomes visible.
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
 
 			if err == redis.Nil {
-				// Normal idle wake-up. Use it as the opportunity to periodically
-				// inspect pending messages without turning the consumer into polling.
-				c.claimMu.Lock()
-				timeSinceLastClaim := time.Since(c.lastClaimTime)
-				shouldClaim := timeSinceLastClaim >= time.Duration(c.config.ClaimIdleTimeout)*time.Millisecond
-				if shouldClaim {
-					c.lastClaimTime = time.Now()
-				}
-				c.claimMu.Unlock()
-
-				if shouldClaim {
-					c.claimPendingMessages(ctx)
-				}
+				// The block elapsed with no messages. Nothing to do: reclaim
+				// runs on its own ticker (reclaimLoop), so this branch does not
+				// need to trigger it -- gating reclaim on this read is exactly
+				// the bug 8e3c66d fixed, and it could not fire at all while the
+				// block was infinite.
 				continue
 			}
 
@@ -239,7 +433,9 @@ func (c *StreamsConsumer) consumeMessagesUntilError(ctx context.Context) error {
 			}
 
 			consumeErrorsTotal.WithLabelValues(c.config.SupplierOperatorAddress, "read_error").Inc()
-			c.logger.Error().Err(err).Msg("error reading from stream")
+			// Per-iteration under a Redis outage; the outage state is logged
+			// by the reconnection loop this return feeds into.
+			c.logger.Debug().Err(err).Msg("error reading from stream")
 			return err
 		}
 
@@ -248,17 +444,24 @@ func (c *StreamsConsumer) consumeMessagesUntilError(ctx context.Context) error {
 			continue
 		}
 
+		replyBytes := consumerReadReplyBytes.WithLabelValues(c.config.SupplierOperatorAddress)
+		total, largest := payloadStats(streams[0].Messages)
+		replyBytes.Set(float64(total))
+		c.noteLargestEntry(largest)
 		for _, message := range streams[0].Messages {
 			msg, parseErr := c.parseMessage(message, c.streamName)
 			if parseErr != nil {
 				deserializationErrors.WithLabelValues(c.config.SupplierOperatorAddress).Inc()
-				c.logger.Error().
+				// Warn, not Error: the message is ACKed and deleted (handled),
+				// but a malformed message signals a producer bug or version
+				// skew worth seeing without debug logging on.
+				c.logger.Warn().
 					Err(parseErr).
 					Str(logging.FieldMessageID, message.ID).
 					Msg("failed to parse message")
 				// Acknowledge AND delete bad message to avoid redelivery and keep stream clean
-				if err := c.ackDeleteMessages(ctx, c.streamName, message.ID); err != nil {
-					c.logger.Warn().Err(err).Str(logging.FieldMessageID, message.ID).Msg("failed to XAckDel bad message")
+				if err := c.client.XAckDel(ctx, c.streamName, c.config.ConsumerGroup, "DELREF", message.ID).Err(); err != nil {
+					c.logger.Debug().Err(err).Str(logging.FieldMessageID, message.ID).Msg("failed to XAckDel bad message")
 				}
 				continue
 			}
@@ -286,71 +489,383 @@ func (c *StreamsConsumer) consumeMessagesUntilError(ctx context.Context) error {
 				msg.Message.ServiceId,
 			).Inc()
 
-			// Send to channel (blocks if channel is full)
-			select {
-			case c.msgCh <- msg:
-			case <-ctx.Done():
-				return ctx.Err()
+			if err := c.send(ctx, msg); err != nil {
+				replyBytes.Set(0)
+				return err
 			}
 		}
+		replyBytes.Set(0)
 	}
 }
 
-// claimPendingMessages claims messages that have been pending too long.
-// This is only called when normal XREADGROUP consumption returns no new messages (idle state).
-// It recovers messages from consumers that crashed without acknowledging.
-func (c *StreamsConsumer) claimPendingMessages(ctx context.Context) {
-	// Claim idle messages from the single supplier stream
-	messages, _, err := c.client.XAutoClaim(ctx, &redis.XAutoClaimArgs{
+// claimIdleFromOtherConsumers returns one page of pending entries that belong
+// to OTHER consumers and have been idle past ClaimIdleTimeout, reassigned to
+// this consumer, plus the cursor to continue from ("0-0" when the scan is
+// done).
+//
+// It replaces a plain XAUTOCLAIM, which filters on idle time ALONE and never
+// on whether the owning consumer is alive — verified against a live Redis: a
+// consumer running XAUTOCLAIM reclaims its OWN pending entries. This reclaim
+// exists to rescue deliveries stranded in a DEAD pod's PEL, so re-claiming
+// our own in-flight work is never the goal: under a backlog, anything sitting
+// in the delivery buffer longer than the timeout got re-delivered to us as a
+// duplicate, and the deeper the lag the more duplicates it produced. Dedup
+// kept the accounting right; the wasted work compounded.
+func (c *StreamsConsumer) claimIdleFromOtherConsumers(
+	ctx context.Context,
+	start string,
+) (msgs []redis.XMessage, next string, err error) {
+	minIdle := time.Duration(c.config.ClaimIdleTimeout) * time.Millisecond
+	if start == "0-0" {
+		start = "-"
+	}
+
+	// Idle prunes the scan SERVER-side; it does not decide who gets the entry.
+	// XCLAIM below still applies MinIdle authoritatively, so correctness does
+	// not depend on this filter -- it only stops the scan from paging through
+	// our own hot in-flight deliveries, which are young by definition and are
+	// the bulk of the PEL under a backlog. XPENDING remains the only command
+	// that reveals WHO owns an entry, which XAUTOCLAIM never does.
+	//
+	// Safe against skipping: the cursor advances past the last entry RETURNED,
+	// so a young entry filtered out here is simply not examined this pass --
+	// and it was not claimable anyway. claimPendingMessages restarts every
+	// drain from "0-0", so nothing is permanently skipped.
+	// The page size and the last-page test below must agree, so both read
+	// this one value.
+	pageSize := c.pageSize()
+	pending, err := c.client.XPendingExt(ctx, &redis.XPendingExtArgs{
+		Stream: c.streamName,
+		Group:  c.config.ConsumerGroup,
+		Idle:   minIdle,
+		Start:  start,
+		End:    "+",
+		Count:  pageSize,
+	}).Result()
+	if err != nil {
+		if !isStreamNotFoundError(err) {
+			reclaimErrorsTotal.WithLabelValues(c.config.SupplierOperatorAddress, "xpending").Inc()
+		}
+		return nil, "0-0", err
+	}
+	if len(pending) == 0 {
+		return nil, "0-0", nil
+	}
+
+	ids := make([]string, 0, len(pending))
+	for _, entry := range pending {
+		if entry.Consumer == c.config.ConsumerName {
+			continue // our own in-flight delivery, not a stranded one
+		}
+		ids = append(ids, entry.ID)
+	}
+
+	// Advance past the last entry EXAMINED, not the last one claimed: a
+	// reclaimed entry stays in the PEL (owned by us now), so restarting from
+	// the same point would return the same page forever. The successor of
+	// "<ms>-<seq>" is "<ms>-<seq+1>"; computing it avoids the exclusive-range
+	// syntax "(", which not every Redis implementation accepts.
+	next = nextStreamID(pending[len(pending)-1].ID)
+	if int64(len(pending)) < pageSize {
+		next = "0-0" // last page
+	}
+
+	if len(ids) == 0 {
+		return nil, next, nil // this page was all ours; keep scanning
+	}
+
+	msgs, err = c.client.XClaim(ctx, &redis.XClaimArgs{
 		Stream:   c.streamName,
 		Group:    c.config.ConsumerGroup,
 		Consumer: c.config.ConsumerName,
-		MinIdle:  time.Duration(c.config.ClaimIdleTimeout) * time.Millisecond,
-		Start:    "0-0",
-		Count:    50, // Reasonable batch size for claiming
+		MinIdle:  minIdle,
+		Messages: ids,
 	}).Result()
-
 	if err != nil {
-		// Stream may not exist yet - skip
-		if strings.Contains(err.Error(), "no such key") ||
-			strings.Contains(err.Error(), "NOGROUP") {
+		if !isStreamNotFoundError(err) {
+			reclaimErrorsTotal.WithLabelValues(c.config.SupplierOperatorAddress, "xclaim").Inc()
+		}
+		return nil, "0-0", err
+	}
+	return msgs, next, nil
+}
+
+// reapDeadConsumers deletes consumer records that hold nothing and have gone
+// silent, so a group's consumer registry does not grow by one entry per supplier
+// per pod recreation forever.
+//
+// Why this is needed at all: the consumer name embeds the hostname and pid, so a
+// recreated pod always registers a NEW name and Redis keeps the old record until
+// something removes it. Until 2026-08-20 nothing did; the registry stayed small
+// only because the stream key carried a TTL and expiring the key took the group
+// with it. That TTL destroyed un-consumed relays along the way and has been
+// removed, which is what makes an explicit reaper mandatory rather than tidy.
+//
+// The guard is deliberately narrow, because XGROUP DELCONSUMER DISCARDS the
+// pending entries of the consumer it deletes -- running it on a consumer that
+// still owns deliveries is exactly the relay loss this whole change exists to
+// stop. Three conditions, all required:
+//
+//  1. not ourselves;
+//  2. Pending == 0, so there is nothing to discard;
+//  3. idle beyond reapIdleMultiplier * ClaimIdleTimeout, so a merely slow
+//     consumer is not mistaken for a dead one.
+//
+// Between reading condition 2 and issuing the delete there is a window, and
+// Redis has no conditional delete to close it. Rather than assert the window is
+// unreachable, the return value of DELCONSUMER -- the number of pending entries
+// it destroyed -- is recorded. It must always be zero; if it ever is not, the
+// metric names the loss instead of hiding it.
+func (c *StreamsConsumer) reapDeadConsumers(ctx context.Context) {
+	claimIdle := time.Duration(c.config.ClaimIdleTimeout) * time.Millisecond
+	reapIdle := claimIdle * reapIdleMultiplier
+
+	consumers, err := c.client.XInfoConsumers(ctx, c.streamName, c.config.ConsumerGroup).Result()
+	if err != nil {
+		if isStreamNotFoundError(err) {
 			return
 		}
 		if ctx.Err() == nil {
-			c.logger.Debug().Err(err).Msg("error claiming idle messages")
+			reclaimErrorsTotal.WithLabelValues(c.config.SupplierOperatorAddress, "xinfoconsumers").Inc()
+			c.logger.Debug().Err(err).Msg("error listing stream consumers")
 		}
 		return
 	}
 
-	if len(messages) == 0 {
-		return
-	}
-
-	claimedMessages.WithLabelValues(c.config.SupplierOperatorAddress).Add(float64(len(messages)))
-
-	c.logger.Debug().
-		Int("count", len(messages)).
-		Str("stream", c.streamName).
-		Msg("claimed idle messages")
-
-	// Process claimed messages. These are reclaims — mark them so downstream
-	// workers know to run duplicate-detection before inserting into the SMST
-	// and incrementing the per-session counter. Normal XREADGROUP `>` delivery
-	// never redelivers, so only this path needs the dedup check.
-	for _, message := range messages {
-		msg, parseErr := c.parseMessage(message, c.streamName)
-		if parseErr != nil {
-			deserializationErrors.WithLabelValues(c.config.SupplierOperatorAddress).Inc()
-			// Acknowledge AND delete bad message to keep stream clean
-			_ = c.ackDeleteMessages(ctx, c.streamName, message.ID)
+	for _, consumer := range consumers {
+		if consumer.Name == c.config.ConsumerName {
 			continue
 		}
-		msg.IsReclaim = true
+		if consumer.Pending != 0 {
+			continue
+		}
+		if consumer.Idle < reapIdle {
+			continue
+		}
 
-		select {
-		case c.msgCh <- msg:
-		case <-ctx.Done():
+		destroyed, delErr := c.client.XGroupDelConsumer(
+			ctx, c.streamName, c.config.ConsumerGroup, consumer.Name,
+		).Result()
+		if delErr != nil {
+			if ctx.Err() == nil {
+				reclaimErrorsTotal.WithLabelValues(c.config.SupplierOperatorAddress, "xgroupdelconsumer").Inc()
+				c.logger.Debug().Err(delErr).
+					Str("dead_consumer", consumer.Name).
+					Msg("error reaping dead consumer")
+			}
+			continue
+		}
+
+		reapedConsumersTotal.WithLabelValues(c.config.SupplierOperatorAddress).Inc()
+
+		if destroyed > 0 {
+			// The window described above actually opened. These are acknowledged
+			// relays that no longer exist anywhere: Error level, not Debug, because
+			// it fires once per occurrence and it is money.
+			reapDestroyedPendingTotal.WithLabelValues(c.config.SupplierOperatorAddress).
+				Add(float64(destroyed))
+			c.logger.Error().
+				Str("dead_consumer", consumer.Name).
+				Int64("destroyed_pending", destroyed).
+				Msg("reaped a consumer that gained pending entries after being observed empty; those relays are lost")
+			continue
+		}
+
+		c.logger.Info().
+			Str("dead_consumer", consumer.Name).
+			Dur("idle", consumer.Idle).
+			Msg("reaped dead stream consumer")
+	}
+}
+
+// nextStreamID returns the smallest stream ID greater than id, so a scan can
+// continue without the exclusive-range syntax.
+func nextStreamID(id string) string {
+	ms, seq, found := strings.Cut(id, "-")
+	if !found {
+		return id
+	}
+	n, err := strconv.ParseUint(seq, 10, 64)
+	if err != nil {
+		return id
+	}
+	return ms + "-" + strconv.FormatUint(n+1, 10)
+}
+
+// claimPendingMessages recovers messages stranded in the PEL of a consumer
+// that crashed without acknowledging them.
+//
+// It drains the WHOLE eligible PEL, not just the first page: each
+// claimIdleFromOtherConsumers call examines at most one page of pending
+// entries and returns the cursor to continue the scan from, and a dead
+// consumer can leave thousands of deliveries behind (a full read batch plus
+// the delivery channel buffer). Stopping after one page would recover them at
+// one page per tick — far slower than the claim window this reclaim exists to
+// beat.
+func (c *StreamsConsumer) claimPendingMessages(ctx context.Context) {
+	start := "0-0"
+	totalClaimed := 0
+
+	for {
+		messages, next, err := c.claimIdleFromOtherConsumers(ctx, start)
+		if err != nil {
+			// Stream may not exist yet - skip
+			if isStreamNotFoundError(err) {
+				return
+			}
+			if ctx.Err() == nil {
+				c.logger.Debug().Err(err).Msg("error claiming idle messages")
+			}
 			return
+		}
+
+		if len(messages) > 0 {
+			totalClaimed += len(messages)
+			claimedMessages.WithLabelValues(c.config.SupplierOperatorAddress).Add(float64(len(messages)))
+		}
+
+		// Process claimed messages. These are reclaims — mark them so downstream
+		// workers know to run duplicate-detection before incrementing the
+		// per-session counter.
+		for _, message := range messages {
+			msg, parseErr := c.parseMessage(message, c.streamName)
+			if parseErr != nil {
+				deserializationErrors.WithLabelValues(c.config.SupplierOperatorAddress).Inc()
+				// Acknowledge AND delete bad message to keep stream clean
+				_ = c.client.XAckDel(ctx, c.streamName, c.config.ConsumerGroup, "DELREF", message.ID)
+				continue
+			}
+			msg.IsReclaim = true
+
+			if c.send(ctx, msg) != nil {
+				return
+			}
+		}
+
+		// A returned cursor of "0-0" means the scan wrapped: the whole PEL has
+		// been examined. The empty-string check is defensive.
+		if next == "0-0" || next == "" {
+			break
+		}
+		start = next
+
+		if ctx.Err() != nil {
+			return
+		}
+	}
+
+	if totalClaimed > 0 {
+		c.logger.Debug().
+			Int("count", totalClaimed).
+			Str("stream", c.streamName).
+			Msg("claimed idle messages")
+	}
+}
+
+// deliverOwnPending hands the read loop, once, every entry already pending under
+// this consumer's name when it starts, before it reads anything new.
+//
+// The name is per process (miner.UniqueConsumerName), so a supplier this
+// process releases and takes again gets a consumer with the SAME name, and what
+// the previous one could not hand back on its way out is this one's. Nothing
+// else reads it: ">" returns only new entries, and the reclaim skips an entry
+// its own consumer owns as an in-flight delivery. It waited for the process to
+// restart under another name.
+//
+// Once, not on every reconnection: past the first pass, what is pending under
+// the name is what this consumer delivered itself -- in the buffer, or being
+// processed. A pass cut short by an error resumes after the last entry it
+// handed over, so none is handed over twice.
+func (c *StreamsConsumer) deliverOwnPending(ctx context.Context) error {
+	if c.ownPendingDone {
+		return nil
+	}
+	if err := c.waitOperable(ctx); err != nil {
+		return err
+	}
+	after, err := c.eachOwnPending(ctx, c.ownPendingAfter, func(msg transport.StreamMessage) error {
+		return c.send(ctx, msg)
+	})
+	c.ownPendingAfter = after
+	if err != nil {
+		return err
+	}
+	c.ownPendingDone = true
+	return nil
+}
+
+// EachOwnPending calls fn with every entry pending under this consumer's name,
+// oldest first, parsed and marked a reclaim; fn owns the message. Each entry is
+// visited once, whatever fn does with it. It is meant for a consumer whose
+// producers have stopped (Stop): with nothing adding to the list, what it
+// visits is all that is left there.
+func (c *StreamsConsumer) EachOwnPending(ctx context.Context, fn func(transport.StreamMessage)) error {
+	_, err := c.eachOwnPending(ctx, "0", func(msg transport.StreamMessage) error {
+		fn(msg)
+		return nil
+	})
+	return err
+}
+
+// eachOwnPending pages through the entries pending under this consumer's name
+// with IDs after the given one ("" meaning from the start), calling fn with
+// each one that parses; one no longer in the stream is acknowledged, and one
+// that does not parse is acknowledged and deleted, as the read loop does. It stops at fn's first error and returns it, with the ID of
+// the last entry finished -- the point to resume from.
+func (c *StreamsConsumer) eachOwnPending(
+	ctx context.Context,
+	after string,
+	fn func(transport.StreamMessage) error,
+) (string, error) {
+	if after == "" {
+		after = "0"
+	}
+	for {
+		// An ID instead of ">" reads this consumer's own pending list and hands
+		// over nothing new. No BLOCK: go-redis sends one only for Block >= 0.
+		streams, err := c.client.XReadGroup(ctx, &redis.XReadGroupArgs{
+			Group:    c.config.ConsumerGroup,
+			Consumer: c.config.ConsumerName,
+			Streams:  []string{c.streamName, after},
+			Count:    c.pageSize(),
+			Block:    -1,
+		}).Result()
+		if err == redis.Nil {
+			return after, nil
+		}
+		if err != nil {
+			return after, fmt.Errorf("failed to read the pending entries of consumer %s: %w", c.config.ConsumerName, err)
+		}
+		if len(streams) == 0 || len(streams[0].Messages) == 0 {
+			return after, nil
+		}
+		for _, message := range streams[0].Messages {
+			if len(message.Values) == 0 {
+				// Deleted from the stream while still pending -- TrimStream's
+				// XTRIM leaves the pending entry behind. Nothing to hand over,
+				// and no producer's defect: the trim is where it went.
+				if ackErr := c.client.XAck(ctx, c.streamName, c.config.ConsumerGroup, message.ID).Err(); ackErr != nil {
+					c.logger.Debug().Err(ackErr).Str(logging.FieldMessageID, message.ID).Msg("failed to XAck a pending entry no longer in the stream")
+				} else {
+					c.logger.Debug().Str(logging.FieldMessageID, message.ID).Msg("dropped a pending entry no longer in the stream")
+				}
+				after = message.ID
+				continue
+			}
+			msg, parseErr := c.parseMessage(message, c.streamName)
+			if parseErr != nil {
+				deserializationErrors.WithLabelValues(c.config.SupplierOperatorAddress).Inc()
+				if delErr := c.client.XAckDel(ctx, c.streamName, c.config.ConsumerGroup, "DELREF", message.ID).Err(); delErr != nil {
+					c.logger.Debug().Err(delErr).Str(logging.FieldMessageID, message.ID).Msg("failed to XAckDel bad message")
+				}
+				after = message.ID
+				continue
+			}
+			msg.IsReclaim = true // the worker runs its duplicate check: it may have been processed
+			if fnErr := fn(msg); fnErr != nil {
+				return after, fnErr
+			}
+			after = message.ID
 		}
 	}
 }
@@ -371,6 +886,7 @@ func (c *StreamsConsumer) parseMessage(message redis.XMessage, streamName string
 	if !ok {
 		return transport.StreamMessage{}, fmt.Errorf("message 'data' field is not a string")
 	}
+	consumerReadBytesTotal.WithLabelValues(c.config.SupplierOperatorAddress).Add(float64(len(dataStr)))
 
 	// Deserialize from protobuf binary format into a pooled MinedRelayMessage
 	// so we recycle the struct across relays instead of burning GC cycles on
@@ -395,6 +911,55 @@ func (c *StreamsConsumer) parseMessage(message redis.XMessage, streamName string
 	}, nil
 }
 
+// ReleaseMessage hands a delivered entry back so ANOTHER consumer can take it,
+// without acknowledging it. It is the opposite of AckMessage: the entry stays in
+// the stream.
+//
+// Why this exists: AckMessage is XAckDel with DELREF, which deletes the entry.
+// A consumer that is going away has no business deleting work it did not do --
+// doing so removes the entry from the pending list the reclaim reads, so nothing
+// can rescue it.
+//
+// It is XNACK SILENT (Redis 8.8.0 and newer; this release refuses to start on
+// anything older than 8.10). It marks the entry unowned and sets its delivery
+// time to 0, so it is claimable immediately regardless of any min-idle -- by
+// every consumer, including the one that let go, whose reclaim skips only the
+// entries it still owns. SILENT is the mode Redis documents for a consumer that
+// is shutting down: the delivery "did not count".
+//
+// A NOPERM is reported as such: an ACL that forbids XNACK is a deliberate
+// operator decision, not a server that lacks the command.
+func (c *StreamsConsumer) ReleaseMessage(ctx context.Context, msg transport.StreamMessage) error {
+	// Same guard AckMessage keeps: a closed consumer must not claim to have
+	// handed anything over. The caller counts a failure here as abandoned, which
+	// leaves the entry pending -- the safe outcome.
+	c.mu.RLock()
+	if c.closed {
+		c.mu.RUnlock()
+		return fmt.Errorf("consumer is closed")
+	}
+	c.mu.RUnlock()
+
+	if msg.StreamName == "" {
+		return fmt.Errorf("message missing stream name")
+	}
+
+	err := c.client.XNack(ctx, &redis.XNackArgs{
+		Stream: msg.StreamName,
+		Group:  c.config.ConsumerGroup,
+		Mode:   redis.XNackModeSilent,
+		IDs:    []string{msg.ID},
+	}).Err()
+	if err == nil {
+		return nil
+	}
+
+	if strings.Contains(err.Error(), "NOPERM") {
+		return fmt.Errorf("XNACK is forbidden by ACL for this user, which is configuration rather than server version: %w", err)
+	}
+	return fmt.Errorf("failed to release message %s: %w", msg.ID, err)
+}
+
 // AckMessage acknowledges a StreamMessage using its embedded stream name.
 // This is the preferred method for acknowledging messages in multi-stream consumption.
 func (c *StreamsConsumer) AckMessage(ctx context.Context, msg transport.StreamMessage) error {
@@ -409,9 +974,10 @@ func (c *StreamsConsumer) AckMessage(ctx context.Context, msg transport.StreamMe
 		return fmt.Errorf("message missing stream name")
 	}
 
-	// Acknowledge AND delete the message from stream. This prevents streams from
-	// growing unbounded after processing.
-	err := c.ackDeleteMessages(ctx, msg.StreamName, msg.ID)
+	// Use XAckDel with DELREF to acknowledge AND delete the message from stream.
+	// This prevents streams from growing unbounded - messages are removed after processing.
+	// DELREF removes all references from all consumer groups (we only have one).
+	err := c.client.XAckDel(ctx, msg.StreamName, c.config.ConsumerGroup, "DELREF", msg.ID).Err()
 	if err != nil {
 		return fmt.Errorf("failed to ack+delete message %s: %w", msg.ID, err)
 	}
@@ -420,131 +986,32 @@ func (c *StreamsConsumer) AckMessage(ctx context.Context, msg transport.StreamMe
 	return nil
 }
 
-// AckMessageBatch acknowledges multiple StreamMessages, automatically grouping by stream.
-func (c *StreamsConsumer) AckMessageBatch(ctx context.Context, msgs []transport.StreamMessage) error {
-	c.mu.RLock()
-	if c.closed {
-		c.mu.RUnlock()
-		return fmt.Errorf("consumer is closed")
-	}
-	c.mu.RUnlock()
+// StreamName is the one stream this consumer reads, and so the stream every
+// message it delivers must be acknowledged on.
+func (c *StreamsConsumer) StreamName() string { return c.streamName }
 
-	if len(msgs) == 0 {
-		return nil
-	}
+// ConsumerGroup is the group this consumer reads and acknowledges in.
+func (c *StreamsConsumer) ConsumerGroup() string { return c.config.ConsumerGroup }
 
-	// Group messages by stream for efficient pipelining
-	byStream := make(map[string][]string)
-	for _, msg := range msgs {
-		if msg.StreamName == "" {
-			continue
-		}
-		byStream[msg.StreamName] = append(byStream[msg.StreamName], msg.ID)
-	}
-
-	err := c.ackDeleteMessagesByStream(ctx, byStream)
+// LastGeneratedID returns the stream's last-generated-id (XINFO STREAM), the
+// highest ID ever appended -- including entries not yet delivered to any
+// consumer. A caller comparing it against what it has already handled uses it
+// to tell "nothing more has ever been written" from "more exists, waiting to
+// be delivered or reclaimed".
+func (c *StreamsConsumer) LastGeneratedID(ctx context.Context) (string, error) {
+	info, err := c.client.XInfoStream(ctx, c.streamName).Result()
 	if err != nil {
-		return fmt.Errorf("failed to batch ack+delete: %w", err)
+		return "", fmt.Errorf("failed to get stream info for %s: %w", c.streamName, err)
 	}
-
-	ackedTotal.WithLabelValues(c.config.SupplierOperatorAddress).Add(float64(len(msgs)))
-	return nil
+	return info.LastGeneratedID, nil
 }
 
-func (c *StreamsConsumer) ackDeleteMessages(ctx context.Context, streamName string, ids ...string) error {
-	if len(ids) == 0 {
-		return nil
-	}
-
-	if err := c.client.XAckDel(ctx, streamName, c.config.ConsumerGroup, "DELREF", ids...).Err(); err == nil {
-		return nil
-	} else if ctx.Err() != nil {
-		return err
-	} else {
-		return c.fallbackAckDelete(ctx, map[string][]string{streamName: ids}, err)
-	}
-}
-
-func (c *StreamsConsumer) ackDeleteMessagesByStream(ctx context.Context, byStream map[string][]string) error {
-	if len(byStream) == 0 {
-		return nil
-	}
-
-	pipe := c.client.Pipeline()
-	for streamName, ids := range byStream {
-		if len(ids) > 0 {
-			pipe.XAckDel(ctx, streamName, c.config.ConsumerGroup, "DELREF", ids...)
-		}
-	}
-
-	_, err := pipe.Exec(ctx)
-	if err == nil {
-		return nil
-	}
-	if ctx.Err() != nil {
-		return err
-	}
-
-	return c.fallbackAckDelete(ctx, byStream, err)
-}
-
-func (c *StreamsConsumer) fallbackAckDelete(ctx context.Context, byStream map[string][]string, xackDelErr error) error {
-	c.xackDelFallbackOnce.Do(func() {
-		c.logger.Warn().
-			Err(xackDelErr).
-			Msg("Redis XACKDEL failed, falling back to XACK plus XDEL")
-	})
-
-	pipe := c.client.Pipeline()
-	for streamName, ids := range byStream {
-		if len(ids) == 0 {
-			continue
-		}
-		pipe.XAck(ctx, streamName, c.config.ConsumerGroup, ids...)
-		pipe.XDel(ctx, streamName, ids...)
-	}
-
-	if _, err := pipe.Exec(ctx); err != nil {
-		return fmt.Errorf("XACKDEL failed (%w), fallback XACK+XDEL failed: %w", xackDelErr, err)
-	}
-
-	return nil
-}
-
-// Pending returns the number of messages that have been delivered but not yet acknowledged.
-func (c *StreamsConsumer) Pending(ctx context.Context) (int64, error) {
-	c.mu.RLock()
-	if c.closed {
-		c.mu.RUnlock()
-		return 0, fmt.Errorf("consumer is closed")
-	}
-	c.mu.RUnlock()
-
-	// Check pending on the single supplier stream
-	info, err := c.client.XPending(ctx, c.streamName, c.config.ConsumerGroup).Result()
-	if err != nil {
-		// Stream may not exist yet
-		if strings.Contains(err.Error(), "no such key") ||
-			strings.Contains(err.Error(), "NOGROUP") {
-			return 0, nil
-		}
-		return 0, fmt.Errorf("failed to get pending info: %w", err)
-	}
-
-	pendingMessages.WithLabelValues(c.config.SupplierOperatorAddress).Set(float64(info.Count))
-	return info.Count, nil
-}
-
-// DeleteStream is a no-op with single stream architecture.
-// Messages are automatically deleted via XAckDel when acknowledged.
-// The single stream per supplier persists but stays clean.
-func (c *StreamsConsumer) DeleteStream(ctx context.Context, sessionID string) error {
-	// No-op: single stream per supplier persists across all sessions.
-	// Messages are automatically deleted from stream via XAckDel (DELREF mode).
-	c.logger.Debug().
-		Str("session_id", sessionID).
-		Msg("DeleteStream is no-op with single stream architecture")
-	return nil
+// RecordAcked counts n messages acknowledged outside AckMessage -- by a script
+// that deletes them in the same call as other writes -- on the same series
+// AckMessage counts on, so the metric keeps meaning "acknowledged" whichever
+// path did it.
+func (c *StreamsConsumer) RecordAcked(n int) {
+	ackedTotal.WithLabelValues(c.config.SupplierOperatorAddress).Add(float64(n))
 }
 
 // TrimStream removes entries older than the specified duration using MINID.
@@ -569,7 +1036,7 @@ func (c *StreamsConsumer) TrimStream(ctx context.Context, maxAge time.Duration) 
 	trimmed, err := c.client.XTrimMinID(ctx, c.streamName, minID).Result()
 	if err != nil {
 		// Stream may not exist - not an error
-		if strings.Contains(err.Error(), "no such key") {
+		if isStreamNotFoundError(err) {
 			return 0, nil
 		}
 		return 0, fmt.Errorf("failed to trim stream %s: %w", c.streamName, err)
@@ -586,25 +1053,162 @@ func (c *StreamsConsumer) TrimStream(ctx context.Context, maxAge time.Duration) 
 	return trimmed, nil
 }
 
+// Stop ends the consumer's producers -- the read loop and the reclaim -- and
+// waits for them, without closing it: AckMessage and ReleaseMessage still work
+// afterwards, which is what a teardown needs to hand back what is left under
+// this consumer's name once nothing can add to it. Idempotent; Close calls it.
+func (c *StreamsConsumer) Stop() {
+	c.mu.RLock()
+	cancel := c.cancelFn
+	c.mu.RUnlock()
+	if cancel != nil {
+		cancel()
+	}
+	c.wg.Wait()
+}
+
 // Close gracefully shuts down the consumer.
 func (c *StreamsConsumer) Close() error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	if c.closed {
+		c.mu.Unlock()
 		return nil
 	}
-
 	c.closed = true
+	c.mu.Unlock()
 
-	// Cancel context to stop goroutines
-	if c.cancelFn != nil {
-		c.cancelFn()
-	}
-
-	// Wait for goroutines to finish
-	c.wg.Wait()
+	c.Stop()
 
 	c.logger.Info().Msg("Redis Streams consumer closed")
 	return nil
+}
+
+// readBudgetBytes is how many relay bytes one supplier's read may bring in,
+// counting what already waits in the delivery channel. XREADGROUP bounds a
+// read in entries only, so the COUNT is derived from it (readCount): with
+// relays of a MiB a fixed COUNT of 1000 read a GiB at once. It is per
+// supplier, so a miner holds up to this times its suppliers: a supplier only
+// needs what it consumes in one read round trip, a few MiB at the most.
+const readBudgetBytes = 8 << 20
+
+// readCount is the COUNT of the next read: what fits in readBudgetBytes, minus
+// the channel's bytes, at the largest entry seen lately, between 1 and
+// BatchSize. The first read asks for one entry, whatever its size; relays of a
+// few KiB get BatchSize from the second read on. It never returns 0: the read
+// is sized, not paused.
+func (c *StreamsConsumer) readCount() int64 {
+	largest := c.largestEntry.Load()
+	if largest <= 0 {
+		return 1
+	}
+	n := (readBudgetBytes - c.channelBytes.Load()) / largest
+	return min(max(n, 1), c.config.BatchSize)
+}
+
+// pageSize is the COUNT of one reclaim or own-pending page: pendingPageSize
+// entries, or fewer when entries are big -- the same budget as readCount, so a
+// page of 1 MiB relays does not bring in 50 MiB outside the channel's count.
+// Before any read it is pendingPageSize.
+func (c *StreamsConsumer) pageSize() int64 {
+	largest := c.largestEntry.Load()
+	if largest <= 0 {
+		return pendingPageSize
+	}
+	return min(max(readBudgetBytes/largest, 1), pendingPageSize)
+}
+
+// noteLargestEntry folds the largest entry of the last read into largestEntry:
+// a bigger one takes over at once, a smaller one lets it fall by a sixteenth
+// per read, so one big relay does not size a supplier's reads forever. An
+// empty read changes nothing.
+func (c *StreamsConsumer) noteLargestEntry(largest int64) {
+	if largest <= 0 {
+		return
+	}
+	prev := c.largestEntry.Load()
+	c.largestEntry.Store(max(largest, prev-prev/16))
+}
+
+// payloadStats is the total and the largest size of the `data` fields of a
+// read reply: the total is what the reply holds on the heap until it has been
+// parsed, the largest sizes the next read.
+func payloadStats(msgs []redis.XMessage) (total, largest int64) {
+	for _, m := range msgs {
+		if d, ok := m.Values["data"].(string); ok {
+			n := int64(len(d))
+			total += n
+			largest = max(largest, n)
+		}
+	}
+	return total, largest
+}
+
+// channelBytesOf is what one delivered relay adds to consumer_channel_bytes.
+// trackChannelSend adds it and MarkDelivered subtracts it, so both must read
+// the same size: the relay bytes the message carries, before the miner clears
+// them after the SMST update. Both fields, because a relay the relayer
+// compressed waits in the channel as RelayBytesS2 with RelayBytes empty.
+func channelBytesOf(msg transport.StreamMessage) (string, float64) {
+	if msg.Message == nil {
+		return "", 0
+	}
+	return msg.Message.SupplierOperatorAddress, float64(len(msg.Message.RelayBytes) + len(msg.Message.RelayBytesS2))
+}
+
+// send hands a parsed relay to the delivery channel, waiting while the channel
+// already holds readBudgetBytes -- "X bytes or N relays": the channel's
+// capacity bounds entries and this bounds bytes. The wait is soft: a relay is
+// let in as soon as the channel drops below the budget, whatever its own size,
+// and always when the channel is empty, so a relay bigger than the budget
+// passes and a drifted count can never wedge a producer. Up to the three
+// producers can pass the check together, so the channel can exceed the budget
+// by at most three relays. On ctx's end the relay is not handed over: it is
+// released to its pool and ctx's error returned.
+func (c *StreamsConsumer) send(ctx context.Context, msg transport.StreamMessage) error {
+	for c.channelBytes.Load() >= readBudgetBytes && len(c.msgCh) > 0 {
+		if c.sendWaitHook != nil {
+			c.sendWaitHook()
+		}
+		select {
+		case <-c.space:
+		case <-ctx.Done():
+			transport.ReleaseMinedRelayMessage(msg.Message)
+			return ctx.Err()
+		}
+	}
+	c.trackChannelSend(msg)
+	select {
+	case c.msgCh <- msg:
+		return nil
+	case <-ctx.Done():
+		// Parsed from the pool and never handed over.
+		c.MarkDelivered(msg)
+		transport.ReleaseMinedRelayMessage(msg.Message)
+		return ctx.Err()
+	}
+}
+
+// trackChannelSend counts a relay as waiting in the delivery channel. It runs
+// BEFORE the send: counting after it would let the receiver's MarkDelivered
+// land first and take the count below zero.
+func (c *StreamsConsumer) trackChannelSend(msg transport.StreamMessage) {
+	supplier, n := channelBytesOf(msg)
+	c.channelBytes.Add(int64(n))
+	consumerChannelBytes.WithLabelValues(supplier).Add(n)
+}
+
+// MarkDelivered is called by whoever takes a message from the channel Consume
+// returns, as soon as it takes it, so the channel's byte count stops counting
+// it. A nil consumer does nothing.
+func (c *StreamsConsumer) MarkDelivered(msg transport.StreamMessage) {
+	if c == nil {
+		return
+	}
+	supplier, n := channelBytesOf(msg)
+	c.channelBytes.Add(-int64(n))
+	consumerChannelBytes.WithLabelValues(supplier).Sub(n)
+	select {
+	case c.space <- struct{}{}:
+	default:
+	}
 }

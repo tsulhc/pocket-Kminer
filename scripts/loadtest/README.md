@@ -95,9 +95,9 @@ scripts/loadtest/backends.sh sweep --include-broken > /tmp/sweep-all.csv
 
 The default `light` preset sends a minimal `eth_blockNumber`-shaped
 request (~70 bytes). That's fine for probe/ceiling but **wildly
-underestimates the cost of real production traffic**. Production traces
-for batch-heavy services can have p95 request bodies of 7-9 KB, 100x the
-light preset. Pool tuning with light payloads will under-provision pools
+underestimates the cost of real production traffic** — batch-heavy
+chains can show p95 request bodies of several KB, ~100x the light
+preset. Pool tuning with light payloads will under-provision pools
 for services whose real traffic is batch-heavy or uses large methods.
 
 ```bash
@@ -218,11 +218,14 @@ fits your topology.
   the relayer; this script measures what one client (= one relayer
   replica) can extract from the backend. That's the right answer for
   per-replica pool sizing — see the section above.
-- **Why not test through the relayer?** The relayer expects a fully
-  signed `RelayRequest` proto with a ring signature from an
-  application with an active session. You can't send "raw" relays
-  from outside. Testing the full path (client → PATH → relayer →
-  backend) needs a PATH gateway with a real app stake. That's a
-  separate project. In the meantime, the gap between the numbers
-  here and the throughput visible in `ha_relayer_*` metrics tells
-  you what the relayer is costing.
+- **Why not test through the relayer?** This script isolates the
+  backend: it measures what the backend sustains with no relayer in
+  front of it. The relayer expects a ring-signed `RelayRequest` from
+  an application with an active session, so a raw request cannot
+  reach it. To load the full path (client → relayer → backend) use
+  the repository's own client, `pocket-relay-miner relay <mode>
+  --load-test`, which signs every request
+  ([docs/testing/DIRECT_CLI.md](../../docs/testing/DIRECT_CLI.md)),
+  or `--simulate` to do it without staking
+  ([docs/SIMULATED_RELAYS.md](../../docs/SIMULATED_RELAYS.md)). The
+  gap between the two measurements is what the relayer costs.

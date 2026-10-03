@@ -27,19 +27,6 @@ const (
 	HealthStatusUnhealthy
 )
 
-func (s HealthStatus) String() string {
-	switch s {
-	case HealthStatusUnknown:
-		return "unknown"
-	case HealthStatusHealthy:
-		return "healthy"
-	case HealthStatusUnhealthy:
-		return "unhealthy"
-	default:
-		return "invalid"
-	}
-}
-
 // BackendHealth tracks the health of a single backend endpoint.
 // When a pool.BackendEndpoint is associated, health state is delegated to it
 // (single source of truth shared with the circuit breaker). Supplementary fields
@@ -87,7 +74,9 @@ type BackendHealth struct {
 // When a pool endpoint is associated, derives status from endpoint.IsHealthy().
 func (h *BackendHealth) GetStatus() HealthStatus {
 	if h.endpoint != nil {
-		if h.endpoint.IsHealthy() {
+		// Pure read: a status observer must not trigger the half-open
+		// auto-recovery (see pool.BackendEndpoint.CurrentlyHealthy).
+		if h.endpoint.CurrentlyHealthy() {
 			return HealthStatusHealthy
 		}
 		return HealthStatusUnhealthy
@@ -110,39 +99,6 @@ func (h *BackendHealth) SetStatus(status HealthStatus) {
 		return
 	}
 	h.status.Store(int32(status))
-}
-
-// GetLastCheck returns when the last health check was performed.
-func (h *BackendHealth) GetLastCheck() time.Time {
-	return time.Unix(0, h.lastCheck.Load())
-}
-
-// GetLastError returns the last error message (empty if healthy).
-func (h *BackendHealth) GetLastError() string {
-	if err := h.lastError.Load(); err != nil {
-		return err.(string)
-	}
-	return ""
-}
-
-// IsHealthy returns true if the backend is healthy.
-// Delegates to pool BackendEndpoint when available (single source of truth).
-func (h *BackendHealth) IsHealthy() bool {
-	if h.endpoint != nil {
-		return h.endpoint.IsHealthy()
-	}
-	status := h.GetStatus()
-	// Unknown is treated as healthy to avoid blocking on startup
-	return status == HealthStatusHealthy || status == HealthStatusUnknown
-}
-
-// ConsecutiveFailureCount returns the current consecutive failure count.
-// Delegates to pool BackendEndpoint when available.
-func (h *BackendHealth) ConsecutiveFailureCount() int32 {
-	if h.endpoint != nil {
-		return h.endpoint.ConsecutiveFailures()
-	}
-	return h.consecutiveFailures.Load()
 }
 
 // HealthChecker manages health checks for all backends.
@@ -221,54 +177,6 @@ func (hc *HealthChecker) RegisterPool(poolKey string, endpoints []*pool.BackendE
 		Int("endpoint_count", len(endpoints)).
 		Bool("health_check_enabled", config != nil && config.Enabled).
 		Msg("registered pool for health checking")
-}
-
-// GetHealth returns the health status for the first endpoint in a pool.
-// For per-endpoint health, use GetAllHealth.
-func (hc *HealthChecker) GetHealth(poolKey string) *BackendHealth {
-	hc.backendsMu.RLock()
-	defer hc.backendsMu.RUnlock()
-	backends := hc.backends[poolKey]
-	if len(backends) == 0 {
-		return nil
-	}
-	return backends[0]
-}
-
-// IsHealthy returns true if any backend in the pool is healthy.
-func (hc *HealthChecker) IsHealthy(poolKey string) bool {
-	hc.backendsMu.RLock()
-	defer hc.backendsMu.RUnlock()
-	backends := hc.backends[poolKey]
-	if len(backends) == 0 {
-		// Unknown pool - assume healthy
-		return true
-	}
-	for _, b := range backends {
-		if b.IsHealthy() {
-			return true
-		}
-	}
-	return false
-}
-
-// GetAllHealth returns health status for all backends across all pools.
-func (hc *HealthChecker) GetAllHealth() map[string]*BackendHealth {
-	hc.backendsMu.RLock()
-	defer hc.backendsMu.RUnlock()
-
-	result := make(map[string]*BackendHealth)
-	for poolKey, backends := range hc.backends {
-		if len(backends) == 1 {
-			result[poolKey] = backends[0]
-		} else {
-			for i, b := range backends {
-				key := fmt.Sprintf("%s#%d", poolKey, i)
-				result[key] = b
-			}
-		}
-	}
-	return result
 }
 
 // Start begins health checking for all registered backends.
@@ -415,6 +323,14 @@ func buildProbeRequest(ctx context.Context, healthURL string, config *BackendHea
 		}
 	}
 
+	// Apply health-check-specific headers on top of pool headers.
+	// A key present here overrides the same key from the pool for the probe only.
+	if config.Headers != nil {
+		for k, v := range config.Headers {
+			req.Header.Set(k, v)
+		}
+	}
+
 	// Apply pool-level authentication
 	if backend.auth != nil {
 		if backend.auth.BearerToken != "" {
@@ -468,7 +384,11 @@ func (hc *HealthChecker) recordFailure(backend *BackendHealth, config *BackendHe
 	backend.lastError.Store(errMsg)
 	backend.consecutiveSuccesses.Store(0)
 
-	endpointLabel := backend.BackendURL
+	// Redact the fallback: a raw backend URL as a Prometheus label carries
+	// operator topology and, in its path/query, provider API keys — and a
+	// TSDB keeps them for the retention period. The endpoint name (host:port)
+	// is already safe.
+	endpointLabel := logging.RedactURL(backend.BackendURL)
 	if backend.endpoint != nil && backend.endpoint.Name != "" {
 		endpointLabel = backend.endpoint.Name
 	}
@@ -482,12 +402,12 @@ func (hc *HealthChecker) recordFailure(backend *BackendHealth, config *BackendHe
 		// Delegate to pool endpoint atomics (shared with circuit breaker)
 		failures := backend.endpoint.IncrementFailures()
 		if int(failures) >= unhealthyThreshold {
-			wasHealthy := backend.endpoint.IsHealthy()
+			wasHealthy := backend.endpoint.CurrentlyHealthy()
 			backend.endpoint.SetUnhealthy()
 			if wasHealthy {
 				hc.logger.Warn().
 					Str(logging.FieldServiceID, backend.ServiceID).
-					Str("backend_url", backend.BackendURL).
+					Str("backend_url", logging.RedactURL(backend.BackendURL)).
 					Str("endpoint", endpointLabel).
 					Str("error", errMsg).
 					Int32("consecutive_failures", failures).
@@ -504,7 +424,7 @@ func (hc *HealthChecker) recordFailure(backend *BackendHealth, config *BackendHe
 			if oldStatus != HealthStatusUnhealthy {
 				hc.logger.Warn().
 					Str(logging.FieldServiceID, backend.ServiceID).
-					Str("backend_url", backend.BackendURL).
+					Str("backend_url", logging.RedactURL(backend.BackendURL)).
 					Str("endpoint", endpointLabel).
 					Str("error", errMsg).
 					Int32("consecutive_failures", failures).
@@ -525,7 +445,11 @@ func (hc *HealthChecker) recordSuccess(backend *BackendHealth, config *BackendHe
 	backend.lastCheck.Store(time.Now().UnixNano())
 	backend.lastError.Store("")
 
-	endpointLabel := backend.BackendURL
+	// Redact the fallback: a raw backend URL as a Prometheus label carries
+	// operator topology and, in its path/query, provider API keys — and a
+	// TSDB keeps them for the retention period. The endpoint name (host:port)
+	// is already safe.
+	endpointLabel := logging.RedactURL(backend.BackendURL)
 	if backend.endpoint != nil && backend.endpoint.Name != "" {
 		endpointLabel = backend.endpoint.Name
 	}
@@ -540,15 +464,24 @@ func (hc *HealthChecker) recordSuccess(backend *BackendHealth, config *BackendHe
 		backend.endpoint.ResetFailures()
 		successes := backend.consecutiveSuccesses.Add(1)
 		if int(successes) >= healthyThreshold {
-			wasUnhealthy := !backend.endpoint.IsHealthy()
+			// CurrentlyHealthy, not IsHealthy: IsHealthy mutates (half-open
+			// auto-recovery), so reading it here flipped the endpoint healthy
+			// and swallowed this very transition log and gauge update.
+			wasUnhealthy := !backend.endpoint.CurrentlyHealthy()
+			// The serving path may have half-opened this endpoint already,
+			// in which case CurrentlyHealthy reads true and the transition
+			// is still unreported — the mark IsHealthy left is the only
+			// record of it, and SetHealthy below is about to clear it.
+			// Claim it here, or the recovery is announced by nobody.
+			recovered := wasUnhealthy || backend.endpoint.ConsumePendingRecovery()
 			backend.endpoint.SetHealthy()
-			if wasUnhealthy {
+			if recovered {
 				// Full reset on recovery: clean slate for the backend
 				backend.endpoint.ResetFailures()
 				backend.consecutiveSuccesses.Store(0)
 				hc.logger.Info().
 					Str(logging.FieldServiceID, backend.ServiceID).
-					Str("backend_url", backend.BackendURL).
+					Str("backend_url", logging.RedactURL(backend.BackendURL)).
 					Str("endpoint", endpointLabel).
 					Int32("consecutive_successes", successes).
 					Msg("backend became healthy (active health check)")
@@ -567,7 +500,7 @@ func (hc *HealthChecker) recordSuccess(backend *BackendHealth, config *BackendHe
 				backend.consecutiveSuccesses.Store(0)
 				hc.logger.Info().
 					Str(logging.FieldServiceID, backend.ServiceID).
-					Str("backend_url", backend.BackendURL).
+					Str("backend_url", logging.RedactURL(backend.BackendURL)).
 					Str("endpoint", endpointLabel).
 					Int32("consecutive_successes", successes).
 					Msg("backend became healthy")
@@ -577,20 +510,6 @@ func (hc *HealthChecker) recordSuccess(backend *BackendHealth, config *BackendHe
 	}
 
 	healthCheckSuccesses.WithLabelValues(backend.ServiceID, endpointLabel).Inc()
-}
-
-// CheckNow performs an immediate health check for all endpoints in a pool.
-func (hc *HealthChecker) CheckNow(ctx context.Context, poolKey string) error {
-	hc.configsMu.RLock()
-	config, ok := hc.configs[poolKey]
-	hc.configsMu.RUnlock()
-
-	if !ok {
-		return fmt.Errorf("no health check config for pool %s", poolKey)
-	}
-
-	hc.checkPool(ctx, poolKey, config)
-	return nil
 }
 
 // Close gracefully shuts down the health checker.

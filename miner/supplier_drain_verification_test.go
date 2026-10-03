@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/puzpuzpuz/xsync/v4"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
@@ -78,7 +79,7 @@ func newTestSupplierManager(t *testing.T, queryClient SupplierQueryClient) *Supp
 			SupplierQueryClient: queryClient,
 			MinerID:             "test-instance",
 		},
-		suppliers: make(map[string]*SupplierState),
+		suppliers: xsync.NewMap[string, *SupplierState](),
 		ctx:       ctx,
 		cancelFn:  cancel,
 	}
@@ -165,7 +166,13 @@ func TestVerifySupplierUnstaked_NoQueryClient(t *testing.T) {
 }
 
 // =============================================================================
-// DRAIN-05: onSupplierReleased drains even when supplier is staked
+// DRAIN-05: onSupplierReleased drains unconditionally (issue #7)
+//
+// All Release() callsites — rebalance, shutdown, claim-callback-failure —
+// operate on suppliers that are expected to remain staked on-chain. The old
+// veto behaviour pinned suppliers to the original miner forever and broke
+// every dual-miner rebalance. The release path now drains regardless of
+// staking status; the chain query is retained only as an audit signal.
 // =============================================================================
 
 func TestOnSupplierReleased_DrainsEvenWhenStaked(t *testing.T) {
@@ -174,12 +181,13 @@ func TestOnSupplierReleased_DrainsEvenWhenStaked(t *testing.T) {
 
 	beforeStaked := testutil.ToFloat64(supplierDrainDecisionTotal.WithLabelValues("rebalance_release", "staked"))
 
-	err := mgr.onSupplierReleased(context.Background(), "pokt1staked")
-	require.NoError(t, err, "internal release must not be vetoed by on-chain staking status")
+	err := mgr.onSupplierReleased(context.Background(), "pokt1staked", triggerRebalanceRelease)
+	mgr.waitDrains()
+	require.NoError(t, err, "rebalance release must not be vetoed by on-chain staking status")
 
 	afterStaked := testutil.ToFloat64(supplierDrainDecisionTotal.WithLabelValues("rebalance_release", "staked"))
 	assert.Equal(t, beforeStaked+1, afterStaked,
-		"audit metric should still record on-chain status even though release proceeds")
+		"audit metric should still record on-chain result even though drain proceeds")
 }
 
 func TestOnSupplierReleased_ProceedsWhenNotFound(t *testing.T) {
@@ -219,8 +227,10 @@ func TestOnKeyChange_RemovalDrainsIfStaked(t *testing.T) {
 	assert.False(t, shouldDrain, "verifySupplierUnstaked returns false for staked supplier")
 	assert.Equal(t, "staked", result)
 
-	// onKeyChange removal proceeds regardless (operator explicit action). Internal
-	// release also proceeds; the difference is only the drain_trigger label.
+	// onKeyChange removal proceeds regardless (operator explicit action).
+	// As of issue #7, onSupplierReleased also drains unconditionally, so the
+	// behavioural difference between the two paths is now only observability
+	// labels (drain_trigger: rebalance_release vs key_removal).
 	beforeStaked := testutil.ToFloat64(supplierDrainDecisionTotal.WithLabelValues("key_removal", "staked"))
 	supplierDrainDecisionTotal.WithLabelValues("key_removal", result).Inc()
 	afterStaked := testutil.ToFloat64(supplierDrainDecisionTotal.WithLabelValues("key_removal", "staked"))
@@ -238,7 +248,9 @@ func TestDrainMetric_RebalanceRelease(t *testing.T) {
 
 	beforeStaked := testutil.ToFloat64(supplierDrainDecisionTotal.WithLabelValues("rebalance_release", "staked"))
 
-	_ = mgr.onSupplierReleased(context.Background(), "pokt1staked")
+	// Drain proceeds (issue #7) but the audit metric is still recorded.
+	_ = mgr.onSupplierReleased(context.Background(), "pokt1staked", triggerRebalanceRelease)
+	mgr.waitDrains()
 
 	afterStaked := testutil.ToFloat64(supplierDrainDecisionTotal.WithLabelValues("rebalance_release", "staked"))
 	assert.Equal(t, beforeStaked+1, afterStaked,
@@ -337,3 +349,14 @@ func TestDrainMetric_RegisteredInMinerRegistry(t *testing.T) {
 	}
 	assert.True(t, found, "supplier_drain_decision_total should be registered in MinerRegistry")
 }
+
+// waitDrains blocks until every drain goroutine this manager started has
+// finished, so a test can assert on the audit without polling a clock.
+//
+// It lives in test code because that is the only thing that calls it, and the
+// dead-code gate is right to refuse a production method nothing in production
+// reaches. NOTE, and it is a decision NOT taken here: Close does not wait for a
+// drain either, so the audit log can still be lost on the way out. Making Close
+// wait would make shutdown as slow as the slowest blocked XREAD -- a trade for
+// the owner to make, not for this change.
+func (m *SupplierManager) waitDrains() { m.drainWG.Wait() }

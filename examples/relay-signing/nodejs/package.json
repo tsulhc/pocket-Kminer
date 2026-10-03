@@ -1,0 +1,20 @@
+{
+  "name": "pocket-relay-ring-signer-example",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Example: sign a Pocket Network relay with a bLSAG ring signature in Node.js, checked against the Go oracle that the relayer actually runs.",
+  "main": "sign.mjs",
+  "scripts": {
+    "build:oracle": "go build -o ./oracle-bin ../oracle",
+    "test": "node verify-against-oracle.mjs"
+  },
+  "engines": {
+    "node": ">=20.19.0"
+  },
+  "license": "ISC",
+  "dependencies": {
+    "@noble/curves": "^2.2.0",
+    "@noble/hashes": "^2.2.0"
+  }
+}

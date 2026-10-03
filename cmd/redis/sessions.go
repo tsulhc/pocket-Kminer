@@ -29,7 +29,7 @@ Session data is stored at:
   - Index: ha:miner:sessions:{supplier}:index
   - State Index: ha:miner:sessions:{supplier}:state:{state}
 
-States: active, claiming, claimed, proving, settled, expired`,
+States: active, claiming, claimed, claim_window_closed, claim_tx_error, claim_missing, claim_skipped, proving, proved, probabilistic_proved, proof_window_closed, proof_tx_error`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := context.Background()
 			client, err := CreateRedisClient(ctx)
@@ -55,7 +55,7 @@ States: active, claiming, claimed, proving, settled, expired`,
 
 	cmd.Flags().StringVar(&supplierAddr, "supplier", "", "Supplier operator address (required)")
 	cmd.Flags().StringVar(&sessionID, "session", "", "Specific session ID to inspect")
-	cmd.Flags().StringVar(&state, "state", "", "Filter by state (active|claiming|claimed|proving|settled|expired)")
+	cmd.Flags().StringVar(&state, "state", "", "Filter by state (see command help for the full list)")
 	cmd.Flags().BoolVar(&jsonOutput, "json", false, "Output as JSON")
 	_ = cmd.MarkFlagRequired("supplier")
 
@@ -63,7 +63,7 @@ States: active, claiming, claimed, proving, settled, expired`,
 }
 
 func showSession(ctx context.Context, client *DebugRedisClient, supplier, sessionID string, jsonOutput bool) error {
-	key := fmt.Sprintf("ha:miner:sessions:%s:%s", supplier, sessionID)
+	key := client.KB().MinerSessionKey(supplier, sessionID)
 
 	snapshot, err := loadSessionKey(ctx, client, key)
 	if err != nil {
@@ -91,7 +91,6 @@ func showSession(ctx context.Context, client *DebugRedisClient, supplier, sessio
 	fmt.Printf("Total Compute Units: %v\n", snapshot["total_compute_units"])
 	fmt.Printf("Session Start Height: %v\n", snapshot["session_start_height"])
 	fmt.Printf("Session End Height: %v\n", snapshot["session_end_height"])
-	fmt.Printf("Last WAL Entry ID: %v\n", snapshot["last_wal_entry_id"])
 	fmt.Printf("Created At: %v\n", snapshot["created_at"])
 	fmt.Printf("Last Updated At: %v\n", snapshot["last_updated_at"])
 
@@ -103,7 +102,7 @@ func showSession(ctx context.Context, client *DebugRedisClient, supplier, sessio
 }
 
 func listSessionsByState(ctx context.Context, client *DebugRedisClient, supplier, state string, jsonOutput bool) error {
-	indexKey := fmt.Sprintf("ha:miner:sessions:%s:state:%s", supplier, state)
+	indexKey := client.KB().MinerSessionStateIndexKey(supplier, state)
 
 	sessionIDs, err := client.SMembers(ctx, indexKey).Result()
 	if err != nil {
@@ -119,7 +118,7 @@ func listSessionsByState(ctx context.Context, client *DebugRedisClient, supplier
 }
 
 func listAllSessions(ctx context.Context, client *DebugRedisClient, supplier string, jsonOutput bool) error {
-	indexKey := fmt.Sprintf("ha:miner:sessions:%s:index", supplier)
+	indexKey := client.KB().MinerSessionsIndexKey(supplier)
 
 	sessionIDs, err := client.SMembers(ctx, indexKey).Result()
 	if err != nil {
@@ -182,7 +181,7 @@ func fetchAndDisplaySessions(ctx context.Context, client *DebugRedisClient, supp
 	// or a legacy JSON string during a rolling upgrade; handle both.
 	var sessions []map[string]interface{}
 	for _, sessionID := range sessionIDs {
-		key := fmt.Sprintf("ha:miner:sessions:%s:%s", supplier, sessionID)
+		key := client.KB().MinerSessionKey(supplier, sessionID)
 		snapshot, err := loadSessionKey(ctx, client, key)
 		if err != nil || snapshot == nil {
 			continue

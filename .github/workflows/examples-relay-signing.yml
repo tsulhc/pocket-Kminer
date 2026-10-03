@@ -1,0 +1,129 @@
+name: Examples — Relay Signing
+
+# These are the multi-language relay-signing examples (nodejs, python, rust).
+# They are documentation as much as code: each one signs a Pocket relay ring
+# signature and is judged by the Go oracle, which wraps the SAME
+# github.com/pokt-network/ring-go a real relayer runs.
+#
+# The whole reason they need CI is hash_to_scalar's left-align quirk: it fires
+# on ~1 challenge in 256, so a broken port still verifies ~99.2% of the time and
+# looks finished. Each harness signs 1500 relays and requires 100% acceptance,
+# plus a negative control that proves it can actually fail. A dependency bump
+# (this is exactly how the k256 update surfaced) can silently break bug-compat;
+# this workflow makes that a red build instead of a production mystery.
+#
+# Scoped on purpose: it only runs when examples/relay-signing/** changes (or
+# this file), so edits to the core relayer/miner never pay for it.
+
+on:
+  # Manual trigger from the Actions tab / `gh workflow run`, independent of the
+  # path filter — lets an operator re-run the harnesses on demand.
+  workflow_dispatch:
+  push:
+    branches: ["main", "develop"]
+    paths:
+      - "examples/relay-signing/**"
+      - ".github/workflows/examples-relay-signing.yml"
+  pull_request:
+    paths:
+      - "examples/relay-signing/**"
+      - ".github/workflows/examples-relay-signing.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  # The oracle is a plain `package main` in the root module (ring-go, go-dleq
+  # and decred/secp256k1 are already in the root go.mod), so every job builds it
+  # the same way before running its language harness.
+
+  nodejs:
+    name: Node.js harness
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: examples/relay-signing/nodejs
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: "1.26.5"
+          cache: true
+
+      - name: Build the oracle
+        run: go build -o /tmp/oracle ./examples/relay-signing/oracle
+        working-directory: .
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: examples/relay-signing/nodejs/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify against the Go oracle (1500 signatures, 100% required)
+        run: node verify-against-oracle.mjs
+        env:
+          ORACLE: /tmp/oracle
+
+  python:
+    name: Python harness
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: examples/relay-signing/python
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: "1.26.5"
+          cache: true
+
+      - name: Build the oracle
+        run: go build -o /tmp/oracle ./examples/relay-signing/oracle
+        working-directory: .
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Verify against the Go oracle (1500 signatures, 100% required)
+        run: python3 verify_against_oracle.py --oracle /tmp/oracle
+
+  rust:
+    name: Rust harness
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: examples/relay-signing/rust
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: "1.26.5"
+          cache: true
+
+      - name: Build the oracle
+        run: go build -o /tmp/oracle ./examples/relay-signing/oracle
+        working-directory: .
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: examples/relay-signing/rust
+
+      - name: Verify against the Go oracle (1500 signatures + larger rings)
+        run: cargo run --release -- /tmp/oracle

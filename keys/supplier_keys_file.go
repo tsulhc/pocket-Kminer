@@ -5,12 +5,14 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 
 	"github.com/cosmos/cosmos-sdk/crypto/keys/secp256k1"
 	cryptotypes "github.com/cosmos/cosmos-sdk/crypto/types"
 	cosmostypes "github.com/cosmos/cosmos-sdk/types"
+	dcrsecp256k1 "github.com/decred/dcrd/dcrec/secp256k1/v4"
 	"github.com/fsnotify/fsnotify"
 	"gopkg.in/yaml.v2"
 
@@ -59,8 +61,10 @@ func (f *SupplierKeysFile) Validate() error {
 	return nil
 }
 
-// validateHexKeyFormat validates the format of a hex-encoded key WITHOUT parsing it.
-// This provides fast, detailed error messages before attempting expensive crypto operations.
+// validateHexKeyFormat validates a hex-encoded key without deriving anything from
+// it: shape first, then the one property that shape cannot show -- whether the
+// number is a usable private key at all. Both are cheap, so the detailed error
+// still arrives before any expensive crypto happens.
 func validateHexKeyFormat(hexKey string) error {
 	// Remove 0x prefix if present
 	cleaned := strings.TrimPrefix(hexKey, "0x")
@@ -83,6 +87,45 @@ func validateHexKeyFormat(hexKey string) error {
 		if !isDigit && !isLowerHex && !isUpperHex {
 			return fmt.Errorf("invalid hex character '%c' at position %d", c, i)
 		}
+	}
+
+	// Shape is not enough: 32 bytes are not automatically a private key. A
+	// secp256k1 key is a NUMBER and it has to sit in [1, N-1], N being the
+	// curve's order. Handed something outside that range the crypto library
+	// does not refuse it -- it REDUCES the value modulo N. So the key the
+	// operator wrote is silently not the key that signs, and the address is not
+	// the one they expect; the supplier then matches nothing staked and the
+	// error they eventually read is "no key for this supplier", which points
+	// nowhere near the file that is actually wrong.
+	//
+	// Measured 2026-09-03: 1 and N+1 derive the SAME
+	// address, and so do 0 and N. Two VALID keys never collide -- that was
+	// measured too -- so this is about material that is not a key, not about
+	// collisions between real ones.
+	//
+	// A value >= N essentially never arrives by accident: it is about 1 in 10^39
+	// of the space, so random corruption does not land there. ZERO does arrive:
+	// a secret that mounted empty, a truncated copy, a zeroed volume. That case
+	// is the reason this check earns its place -- it turns a confusing symptom
+	// into a message that names the file.
+	//
+	// The question is put to the very library that performs the reduction, so
+	// the check cannot drift from the behaviour it guards against: SetByteSlice
+	// reports whether the value had to be reduced. It is a copy and a compare,
+	// with no point multiplication.
+	raw, err := hex.DecodeString(cleaned)
+	if err != nil {
+		return fmt.Errorf("invalid hex: %w", err)
+	}
+	var scalar dcrsecp256k1.ModNScalar
+	if overflow := scalar.SetByteSlice(raw); overflow {
+		return fmt.Errorf("not a usable secp256k1 private key: the value is at or above the curve " +
+			"order N, and the crypto library reduces such a value instead of rejecting it, so this " +
+			"key would sign as a DIFFERENT key at a DIFFERENT address")
+	}
+	if scalar.IsZero() {
+		return fmt.Errorf("not a usable secp256k1 private key: the value is zero " +
+			"(all-zero key material usually means the file was truncated, or a mounted secret came up empty)")
 	}
 
 	return nil
@@ -111,15 +154,22 @@ func NewSupplierKeysFileProvider(logger logging.Logger, filePath string) (*Suppl
 		return nil, fmt.Errorf("failed to stat supplier keys file: %w", err)
 	}
 
-	// Create fsnotify watcher for the file
+	// Watch the PARENT DIRECTORY, not the file itself (same technique as
+	// FileKeyProvider): fsnotify drops a file watch when the watched inode is
+	// deleted or renamed, and Rename/Remove never re-arm it — so any atomic
+	// replace (vim/sed's write-temp-then-rename, a k8s projected-volume
+	// symlink swap) would silently kill hot reload, leaving the relayer
+	// signing with stale keys and no log evidence. The directory watch
+	// survives file replacement; Write|Create on the directory covers both
+	// in-place writes and the rename/symlink-swap arrival of new content.
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		return nil, fmt.Errorf("failed to create file watcher: %w", err)
 	}
 
-	if err := watcher.Add(filePath); err != nil {
+	if err := watcher.Add(filepath.Dir(filePath)); err != nil {
 		_ = watcher.Close()
-		return nil, fmt.Errorf("failed to watch supplier keys file: %w", err)
+		return nil, fmt.Errorf("failed to watch supplier keys directory: %w", err)
 	}
 
 	return &SupplierKeysFileProvider{
@@ -134,6 +184,10 @@ func NewSupplierKeysFileProvider(logger logging.Logger, filePath string) (*Suppl
 func (p *SupplierKeysFileProvider) Name() string {
 	return "supplier_keys_file:" + p.filePath
 }
+
+// Kind returns the provider family, for metric labels. Deliberately without the
+// path that Name() carries: a metric label must be bounded.
+func (p *SupplierKeysFileProvider) Kind() string { return "supplier_keys_file" }
 
 // LoadKeys loads all keys from the supplier.yaml file.
 // The operator address is derived from each private key.
@@ -172,7 +226,7 @@ func (p *SupplierKeysFileProvider) LoadKeys(ctx context.Context) (map[string]cry
 				Err(err).
 				Int("index", i).
 				Msg("failed to parse key from supplier.yaml")
-			keyLoadErrors.WithLabelValues("supplier_keys_file").Inc()
+			keyLoadErrors.WithLabelValues(p.Kind()).Inc()
 			continue
 		}
 
@@ -215,12 +269,11 @@ func parseHexKeyWithAddress(hexKey string) (cryptotypes.PrivKey, string, error) 
 
 	privKey := &secp256k1.PrivKey{Key: keyBytes}
 
-	// Derive the operator address from the public key using "pokt" bech32 prefix
+	// Derive the operator address from the public key using Pocket's bech32 prefix
 	pubKey := privKey.PubKey()
 	addr := cosmostypes.AccAddress(pubKey.Address())
 
-	// Convert to "pokt" prefix (Pocket Network uses "pokt" instead of "cosmos")
-	operatorAddr, err := cosmostypes.Bech32ifyAddressBytes("pokt", addr)
+	operatorAddr, err := OperatorAddress(addr)
 	if err != nil {
 		return nil, "", fmt.Errorf("failed to encode address with pokt prefix: %w", err)
 	}
@@ -235,32 +288,9 @@ func (p *SupplierKeysFileProvider) SupportsHotReload() bool {
 
 // WatchForChanges returns a channel that signals when keys may have changed.
 func (p *SupplierKeysFileProvider) WatchForChanges(ctx context.Context) <-chan struct{} {
-	// Start watching goroutine
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case event, ok := <-p.watcher.Events:
-				if !ok {
-					return
-				}
-				// Trigger on Write or Create (file replacement)
-				if event.Op&(fsnotify.Write|fsnotify.Create) != 0 {
-					// Non-blocking send
-					select {
-					case p.changeCh <- struct{}{}:
-					default:
-					}
-				}
-			case err, ok := <-p.watcher.Errors:
-				if !ok {
-					return
-				}
-				p.logger.Warn().Err(err).Msg("file watcher error")
-			}
-		}
-	}()
+	// Trigger on Write or Create (file replacement).
+	go watchFileEvents(ctx, p.logger, p.watcher, p.changeCh, &p.mu, &p.closed,
+		fsnotify.Write|fsnotify.Create)
 
 	return p.changeCh
 }

@@ -19,10 +19,11 @@ import (
 
 	"github.com/pokt-network/pocket-relay-miner/leader"
 	"github.com/pokt-network/pocket-relay-miner/logging"
+	redisutil "github.com/pokt-network/pocket-relay-miner/transport/redis"
 )
 
 // This file is the wiring smoke test the CUPR incident demanded: it wires the
-// REAL CacheOrchestrator + REAL cache-pkg entity caches + miniredis + a fake
+// REAL CacheOrchestrator + REAL cache-pkg entity caches + a real Redis + a fake
 // chain, drives a real block event through the leader's refresh worker, and
 // asserts the full propagation chain end-to-end:
 //
@@ -164,7 +165,7 @@ type smokeHarness struct {
 	relayerSvc KeyedEntityCache[string, *sharedtypes.Service]
 }
 
-// newSmokeOrchestrator wires the full orchestrator with real caches + miniredis +
+// newSmokeOrchestrator wires the full orchestrator with real caches + a real Redis +
 // fake chain clients. It does NOT start the leader elector; the test drives
 // leadership deterministically via onBecameLeader (no heartbeat timing).
 func newSmokeOrchestrator(t *testing.T, svcCUPR uint64, appDelegatees []string) *smokeHarness {
@@ -181,9 +182,6 @@ func newSmokeOrchestrator(t *testing.T, svcCUPR uint64, appDelegatees []string) 
 	proofCache := NewProofParamsCache(log, redisClient, &smokeProofClient{}, &stubSharedQueryClient{}, 10)
 	supplierParams := NewRedisSupplierParamCache(log, redisClient, &smokeSupplierParamsClient{}, CacheConfig{})
 	supplierCache := NewSupplierCache(log, redisClient, SupplierCacheConfig{})
-	sessionCache := NewRedisSessionCache(log, redisClient,
-		&frozenSessionQueryClient{frozenID: "s", endHeight: 110},
-		&stubSharedQueryClient{}, &stubBlockClient{height: 100}, CacheConfig{})
 
 	// A second service cache instance simulates the RELAYER: it has no
 	// orchestrator and follows only via pub/sub + its own L1 TTL.
@@ -198,6 +196,18 @@ func newSmokeOrchestrator(t *testing.T, svcCUPR uint64, appDelegatees []string) 
 			_ = c.Close()
 		}
 	})
+
+	// Start() spawns the invalidation subscription in a goroutine and returns
+	// before SUBSCRIBE reaches the server (see SubscribeToInvalidations in
+	// cache/pubsub.go). Redis pub/sub has no replay: an invalidation published
+	// into that window is dropped and the subscriber never learns of it, so its
+	// L1 stays stale forever. Wait for the subscriptions the tests depend on to
+	// be registered before any test can publish a block event.
+	//
+	// Both service caches (leader + relayer) listen on the service channel; the
+	// application cache is the sole listener on its own.
+	waitForInvalidationSubscribers(t, redisClient, "service", 2)
+	waitForInvalidationSubscribers(t, redisClient, "application", 1)
 
 	subscriber := newControllableBlockSubscriber()
 	elector := leader.NewGlobalLeaderElectorWithConfig(log, redisClient, "smoke-instance",
@@ -215,7 +225,6 @@ func newSmokeOrchestrator(t *testing.T, svcCUPR uint64, appDelegatees []string) 
 		appCache,
 		leaderSvc,
 		supplierCache,
-		sessionCache,
 		// Mirror NewCacheOrchestrator's own master-pool sizing assumption
 		// (numCPU*8) so its 15% refresh subpool fits.
 		pond.NewPool(runtime.NumCPU()*8),
@@ -229,6 +238,26 @@ func newSmokeOrchestrator(t *testing.T, svcCUPR uint64, appDelegatees []string) 
 		leaderSvc:  leaderSvc,
 		relayerSvc: relayerSvc,
 	}
+}
+
+// waitForInvalidationSubscribers blocks until at least n subscribers are
+// registered on the server for the given cache type's invalidation channel.
+//
+// This closes the only timing hole in this harness. Without it the tests race
+// the subscription goroutine: they pass whenever it wins (always, on an idle
+// dev box) and fail permanently when it does not, because the missed
+// invalidation is never redelivered. That is how they failed on a loaded
+// 2-core CI runner.
+func waitForInvalidationSubscribers(t *testing.T, redisClient *redisutil.Client, cacheType string, n int64) {
+	t.Helper()
+	ctx := context.Background()
+	channel := redisClient.KB().EventChannel(cacheType, "invalidate")
+
+	require.Eventually(t, func() bool {
+		counts, err := redisClient.PubSubNumSub(ctx, channel).Result()
+		return err == nil && counts[channel] >= n
+	}, 10*time.Second, 5*time.Millisecond,
+		"%d subscriber(s) must be registered on %s before any invalidation is published", n, channel)
 }
 
 // becomeLeaderAndStart starts the orchestrator and deterministically drives it
@@ -249,22 +278,6 @@ func seedKnown(t *testing.T, h *smokeHarness, entityType string, ids ...string) 
 	ctx := context.Background()
 	key := h.orch.redisClient.KB().CacheKnownKey(entityType)
 	require.NoError(t, h.orch.redisClient.SAdd(ctx, key, ids).Err())
-}
-
-func waitServicePubSubReady(t *testing.T, h *smokeHarness, serviceID string) {
-	t.Helper()
-	ctx := context.Background()
-	const readyCUPR = uint64(101)
-	require.NoError(t, h.leaderSvc.Set(ctx, serviceID, &sharedtypes.Service{
-		Id:                   serviceID,
-		ComputeUnitsPerRelay: readyCUPR,
-	}, 0))
-	payload := `{"service_id":"` + serviceID + `"}`
-	require.Eventually(t, func() bool {
-		_ = PublishInvalidation(ctx, h.orch.redisClient, h.orch.logger, serviceCacheType, payload)
-		svc, err := h.relayerSvc.Get(ctx, serviceID)
-		return err == nil && svc.GetComputeUnitsPerRelay() == readyCUPR
-	}, 5*time.Second, 20*time.Millisecond, "relayer service cache pub/sub subscription must be active before testing refresh invalidation")
 }
 
 // TestOrchestrator_BlockEvent_RefreshesDiscoveredService_FullChain is the
@@ -291,7 +304,6 @@ func TestOrchestrator_BlockEvent_RefreshesDiscoveredService_FullChain(t *testing
 	rsvc, err := h.relayerSvc.Get(ctx, svcID)
 	require.NoError(t, err)
 	require.Equal(t, uint64(100), rsvc.GetComputeUnitsPerRelay())
-	waitServicePubSubReady(t, h, svcID)
 
 	// On-chain change mid-session.
 	h.svcClient.setChainCUPR(200)

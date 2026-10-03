@@ -1,8 +1,11 @@
 package cmd
 
 import (
+	"crypto/rand"
 	"fmt"
+	"math/big"
 	"net/url"
+	"os"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -24,6 +27,7 @@ Modes:
   websocket - Send WebSocket relay requests
   grpc      - Send gRPC relay requests
   stream    - Send streaming relay requests (SSE/NDJSON)
+  cometbft  - Send CometBFT relay requests (RPCType 5; JSON-RPC over HTTP)
 
 Examples:
   # Send a single JSONRPC relay
@@ -41,32 +45,39 @@ Examples:
 
 // Relay command flags are now in the relay package (relay.relay.RelayAppPrivKey, etc.)
 
-// Localnet defaults (from tilt/config/all-keys.yaml)
-// Genesis has 4 services with corresponding apps:
-//   - develop-http      -> app1 (pokt1mrqt5f7qh8uxs27cjm9t7v9e74a9vvdnq5jva4)
+// Localnet defaults, compiled in. They mirror tilt/config/all-keys.yaml but
+// are not read from it at runtime.
+// Genesis has 5 services with corresponding apps:
+//   - develop-http      -> app1 (pokt1pyr6a2yz9rrdhlgg8ff0xqhlsv3qsxcmm3yp8z)
 //   - develop-websocket -> app2 (pokt184zvylazwu4queyzpl0gyz9yf5yxm2kdhh9hpm)
 //   - develop-stream    -> app3 (pokt1lqyu4v88vp8tzc86eaqr4lq8rwhssyn6rfwzex)
 //   - develop-grpc      -> app4 (pokt1pn64d94e6u5g8cllsnhgrl6t96ysnjw59j5gst)
+//   - develop-cometbft  -> app5 (pokt1ppuhmrhphj0gawkhrs7d45u85gp4fw06tjg3j5)
 //
 // All apps delegate to gateway1 (pokt15vzxjqklzjtlz7lahe8z2dfe9nm5vxwwmscne4)
 const (
 	// App private keys (each app is staked for one service)
-	localnetApp1PrivKey = "2d00ef074d9b51e46886dc9a1df11e7b986611d0f336bdcf1f0adce3e037ec0a" // develop-http
-	localnetApp2PrivKey = "7e7571a8c61b0887ff8a9017bb4ad83c016b193234f9dc8b6a8ce10c7c483600" // develop-websocket
-	localnetApp3PrivKey = "7cbbaa043b9b63baa7d6bb087483b0a6a9f82596c19dce4c5028eb43e5b63674" // develop-stream
-	localnetApp4PrivKey = "84e4f2257f24d9e1517d414b834bbbfa317e0d53fef21c1528a07a5fa8c70d57" // develop-grpc
+	localnetApp1PrivKey                = "c188c43496351a963762a5d9de78ff887ac66b4ba5de5967efd55a6d1e71ddda" // develop-http
+	localnetApp2PrivKey                = "7e7571a8c61b0887ff8a9017bb4ad83c016b193234f9dc8b6a8ce10c7c483600" // develop-websocket
+	localnetApp3PrivKey                = "7cbbaa043b9b63baa7d6bb087483b0a6a9f82596c19dce4c5028eb43e5b63674" // develop-stream
+	localnetApp4PrivKey                = "84e4f2257f24d9e1517d414b834bbbfa317e0d53fef21c1528a07a5fa8c70d57" // develop-grpc
+	localnetApp5PrivKey                = "50058b14b956cd3071aad111f3f2a0d9a00b7028edde6c713e838b7522a626de" // develop-cometbft
+	localnetAppHTTPEagerPrivKey        = "ba6603975b80a409bd52f9cb662855430a354aaa801eaf0a025360d893d02cb6" // develop-http-eager (mode-matrix cell)
+	localnetAppWSOptimisticPrivKey     = "8ddd54f70b3e0e486d6eae1d83af5cfa7131868f25ba106275dab37d78ccf804" // develop-websocket-optimistic (mode-matrix cell)
+	localnetAppGRPCOptimisticPrivKey   = "f98650408e97fb56760238ff6f8d02bc2259eaa7dba20f928bf95e4fd8ea50a7" // develop-grpc-optimistic (mode-matrix cell)
+	localnetAppStreamOptimisticPrivKey = "36254136682eeddd1047358dd907afea8de19fb9c2e4da20d4ed4e3a403ea108" // develop-stream-optimistic (mode-matrix cell)
+	localnetAppCometOptimisticPrivKey  = "0c9e344ee14f70d097b0c99c8dc20367e48fb3ca283dd1dfd6c4974656508c5c" // develop-cometbft-optimistic (mode-matrix cell)
 
 	// Gateway private key (all apps delegate to this gateway)
 	// When --gateway-priv-key is provided, relays are signed with this key on behalf of the app
-	// This matches PATH's approach for gateway signing
+	// This is how a gateway signs
 	localnetGateway1PrivKey = "cf09805c952fa999e9a63a9f434147b0a5abfd10f268879694c6b5a70e1ae177"
 
 	// First supplier address (for relay routing)
-	localnetSupplier1Addr = "pokt19a3t4yunp0dlpfjrp7qwnzwlrzd5fzs2gjaaaj"
+	localnetSupplier1Addr = "pokt1600zxkjujmckypws608sd0782r6dta0jpj58yj"
 
 	// Network endpoints
 	localnetGRPCEndpoint = "localhost:9090"
-	localnetRPCEndpoint  = "http://localhost:26657"
 	localnetChainID      = "poktroll"
 	localnetRelayerURL   = "http://localhost:8180"
 )
@@ -74,10 +85,16 @@ const (
 // localnetAppKeys maps service IDs to their corresponding app private keys.
 // This allows automatic selection of the correct app when --localnet and --service are used together.
 var localnetAppKeys = map[string]string{
-	"develop-http":      localnetApp1PrivKey,
-	"develop-websocket": localnetApp2PrivKey,
-	"develop-stream":    localnetApp3PrivKey,
-	"develop-grpc":      localnetApp4PrivKey,
+	"develop-http":                 localnetApp1PrivKey,
+	"develop-websocket":            localnetApp2PrivKey,
+	"develop-stream":               localnetApp3PrivKey,
+	"develop-grpc":                 localnetApp4PrivKey,
+	"develop-cometbft":             localnetApp5PrivKey,
+	"develop-http-eager":           localnetAppHTTPEagerPrivKey,
+	"develop-websocket-optimistic": localnetAppWSOptimisticPrivKey,
+	"develop-grpc-optimistic":      localnetAppGRPCOptimisticPrivKey,
+	"develop-stream-optimistic":    localnetAppStreamOptimisticPrivKey,
+	"develop-cometbft-optimistic":  localnetAppCometOptimisticPrivKey,
 }
 
 // validateURL validates a URL and ensures it uses an allowed scheme.
@@ -153,34 +170,167 @@ func validateServiceID(serviceID string) error {
 // RelayCmd returns the relay command for testing relay requests.
 func RelayCmd() *cobra.Command {
 	// Localnet mode
-	relayCmd.PersistentFlags().BoolVar(&relay.RelayLocalnet, "localnet", false, "Use localnet defaults from tilt/config (auto-selects app for service)")
+	relayCmd.PersistentFlags().BoolVar(&relay.RelayLocalnet, "localnet", false, "Use the compiled-in localnet defaults: relayer http://localhost:8180, node localhost:9090, the Tilt localnet keys (auto-selects app for service); --relayer-url and --node override them")
 
 	// Connection flags
-	relayCmd.PersistentFlags().StringVar(&relay.RelayAppPrivKey, "app-priv-key", "", "Application private key (hex)")
-	relayCmd.PersistentFlags().StringVar(&relay.RelayGatewayPrivKey, "gateway-priv-key", "", "Gateway private key for ring signing (hex, matches PATH approach)")
+	relayCmd.PersistentFlags().StringVar(&relay.RelayAppPrivKey, "app-priv-key", "", "Application private key (hex) — testing/localnet only; prefer --app-key or --keys-file to keep hex off the command line")
+	relayCmd.PersistentFlags().StringVar(&relay.RelayGatewayPrivKey, "gateway-priv-key", "", "Gateway private key for ring signing (hex) — testing/localnet only; prefer --gateway-key or --keys-file")
+
+	// Secure key sources (resolved to keys in memory; hex never appears on the CLI)
+	relayCmd.PersistentFlags().StringVar(&relay.RelayKeyringBackend, "keyring-backend", "", "Cosmos keyring backend for --app-key/--gateway-key: file or test")
+	relayCmd.PersistentFlags().StringVar(&relay.RelayKeyringDir, "keyring-dir", "", "Cosmos keyring directory CONTAINING the keyring (required with --keyring-backend; the backend reads <dir>/keyring-<backend>)")
+	relayCmd.PersistentFlags().StringVar(&relay.RelayAppKeyName, "app-key", "", "Application key name in the keyring (resolved via --keyring-backend)")
+	relayCmd.PersistentFlags().StringVar(&relay.RelayGatewayKeyName, "gateway-key", "", "Gateway key name in the keyring (resolved via --keyring-backend)")
+	relayCmd.PersistentFlags().StringVar(&relay.RelayKeysFile, "keys-file", "", "Path to a YAML keys file (applications:[hex] + gateway:[hex]); uses the first of each")
 	relayCmd.PersistentFlags().StringVar(&relay.RelayServiceID, "service", "", "Service ID (e.g., develop-http, develop-websocket, develop-stream, develop-grpc)")
 	relayCmd.PersistentFlags().StringVar(&relay.RelayNodeGRPC, "node", "", "gRPC endpoint for chain queries (e.g., localhost:9090)")
-	relayCmd.PersistentFlags().StringVar(&relay.RelayNodeRPC, "node-rpc", "", "CometBFT RPC endpoint for block subscription (e.g., http://localhost:26657)")
+	relayCmd.PersistentFlags().BoolVar(&relay.RelayGRPCTLS, "grpc-tls", false, "Use TLS for the --node gRPC connection (required for beta/mainnet endpoints on :443)")
+	relayCmd.PersistentFlags().StringVar(&relay.RelayNodeRPC, "node-rpc", "", "Unused: the chain height is read over the --node gRPC connection")
 	relayCmd.PersistentFlags().StringVar(&relay.RelayChainID, "chain-id", "", "Chain ID (e.g., poktroll)")
+
+	// --node-rpc has no reader: the relay client reads the chain height over the
+	// --node gRPC connection. It stays accepted so existing invocations keep
+	// working, and says so when used.
+	_ = relayCmd.PersistentFlags().MarkDeprecated("node-rpc", "it is unused: the chain height is now read over the --node gRPC connection")
 
 	// Optional flags
 	relayCmd.PersistentFlags().StringVar(&relay.RelayRelayerURL, "relayer-url", "", "Relayer endpoint URL")
 	relayCmd.PersistentFlags().StringVar(&relay.RelaySupplierAddr, "supplier", "", "Supplier operator address")
-	relayCmd.PersistentFlags().IntVarP(&relay.RelayCount, "count", "n", 1, "Number of requests to send")
+	relayCmd.PersistentFlags().BoolVar(&relay.RelayAllSuppliers, "all-suppliers", false, "Do not pin one supplier: a load test round-robins across every supplier in the session (avoids exhausting one supplier's per-session claimable budget); a single relay picks one of them at random")
+	relayCmd.PersistentFlags().IntVarP(&relay.RelayCount, "count", "n", 1, "Number of requests to send (jsonrpc/websocket/grpc load test)")
+	relayCmd.PersistentFlags().IntVar(&relay.RelayBatches, "batches", 0, "stream mode: ask the backend to emit this many SSE batches then close (0 = receive until the server closes or --timeout)")
+	relayCmd.PersistentFlags().StringVar(&relay.RelayGRPCMethod, "grpc-method", "", "grpc mode: /package.Service/Method to invoke (default: the localnet demo method, which any other backend answers UNIMPLEMENTED)")
+	relayCmd.PersistentFlags().StringVar(&relay.RelayGRPCRequestHex, "grpc-request-hex", "", "grpc mode: protobuf request body as hex (default: empty, which is correct for any request message with no fields)")
+	relayCmd.PersistentFlags().StringVar(&relay.RelayWSHandshake, "ws-handshake", "v2", "websocket mode: handshake shape — v2 names the supplier in a header, v1 omits it so the supplier comes from the first RelayRequest")
+	relayCmd.PersistentFlags().StringVar(&relay.RelayWSCase, "ws-case", "", "websocket mode: run ONE adversarial case instead of a relay and assert what the relayer did (hang, garbage, abrupt-disconnect, supplier-change, no-session-header, oversized, subscribe)")
 	relayCmd.PersistentFlags().BoolVar(&relay.RelayLoadTest, "load-test", false, "Enable load test mode with concurrency")
 	relayCmd.PersistentFlags().IntVar(&relay.RelayConcurrency, "concurrency", 10, "Number of concurrent workers (load test mode)")
 	relayCmd.PersistentFlags().IntVar(&relay.RelayRPS, "rps", 0, "Target requests per second (0 = unlimited, only for load test mode)")
-	relayCmd.PersistentFlags().StringVar(&relay.RelayPayloadJSON, "payload", "", "Custom JSON-RPC payload (default: eth_blockNumber)")
-	relayCmd.PersistentFlags().BoolVar(&relay.RelayOutputJSON, "output-json", false, "Output results as JSON")
-	relayCmd.PersistentFlags().IntVar(&relay.RelayTimeout, "timeout", 30, "Request timeout in seconds")
+	relayCmd.PersistentFlags().StringVar(&relay.RelayPayloadJSON, "payload", "",
+		"Custom JSON-RPC payload, or @FILE to read it from a file (default: eth_blockNumber). "+
+			"A body over ~128 KiB can ONLY be passed as @FILE: the kernel caps one argument at that size")
+	relayCmd.PersistentFlags().BoolVar(&relay.RelayOutputJSON, "output-json", false, "Output results as JSON (stream mode only; ignored by other modes)")
+	relayCmd.PersistentFlags().IntVar(&relay.RelayTimeout, "timeout", 120, "Request timeout in seconds (also the max time a stream is read before giving up)")
 	relayCmd.PersistentFlags().BoolVar(&relay.RelayVerbose, "verbose", false, "Verbose logging")
 
+	// Simulated-relay flags: fire a real, ring-signed relay verified by the
+	// relayer's SimulationVerifier against a config-pinned ring instead of an
+	// on-chain session (served but never charged). See cmd/relay/simulate.go.
+	relayCmd.PersistentFlags().BoolVar(&relay.RelaySimulate, "simulate", false, "Fire a simulated relay: locally ring-signed (no chain query), verified by the relayer's SimulationVerifier against config-pinned keys — served but never charged — instead of a normal chain-backed relay")
+	relayCmd.PersistentFlags().StringVar(&relay.RelaySimKeyID, "sim-key-id", "", "Simulation identity key_id pinned in the relayer's simulation config (required with --simulate)")
+	relayCmd.PersistentFlags().StringVar(&relay.RelaySimAppPubKey, "sim-app-pubkey", "", "Compressed secp256k1 app pubkey (hex) for the simulated ring (default: derived from --app-priv-key/--app-key/--keys-file)")
+	relayCmd.PersistentFlags().StringSliceVar(&relay.RelaySimGatewayPubKeys, "sim-gateway-pubkeys", nil, "Compressed secp256k1 gateway pubkey(s) (hex; comma-separated or repeated) for the simulated ring (default: derived from --gateway-priv-key/--gateway-key/--keys-file)")
+
 	return relayCmd
+}
+
+// payloadFileMarker is the prefix that makes --payload name a FILE instead of
+// carrying the body itself.
+//
+// It exists because an argument cannot carry a big body: the kernel caps a
+// single argv entry at MAX_ARG_STRLEN (128 KiB), and a --payload past that dies
+// as "Argument list too long" from the shell, AFTER the caller has printed how
+// many bytes it meant to send. Measured 2026-09-20 with 8 MiB. So the sizes
+// that matter for filling a validation queue -- megabytes, up to the service's
+// max_body_size_bytes -- can only arrive through a file.
+const payloadFileMarker = "@"
+
+// payloadSizeWarnBytes is where this command warns that the body may be refused
+// before it proves anything.
+//
+// It is the STOCK default of the relayer's default_max_body_size_bytes (10 MiB)
+// and not a limit this command enforces: the real bound belongs to the service
+// being relayed to, and this process does not read the relayer's config. A body
+// over it is still sent, because refusing here would be this tool inventing a
+// rule the relayer might not have. What must not happen is the silent version:
+// the relay refused for SIZE while the operator believes they measured a queue.
+const payloadSizeWarnBytes = 10 * 1024 * 1024
+
+// resolvePayloadFile replaces a --payload of the form @path with the file's
+// contents.
+//
+// A missing or unreadable file is a FAILURE naming the path, never a fallback
+// to the built-in payload: a body that was not sent and a run that "did not
+// saturate" read identically afterwards, and that is the failure mode this
+// whole change exists to remove.
+func resolvePayloadFile() error {
+	if !strings.HasPrefix(relay.RelayPayloadJSON, payloadFileMarker) {
+		return nil
+	}
+
+	path := strings.TrimPrefix(relay.RelayPayloadJSON, payloadFileMarker)
+	if path == "" {
+		return fmt.Errorf("--payload=%s needs a file path after the %s",
+			payloadFileMarker, payloadFileMarker)
+	}
+
+	body, err := os.ReadFile(path) //nolint:gosec // the operator names the file; this is a testing CLI
+	if err != nil {
+		return fmt.Errorf("--payload=%s%s: %w", payloadFileMarker, path, err)
+	}
+	if len(body) == 0 {
+		return fmt.Errorf("--payload=%s%s: the file is empty, so the relay would carry no body",
+			payloadFileMarker, path)
+	}
+
+	if int64(len(body)) > payloadSizeWarnBytes {
+		fmt.Fprintf(os.Stderr,
+			"WARNING: payload is %d bytes, over the stock default_max_body_size_bytes (%d). "+
+				"If this service does not raise max_body_size_bytes, the relayer refuses the relay for SIZE "+
+				"-- which is not the limit you are trying to measure.\n",
+			len(body), payloadSizeWarnBytes)
+	}
+
+	relay.RelayPayloadJSON = string(body)
+	return nil
 }
 
 // runRelayCommand executes the relay command based on the selected mode.
 func runRelayCommand(cmd *cobra.Command, args []string) error {
 	mode := args[0]
+
+	// A payload given as @path is read from the FILE, and it is resolved HERE,
+	// before anything else runs.
+	//
+	// WHY IN THIS ONE PLACE: the value has seven readers (cmd/relay/http.go,
+	// websocket.go, cometbft.go, stream.go, grpc.go, websocket_cases.go, and the
+	// gRPC flag check further down), and every mode arrives through this
+	// function -- `relay` takes the mode as an ARGUMENT, not as a cobra
+	// subcommand, so there is exactly one entry point. Resolving it per reader
+	// would be seven edits, and the one that got forgotten would send the
+	// literal "@/tmp/payload.json" as the body: the backend then answers a JSON
+	// error, which names the payload and not the resolution that never happened.
+	if err := resolvePayloadFile(); err != nil {
+		return err
+	}
+
+	// Initialize Cosmos SDK config with the "pokt" Bech32 prefix, same as
+	// runHARelayer. Without this, cosmostypes.AccAddress(...).String() (used
+	// by BuildSimulatedRelayRequest to derive the simulated session's
+	// ApplicationAddress, matching relayer/simulation.go's own derivation)
+	// would default to the cosmos-sdk's stock "cosmos" prefix in THIS
+	// process, producing an address the relayer's pinned identity would
+	// never match — even though relay_client's other address helpers
+	// (deriveAddressFromPubKey) sidestep this by hardcoding "pokt" directly.
+	initSDKConfig()
+
+	// Create logger (needed early so key resolution can log through the keyring).
+	logConfig := logging.DefaultConfig()
+	if relay.RelayVerbose {
+		logConfig.Level = "debug"
+		logConfig.Format = "text"
+	} else {
+		logConfig.Level = "info"
+	}
+	logger := logging.NewLoggerFromConfig(logConfig)
+
+	// Resolve keys from a keyring (--app-key/--gateway-key) or a keys file
+	// (--keys-file) into the in-memory hex fields, so raw private keys never have
+	// to be passed on the command line. Runs before the localnet block, which only
+	// fills fields still empty.
+	if err := relay.ResolveKeys(logger); err != nil {
+		return err
+	}
 
 	// Apply localnet defaults if --localnet flag is set
 	if relay.RelayLocalnet {
@@ -197,7 +347,7 @@ func runRelayCommand(cmd *cobra.Command, args []string) error {
 			relay.RelayAppPrivKey = localnetApp1PrivKey
 		}
 
-		// Set gateway key for gateway mode (matches PATH's approach)
+		// Set gateway key for gateway mode (signs as a gateway does)
 		// All apps delegate to gateway1, so we can sign relays on their behalf
 		if relay.RelayGatewayPrivKey == "" {
 			relay.RelayGatewayPrivKey = localnetGateway1PrivKey
@@ -206,23 +356,20 @@ func runRelayCommand(cmd *cobra.Command, args []string) error {
 		if relay.RelayNodeGRPC == "" {
 			relay.RelayNodeGRPC = localnetGRPCEndpoint
 		}
-		if relay.RelayNodeRPC == "" {
-			relay.RelayNodeRPC = localnetRPCEndpoint
-		}
 		if relay.RelayChainID == "" {
 			relay.RelayChainID = localnetChainID
 		}
 		if relay.RelayRelayerURL == "" {
 			relay.RelayRelayerURL = localnetRelayerURL
 		}
-		if relay.RelaySupplierAddr == "" {
+		if shouldPinLocalnetSupplier(relay.RelaySupplierAddr, relay.RelayAllSuppliers, relay.RelaySimulate) {
 			relay.RelaySupplierAddr = localnetSupplier1Addr
 		}
 	}
 
 	// Validate required flags
 	if relay.RelayAppPrivKey == "" {
-		return fmt.Errorf("--app-priv-key is required (or use --localnet)")
+		return fmt.Errorf("an application key is required: --app-key <name> (keyring), --keys-file <path>, or --app-priv-key <hex> (or use --localnet)")
 	}
 	if relay.RelayServiceID == "" {
 		return fmt.Errorf("--service is required")
@@ -244,18 +391,9 @@ func runRelayCommand(cmd *cobra.Command, args []string) error {
 		relay.RelayRelayerURL = "http://localhost:8080"
 	}
 
-	// Default RPC endpoint to gRPC endpoint with different port if not provided
-	if relay.RelayNodeRPC == "" {
-		// Try to infer from gRPC endpoint (e.g., localhost:9090 -> http://localhost:26657)
-		relay.RelayNodeRPC = "http://localhost:26657"
-	}
-
 	// Validate URLs (security: prevent SSRF, ensure valid schemes)
 	if err := validateURL(relay.RelayRelayerURL, []string{"http", "https", "ws", "wss"}); err != nil {
 		return fmt.Errorf("invalid relayer URL: %w", err)
-	}
-	if err := validateURL(relay.RelayNodeRPC, []string{"http", "https"}); err != nil {
-		return fmt.Errorf("invalid node RPC URL: %w", err)
 	}
 
 	// Validate mode
@@ -264,9 +402,10 @@ func runRelayCommand(cmd *cobra.Command, args []string) error {
 		"websocket": true,
 		"grpc":      true,
 		"stream":    true,
+		"cometbft":  true,
 	}
 	if !validModes[mode] {
-		return fmt.Errorf("invalid mode %q. Valid modes: jsonrpc, websocket, grpc, stream", mode)
+		return fmt.Errorf("invalid mode %q. Valid modes: jsonrpc, websocket, grpc, stream, cometbft", mode)
 	}
 
 	// Validate concurrency (security: prevent resource exhaustion)
@@ -304,6 +443,39 @@ func runRelayCommand(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("--rps requires --load-test flag (RPS targeting only works in load test mode)")
 	}
 
+	// --batches asks the backend to emit that many SSE batches then close; it is a
+	// stream-only control. -n/--count is the request/load-test count for the other
+	// modes and has no meaning for stream (a stream is read until the server closes
+	// or --timeout fires). Reject both cross-mode uses before any client or key is
+	// initialized, and point users at the right flag instead of silently ignoring.
+	if relay.RelayBatches < 0 {
+		return fmt.Errorf("--batches must be non-negative")
+	}
+	if relay.RelayBatches > 0 && mode != "stream" {
+		return fmt.Errorf("--batches only applies to stream mode (other modes use -n/--count)")
+	}
+	if (relay.RelayGRPCMethod != "" || relay.RelayGRPCRequestHex != "") && mode != "grpc" {
+		return fmt.Errorf("--grpc-method/--grpc-request-hex only apply to grpc mode")
+	}
+	// A custom --payload drives the REST fallback, where buildNativeGRPCPayload
+	// never runs -- so the method and request body would be dropped without a
+	// word. Silently ignoring a flag the operator passed is the defect this
+	// whole rescue answers; refuse instead.
+	if (relay.RelayGRPCMethod != "" || relay.RelayGRPCRequestHex != "") && relay.RelayPayloadJSON != "" {
+		return fmt.Errorf("--grpc-method/--grpc-request-hex cannot be combined with --payload: " +
+			"a custom payload drives the REST fallback, which never builds a gRPC request")
+	}
+	if relay.RelayGRPCRequestHex != "" && relay.RelayGRPCMethod == "" {
+		return fmt.Errorf("--grpc-request-hex needs --grpc-method: " +
+			"a request body for the demo method is almost certainly a mistake")
+	}
+	if mode == "stream" && relay.RelayCount > 1 {
+		return fmt.Errorf("-n/--count does not apply to stream mode (a stream is read until the server closes; use --batches to ask the backend for a bounded number of SSE batches)")
+	}
+	if mode == "stream" && relay.RelayLoadTest {
+		return fmt.Errorf("load test mode is not supported for streaming relays (use --batches to ask the backend for a bounded number of SSE batches)")
+	}
+
 	// Warn if load test flags are used without --load-test
 	if !relay.RelayLoadTest {
 		if relay.RelayConcurrency > 1 && cmd.Flags().Changed("concurrency") {
@@ -314,20 +486,10 @@ func runRelayCommand(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Create logger
-	logConfig := logging.DefaultConfig()
-	if relay.RelayVerbose {
-		logConfig.Level = "debug"
-		logConfig.Format = "text"
-	} else {
-		logConfig.Level = "info"
-	}
-	logger := logging.NewLoggerFromConfig(logConfig)
-
 	// Create query clients for chain interaction
 	queryClients, err := query.NewQueryClients(logger, query.ClientConfig{
 		GRPCEndpoint: relay.RelayNodeGRPC,
-		UseTLS:       false,
+		UseTLS:       relay.RelayGRPCTLS,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create query clients: %w", err)
@@ -342,6 +504,37 @@ func runRelayCommand(cmd *cobra.Command, args []string) error {
 	}, logger)
 	if err != nil {
 		return fmt.Errorf("failed to create relay client: %w", err)
+	}
+
+	// Resolve/validate the --simulate flag group now that keys are resolved
+	// (app/gateway priv key hex available for pubkey defaulting), but BEFORE
+	// the placeholder-supplier fallback below — --simulate requires a real
+	// --supplier, and the fallback would otherwise mask a missing one.
+	if err := relay.ResolveSimulationFlags(); err != nil {
+		return err
+	}
+
+	// --all-suppliers on a single relay means "any of them, do not make me name
+	// one", so pick one of the session's suppliers at random. Before this, the
+	// flag was consulted only on the load-test paths: a single relay fell through
+	// to the placeholder below and the warning said "--supplier not provided",
+	// which reads as "you forgot a flag" to someone who passed one that should
+	// have covered it. Recorded during the beta/pnf bring-up as silent wrong
+	// behaviour.
+	if relay.RelaySupplierAddr == "" && relay.RelayAllSuppliers {
+		suppliers, err := relayClient.SessionSupplierAddresses(cmd.Context(), relay.RelayServiceID)
+		if err != nil {
+			return fmt.Errorf("--all-suppliers: failed to list the session's suppliers: %w", err)
+		}
+		picked, err := pickRandomSupplier(suppliers)
+		if err != nil {
+			return fmt.Errorf("--all-suppliers: %w", err)
+		}
+		relay.RelaySupplierAddr = picked
+		logger.Info().
+			Str("supplier", relay.RelaySupplierAddr).
+			Int("session_suppliers", len(suppliers)).
+			Msg("--all-suppliers: picked one of the session's suppliers at random")
 	}
 
 	// If supplier address not provided, try to detect from relayer
@@ -375,7 +568,52 @@ func runRelayCommand(cmd *cobra.Command, args []string) error {
 		return relay.RunGRPCMode(cmd.Context(), logger, relayClient)
 	case "stream":
 		return relay.RunStreamMode(cmd.Context(), logger, relayClient)
+	case "cometbft":
+		return relay.RunCometBFTMode(cmd.Context(), logger, relayClient)
 	default:
 		return fmt.Errorf("mode %q not yet implemented", mode)
 	}
+}
+
+// pickRandomSupplier returns one of suppliers, chosen uniformly at random.
+//
+// Random rather than suppliers[0]: --all-suppliers means "any of them, do not
+// make me name one", so always returning the same element would quietly turn the
+// flag into a fixed choice and drain that one supplier's per-session claimable
+// budget -- the exact thing the flag exists to avoid.
+//
+// The empty case is an error rather than a panic even though the only caller
+// cannot produce it (SessionSupplierAddresses returns an error for a session
+// with no suppliers, client/relay_client/client.go:476), because the guarantee
+// lives in a different file and nothing enforces it here.
+func pickRandomSupplier(suppliers []string) (string, error) {
+	if len(suppliers) == 0 {
+		return "", fmt.Errorf("no suppliers to choose from")
+	}
+	n, err := rand.Int(rand.Reader, big.NewInt(int64(len(suppliers))))
+	if err != nil {
+		return "", fmt.Errorf("failed to choose a supplier: %w", err)
+	}
+	return suppliers[n.Int64()], nil
+}
+
+// shouldPinLocalnetSupplier says whether --localnet should fill in its default
+// supplier. It must not when --all-suppliers was passed: this runs ~170 lines
+// BEFORE the random pick, so pinning here silently wins and the flag goes on
+// being ignored under --localnet -- which is how every local test and the live
+// gate invoke the CLI.
+//
+// --simulate is the exception, and it must stay one: ResolveSimulationFlags
+// runs BEFORE the random pick and rejects an empty address, so suppressing the
+// default here would turn a working `--localnet --simulate --all-suppliers`
+// into a startup error. A simulated relay wants the simulation identity's
+// supplier anyway, not an arbitrary one, so "any of them" has no meaning there.
+//
+// Measured 2026-08-30: the random pick shipped with a unit test that passed and
+// a code path that never ran. Eight consecutive --localnet --all-suppliers
+// relays all went to supplier1; after this guard, eight runs hit six different
+// suppliers. The helper was right and the wiring was not, which is why the
+// precedence is a function with its own test rather than a condition inline.
+func shouldPinLocalnetSupplier(currentAddr string, allSuppliers, simulate bool) bool {
+	return currentAddr == "" && (!allSuppliers || simulate)
 }

@@ -48,10 +48,6 @@ func (n *noopPublisher) Publish(_ context.Context, _ *transport.MinedRelayMessag
 	return nil
 }
 
-func (n *noopPublisher) PublishBatch(_ context.Context, _ []*transport.MinedRelayMessage) error {
-	return nil
-}
-
 func (n *noopPublisher) Close() error {
 	return nil
 }
@@ -154,15 +150,19 @@ func TestNewWebSocketBridge_RequiresRelayProcessor(t *testing.T) {
 		"ws://backend:8545",
 		"svc-test",
 		"pokt1supplier",
-		0,
+		atHeight(0),
 		nil, // relayProcessor - intentionally nil
 		&noopPublisher{},
 		nil,
 		http.Header{},
 		nil,
 		nil,
-		1,
 		time.Second,
+		false, // simulated
+		nil,   // simVerifier
+		"",    // simKeyID
+		nil,   // onBackendDial
+		nil,   // queueFull
 	)
 	require.Error(t, err, "nil relayProcessor must fail fast — the old fallback silently collapsed events")
 	assert.Nil(t, bridge)

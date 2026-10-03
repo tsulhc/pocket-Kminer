@@ -155,13 +155,6 @@ func TestBlockSubscriber_IncreaseBackoff(t *testing.T) {
 	require.Equal(t, reconnectMaxDelay, delay4, "Backoff should stay at max delay")
 }
 
-// TestDefaultBlockSubscriberConfig tests default configuration.
-func TestDefaultBlockSubscriberConfig(t *testing.T) {
-	config := DefaultBlockSubscriberConfig()
-	require.Empty(t, config.RPCEndpoint, "Default config should have empty endpoint")
-	require.False(t, config.UseTLS, "Default config should have TLS disabled")
-}
-
 // TestSimpleBlock_Interface tests the SimpleBlock implementation.
 func TestSimpleBlock_Interface(t *testing.T) {
 	block := &SimpleBlock{
@@ -356,4 +349,18 @@ func TestConstants(t *testing.T) {
 	require.Equal(t, 1*time.Second, reconnectBaseDelay)
 	require.Equal(t, 15*time.Second, reconnectMaxDelay) // Updated to match actual code
 	require.Equal(t, 2, reconnectBackoffFactor)
+}
+
+// TestNewBlockSubscriber_TrimsTrailingSlash proves a trailing slash on the RPC
+// endpoint is normalized away, so the CometBFT client builds "/websocket" rather
+// than a "//websocket" path that a reverse proxy (e.g. Sauron) rejects with
+// "bad handshake".
+func TestNewBlockSubscriber_TrimsTrailingSlash(t *testing.T) {
+	logger := logging.NewLoggerFromConfig(logging.DefaultConfig())
+	for _, in := range []string{"http://localhost:26657/", "http://localhost:26657//", "http://localhost:26657"} {
+		sub, err := NewBlockSubscriber(logger, BlockSubscriberConfig{RPCEndpoint: in})
+		require.NoError(t, err)
+		require.Equal(t, "http://localhost:26657", sub.config.RPCEndpoint, "input %q must normalize", in)
+		sub.Close()
+	}
 }

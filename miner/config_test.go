@@ -1,6 +1,9 @@
 package miner
 
 import (
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -8,6 +11,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/pokt-network/pocket-relay-miner/config"
+	"github.com/pokt-network/pocket-relay-miner/logging"
 )
 
 func TestDefaultConfig(t *testing.T) {
@@ -16,11 +20,12 @@ func TestDefaultConfig(t *testing.T) {
 	// Redis config now uses namespace configuration for stream prefix and consumer group
 	// These are derived from the namespace config at runtime
 	require.Equal(t, "redis://localhost:6379", cfg.Redis.URL)
-	// Note: BlockTimeout removed - BLOCK 0 (TRUE PUSH) is now hardcoded in consumer
+	// Note: BlockTimeout removed - the consumer uses a bounded block (see
+	// blockInterval in transport/redis/consumer.go), NOT BLOCK 0: an unbounded
+	// block sets no read deadline, so a cancelled context cannot end the read
+	// and Close() hangs.
 	require.Equal(t, int64(60000), cfg.Redis.ClaimIdleTimeoutMs)
-	require.Equal(t, int64(10), cfg.DeduplicationTTLBlocks)
 	require.Equal(t, int64(1000), cfg.BatchSize) // Increased from 100 for better throughput
-	require.Equal(t, int64(50), cfg.AckBatchSize)
 }
 
 func TestConfig_Validate_Valid(t *testing.T) {
@@ -38,35 +43,13 @@ func TestConfig_Validate_Valid(t *testing.T) {
 		Keys: config.KeysConfig{
 			KeysFile: "/path/to/keys.yaml",
 		},
+		// Required since the transaction deadline became derived: there is no
+		// default block time to fall back on, so a config without it is invalid.
+		BlockTimeSeconds: 60,
 	}
 
 	err := cfg.Validate()
 	require.NoError(t, err)
-}
-
-func TestConfig_Validate_TxTimeoutMaxRejectsCosmosHardLimit(t *testing.T) {
-	cfg := &Config{
-		Redis: RedisConfig{
-			RedisConfig: config.RedisConfig{
-				URL: "redis://localhost:6379",
-			},
-		},
-		PocketNode: config.PocketNodeConfig{
-			QueryNodeRPCUrl:  "http://localhost:26657",
-			QueryNodeGRPCUrl: "localhost:9090",
-		},
-		Keys: config.KeysConfig{
-			KeysFile: "/path/to/keys.yaml",
-		},
-		Transaction: TransactionConfig{
-			TxTimeoutMaxSeconds: 600,
-		},
-	}
-
-	err := cfg.Validate()
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "transaction.tx_timeout_max_seconds")
-	require.Contains(t, err.Error(), "must be less than 600")
 }
 
 func TestConfig_Validate_MissingRedisURL(t *testing.T) {
@@ -149,13 +132,184 @@ func TestConfig_Validate_NoKeySource(t *testing.T) {
 
 	err := cfg.Validate()
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "keys config is required")
+	// The rule and its wording now live in keys.ValidateKeySources, shared with
+	// the relayer so the two binaries cannot drift on what a key config means.
+	require.Contains(t, err.Error(), "no key source configured")
+	require.Contains(t, err.Error(), "keys_file")
+	require.Contains(t, err.Error(), "keyring")
+}
+
+// TestLoadConfig_RetiredKeysAreNamedWithWhatTheyChanged replaces the two
+// tombstone tests this file used to carry (keys.keys_dir and the top-level
+// hot_reload_enabled).
+//
+// The tombstone STRUCT FIELDS are gone: a field per retired key is config that
+// configures nothing, and it could never cover the case that actually bit us --
+// a key that was never a field at all. What replaced them is a strict second
+// decode of the same bytes, so this test drives the real path (file ->
+// LoadConfig -> Warnings) instead of a struct literal, which is the stronger
+// assertion: the struct literal could never have caught a typo.
+//
+// The retired-key SENTENCE is the part worth pinning. A bare "field not found"
+// tells the operator a key is unknown; it does not tell them their keys were
+// silently not loaded, which is the loss that earned the tombstone.
+func TestLoadConfig_RetiredKeysAreNamedWithWhatTheyChanged(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "miner.yaml")
+
+	// A config that boots, carrying both retired keys. Neither may fail the
+	// load: warn-and-start is the deliberate default, because a rolling deploy
+	// lands a new binary beside an older ConfigMap as a matter of course.
+	require.NoError(t, os.WriteFile(path, []byte(
+		"redis:\n"+
+			"  url: redis://localhost:6379\n"+
+			"  consumer_name: miner-1\n"+
+			"pocket_node:\n"+
+			"  query_node_rpc_url: http://localhost:26657\n"+
+			"  query_node_grpc_url: localhost:9090\n"+
+			"keys:\n"+
+			"  keys_file: /path/to/keys.yaml\n"+
+			"  keys_dir: /etc/pocket/keys\n"+
+			"block_time_seconds: 60\n"+
+			"hot_reload_enabled: true\n"), 0o600))
+
+	cfg, err := LoadConfig(path)
+	require.NoError(t, err, "a retired key must NOT fail the load: the serving binary warns and starts")
+
+	warnings := strings.Join(cfg.Warnings(), "\n")
+
+	require.Contains(t, warnings, "keys_dir")
+	require.Contains(t, warnings, "keys_file",
+		"the advice must name the safe migration, not just the removed mechanism")
+
+	require.Contains(t, warnings, "hot_reload_enabled")
+	require.Contains(t, warnings, "keys.hot_reload_enabled",
+		"the operator has to be told the NEW home, or the warning costs them a search")
+
+	require.Contains(t, warnings, "REMOVED",
+		"a retired key must read as removed, not merely unknown")
+}
+
+// TestLoadConfig_TheInclusionReconcilerSwitchIsRetired is the tooth on S11: the
+// reconciler is CORE, so `disable_inclusion_reconciler` must reach the operator
+// as a REMOVED key and not be quietly accepted. It drives the real path rather
+// than the retiredKeys map, which is what makes it fail if anyone reintroduces
+// the field: a struct that declares the key again stops UnknownKeys from
+// reporting it, and every assertion below goes red at once.
+//
+// It must still not fail the load. A deployment that set this ran fire-once,
+// and refusing to boot would turn its rolling deploy into an outage at exactly
+// the moment the new binary is the one that would have saved its claims.
+func TestLoadConfig_TheInclusionReconcilerSwitchIsRetired(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "miner.yaml")
+
+	require.NoError(t, os.WriteFile(path, []byte(
+		"redis:\n"+
+			"  url: redis://localhost:6379\n"+
+			"  consumer_name: miner-1\n"+
+			"pocket_node:\n"+
+			"  query_node_rpc_url: http://localhost:26657\n"+
+			"  query_node_grpc_url: localhost:9090\n"+
+			"keys:\n"+
+			"  keys_file: /path/to/keys.yaml\n"+
+			"block_time_seconds: 60\n"+
+			"transaction:\n"+
+			"  disable_inclusion_reconciler: true\n"), 0o600))
+
+	cfg, err := LoadConfig(path)
+	require.NoError(t, err, "a retired key must NOT fail the load: warn-and-start is deliberate")
+
+	warnings := strings.Join(cfg.Warnings(), "\n")
+
+	require.Contains(t, warnings, "disable_inclusion_reconciler")
+	require.Contains(t, warnings, "REMOVED",
+		"the switch is gone, not merely unrecognised")
+	require.Contains(t, warnings, "fire-once",
+		"the sentence has to name what that deployment WAS doing -- an operator who "+
+			"set this to true was running without verification or rebroadcast, and "+
+			"telling them only that a key vanished hides the loss it was causing")
+	require.Contains(t, warnings, "gas",
+		"removing a switch IMPOSES a cost the operator did not choose -- the resends "+
+			"pay gas and the verification queries their node once per supplier per "+
+			"block. A tombstone that only lists what they gain is an advert")
+	require.Contains(t, warnings, "max_rebroadcasts",
+		"an operator who wanted the reconciler quiet needs the surviving knob that "+
+			"gets closest to it, or the warning leaves them with no move")
+}
+
+// TestLoadConfig_AnUnknownKeyIsReportedButDoesNotFailTheLoad covers the case no
+// tombstone could ever have covered: a key that was never a field. This is the
+// shape that cost real money -- config.miner.example.yaml shipped a `suppliers:`
+// block promising supplier filtering while no such field existed, so an operator
+// who uncommented it believed they were filtering and the miner claimed for
+// every key it held.
+func TestLoadConfig_AnUnknownKeyIsReportedButDoesNotFailTheLoad(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "miner.yaml")
+
+	require.NoError(t, os.WriteFile(path, []byte(
+		"redis:\n"+
+			"  url: redis://localhost:6379\n"+
+			"  consumer_name: miner-1\n"+
+			"pocket_node:\n"+
+			"  query_node_rpc_url: http://localhost:26657\n"+
+			"  query_node_grpc_url: localhost:9090\n"+
+			"keys:\n"+
+			"  keys_file: /path/to/keys.yaml\n"+
+			"block_time_seconds: 60\n"+
+			"suppliers:\n"+
+			"  - operator_address: pokt1abc\n"), 0o600))
+
+	cfg, err := LoadConfig(path)
+	require.NoError(t, err)
+
+	warnings := cfg.Warnings()
+	require.Len(t, warnings, 1)
+	require.Contains(t, warnings[0], "suppliers")
+	require.Contains(t, warnings[0], "line ",
+		"the operator must be pointed at the line, or a long config is a hunt")
+	require.NotContains(t, warnings[0], "REMOVED",
+		"a key that was never a field is unknown, not retired: calling it removed would be a lie")
+}
+
+// TestLoadConfig_AGoodConfigWarnsAboutNothing is the other half, and it is the
+// one that keeps the warning worth reading. A false positive here trains the
+// operator to ignore the output, which is worse than the silence it replaced.
+func TestLoadConfig_AGoodConfigWarnsAboutNothing(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "miner.yaml")
+
+	require.NoError(t, os.WriteFile(path, []byte(
+		"redis:\n"+
+			"  url: redis://localhost:6379\n"+
+			"  consumer_name: miner-1\n"+
+			"pocket_node:\n"+
+			"  query_node_rpc_url: http://localhost:26657\n"+
+			"  query_node_grpc_url: localhost:9090\n"+
+			"keys:\n"+
+			"  keys_file: /path/to/keys.yaml\n"+
+			"block_time_seconds: 60\n"), 0o600))
+
+	cfg, err := LoadConfig(path)
+	require.NoError(t, err)
+	require.Empty(t, cfg.Warnings())
+}
+
+// TestDefaultConfig_KeyHotReloadOn pins the default the operator gets when they
+// say nothing. It is the counterpart of the tombstone above: moving the setting
+// without moving its default is the same bug in the other direction, and it is
+// the one that actually shipped.
+func TestDefaultConfig_KeyHotReloadOn(t *testing.T) {
+	require.True(t, DefaultConfig().Keys.HotReloadEnabled,
+		"a miner that is told nothing must reload keys; the relayer already does")
 }
 
 // Note: Supplier validation tests removed - suppliers are auto-discovered from keys
 // See TestConfig_Validate_NoKeySource for key validation
 
-// Note: TestConfig_GetRedisBlockTimeout removed - BLOCK 0 is now hardcoded
+// Note: TestConfig_GetRedisBlockTimeout removed - the block duration is no longer
+// configurable; it is the bounded blockInterval in transport/redis/consumer.go.
 
 func TestConfig_GetClaimIdleTimeout(t *testing.T) {
 	cfg := &Config{
@@ -178,24 +332,6 @@ func TestConfig_GetBatchSize(t *testing.T) {
 	// Test default
 	cfg.BatchSize = 0
 	require.Equal(t, int64(1000), cfg.GetBatchSize()) // Default increased from 100
-}
-
-func TestConfig_GetAckBatchSize(t *testing.T) {
-	cfg := &Config{AckBatchSize: 25}
-	require.Equal(t, int64(25), cfg.GetAckBatchSize())
-
-	// Test default
-	cfg.AckBatchSize = 0
-	require.Equal(t, int64(50), cfg.GetAckBatchSize())
-}
-
-func TestConfig_GetDeduplicationTTL(t *testing.T) {
-	cfg := &Config{DeduplicationTTLBlocks: 20}
-	require.Equal(t, int64(20), cfg.GetDeduplicationTTL())
-
-	// Test default
-	cfg.DeduplicationTTLBlocks = 0
-	require.Equal(t, int64(10), cfg.GetDeduplicationTTL())
 }
 
 // Note: TestSupplierConfig_WithServices and TestConfig_Validate_MultipleSuppliers removed
@@ -225,20 +361,12 @@ func TestGetQueryWorkers(t *testing.T) {
 	require.Equal(t, 30, cfg.GetQueryWorkers())
 }
 
-func TestGetSettlementWorkers(t *testing.T) {
-	cfg := &Config{}
-	require.Equal(t, 2, cfg.GetSettlementWorkers()) // default
-
-	cfg.WorkerPools.SettlementWorkers = 4
-	require.Equal(t, 4, cfg.GetSettlementWorkers())
-}
-
 func TestGetMasterPoolSize(t *testing.T) {
 	cfg := &Config{}
 
 	// Test auto-calculation with small supplier count (CPU-bound)
 	// With default values: cpu_multiplier=4, workers_per_supplier=6, query=20
-	// Settlement monitor disabled by default, so overhead = query_workers only (20)
+	// Overhead = query_workers (20)
 	// On a machine with N CPUs: max(N×4, suppliers×6) + 20
 	// For 5 suppliers: max(N×4, 30) + 20
 	// This test uses 5 suppliers which should be CPU-bound on most machines
@@ -252,70 +380,10 @@ func TestGetMasterPoolSize(t *testing.T) {
 	// This should be supplier-bound unless running on 117+ core machine
 	require.GreaterOrEqual(t, size, 488)
 
-	// Test with settlement monitor enabled (adds settlement_workers to overhead)
-	cfg.SettlementMonitor.Enabled = true
-	size = cfg.GetMasterPoolSize(78)
-	// 78 × 6 = 468, plus overhead 22 (20 query + 2 settlement) = 490
-	require.GreaterOrEqual(t, size, 490)
-	cfg.SettlementMonitor.Enabled = false // reset
-
 	// Test explicit override
 	cfg.WorkerPools.MasterPoolSize = 500
 	require.Equal(t, 500, cfg.GetMasterPoolSize(78))
 	require.Equal(t, 500, cfg.GetMasterPoolSize(5)) // override ignores supplier count
-}
-
-// TestSMSTLiveRootCheckpointIntervalYAMLParsing verifies the full wire
-// from config.miner.yaml (smst_live_root_checkpoint_interval key) down
-// to the SMST manager's internal checkpoint cadence. A regression here
-// would leave operators unable to tune the relay-loss-on-failover
-// trade-off in production even though the knob exists.
-func TestSMSTLiveRootCheckpointIntervalYAMLParsing(t *testing.T) {
-	t.Run("parses configured value", func(t *testing.T) {
-		yamlData := `smst_live_root_checkpoint_interval: 25`
-		var cfg Config
-		err := yaml.Unmarshal([]byte(yamlData), &cfg)
-		require.NoError(t, err)
-		require.Equal(t, 25, cfg.SMSTLiveRootCheckpointInterval)
-	})
-
-	t.Run("absent yields zero (manager falls back to default)", func(t *testing.T) {
-		var cfg Config
-		err := yaml.Unmarshal([]byte(""), &cfg)
-		require.NoError(t, err)
-		require.Equal(t, 0, cfg.SMSTLiveRootCheckpointInterval,
-			"absent key must yield zero so the manager picks DefaultLiveRootCheckpointInterval")
-	})
-}
-
-// TestSMSTLiveRootCheckpointInterval_PropagatesToManager is the integration
-// side of the wiring check: build a RedisSMSTManagerConfig from a specific
-// operator-provided interval and verify the manager actually applies it
-// (as opposed to always using the default). This would have caught the
-// gap where the YAML key existed but nothing downstream read it.
-func TestSMSTLiveRootCheckpointInterval_PropagatesToManager(t *testing.T) {
-	// Without a miniredis harness here we exercise only the config helper,
-	// which is the single source of truth the manager consults. The
-	// end-to-end test in smst_live_root_test.go's TestLiveRoot_CustomIntervalRespected
-	// covers the behavioural side (writes respect the interval).
-	cases := []struct {
-		name     string
-		input    int
-		expected int
-	}{
-		{"explicit 1 = zero-loss mode", 1, 1},
-		{"explicit 50", 50, 50},
-		{"zero falls back to default", 0, DefaultLiveRootCheckpointInterval},
-		{"negative falls back to default (defensive)", -5, DefaultLiveRootCheckpointInterval},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			m := &RedisSMSTManager{
-				config: RedisSMSTManagerConfig{LiveRootCheckpointInterval: tc.input},
-			}
-			require.Equal(t, tc.expected, m.liveRootInterval())
-		})
-	}
 }
 
 func TestWorkerPoolConfigYAMLParsing(t *testing.T) {
@@ -325,7 +393,6 @@ worker_pools:
   cpu_multiplier: 6
   workers_per_supplier: 3
   query_workers: 25
-  settlement_workers: 4
 `
 	var cfg Config
 	err := yaml.Unmarshal([]byte(yamlData), &cfg)
@@ -335,12 +402,90 @@ worker_pools:
 	require.Equal(t, 6, cfg.WorkerPools.CPUMultiplier)
 	require.Equal(t, 3, cfg.WorkerPools.WorkersPerSupplier)
 	require.Equal(t, 25, cfg.WorkerPools.QueryWorkers)
-	require.Equal(t, 4, cfg.WorkerPools.SettlementWorkers)
 
 	// Test that getters use the parsed values
 	require.Equal(t, 150, cfg.GetMasterPoolSize(100)) // explicit override
 	require.Equal(t, 6, cfg.GetCPUMultiplier())
 	require.Equal(t, 3, cfg.GetWorkersPerSupplier())
 	require.Equal(t, 25, cfg.GetQueryWorkers())
-	require.Equal(t, 4, cfg.GetSettlementWorkers())
+}
+
+// TestConfig_Validate_RejectsBadLoggingLevel pins that logging validation is
+// wired into the miner's Validate: a typo'd level used to silently run the
+// process at Info.
+func TestConfig_Validate_RejectsBadLoggingLevel(t *testing.T) {
+	cfg := &Config{
+		Redis: RedisConfig{
+			RedisConfig: config.RedisConfig{
+				URL: "redis://localhost:6379",
+			},
+			ConsumerName: "miner-1",
+		},
+		Logging: logging.Config{Level: "warning"},
+	}
+
+	err := cfg.Validate()
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "logging.level")
+}
+
+// A config that cannot say how fast its chain produces blocks must not start.
+//
+// This is the only protection left after the four tx_timeout knobs were retired.
+// Before them there was a default of 30 seconds to fall back on, which at least
+// produced a number; now an absent block time means WindowTimeout is called with
+// zero, falls to the chain ceiling under the "unknown" regime, and every claim
+// and proof carries a deadline nobody chose. Jorge's decision was explicit --
+// "no moving to defaults, it doesn't start, so they fix it" -- and without a
+// test a later refactor can delete the guard with nothing turning red.
+//
+// The fixtures are valid in EVERY other respect on purpose. The guard sits at
+// the END of Validate, because putting it first masked the real first problem of
+// a config with several errors, so a fixture with a second defect would pass
+// this test for the wrong reason: it would be failing on the other one.
+func TestConfig_Validate_BlockTimeSecondsIsRequired(t *testing.T) {
+	otherwiseValid := func(blockTime int64) *Config {
+		return &Config{
+			Redis: RedisConfig{
+				RedisConfig:  config.RedisConfig{URL: "redis://localhost:6379"},
+				ConsumerName: "miner-1",
+			},
+			PocketNode: config.PocketNodeConfig{
+				QueryNodeRPCUrl:  "http://localhost:26657",
+				QueryNodeGRPCUrl: "localhost:9090",
+			},
+			Keys:             config.KeysConfig{KeysFile: "/path/to/keys.yaml"},
+			BlockTimeSeconds: blockTime,
+		}
+	}
+
+	for _, tc := range []struct {
+		name      string
+		blockTime int64
+	}{
+		{name: "absent", blockTime: 0},
+		{name: "negative", blockTime: -1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := otherwiseValid(tc.blockTime).Validate()
+			require.Error(t, err,
+				"a config without a usable block time must refuse to start, not fall back to a default")
+			require.Contains(t, err.Error(), "block_time_seconds",
+				"the error must NAME the field: an operator reading it has to know what to fix")
+		})
+	}
+
+	// The control. Without it, a Validate() that rejected everything would
+	// satisfy both cases above.
+	require.NoError(t, otherwiseValid(60).Validate(),
+		"the same config with a positive block time must be valid")
+}
+
+// The gas price fallback is the mainnet minimum gas price, the same value
+// DefaultConfig carries. It used to return 0.00001upokt, 10 times that, when
+// transaction.gas_price was set to an empty string.
+func TestConfig_GetTxGasPrice_FallbackIsMainnetMinimum(t *testing.T) {
+	const mainnetMinGasPrice = "0.000001upokt"
+	require.Equal(t, mainnetMinGasPrice, (&Config{}).GetTxGasPrice(), "empty gas_price falls back to the mainnet minimum")
+	require.Equal(t, mainnetMinGasPrice, DefaultConfig().GetTxGasPrice(), "the default config carries the same value")
 }

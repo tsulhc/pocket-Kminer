@@ -83,12 +83,13 @@ gateway_config:
   gateway_mode: "centralized"
   gateway_address: "pokt15vzxjqklzjtlz7lahe8z2dfe9nm5vxwwmscne4"
   gateway_private_key_hex: "cf09805c952fa999e9a63a9f434147b0a5abfd10f268879694c6b5a70e1ae177"
-  # App private keys from all-keys.yaml (app1-app4)
+  # App private keys from all-keys.yaml (app1-app5)
   owned_apps_private_keys_hex:
-    - "2d00ef074d9b51e46886dc9a1df11e7b986611d0f336bdcf1f0adce3e037ec0a"  # app1 - develop-http
+    - "c188c43496351a963762a5d9de78ff887ac66b4ba5de5967efd55a6d1e71ddda"  # app1 - develop-http
     - "7e7571a8c61b0887ff8a9017bb4ad83c016b193234f9dc8b6a8ce10c7c483600"  # app2 - develop-websocket
     - "7cbbaa043b9b63baa7d6bb087483b0a6a9f82596c19dce4c5028eb43e5b63674"  # app3 - develop-stream
     - "84e4f2257f24d9e1517d414b834bbbfa317e0d53fef21c1528a07a5fa8c70d57"  # app4 - develop-grpc
+    - "50058b14b956cd3071aad111f3f2a0d9a00b7028edde6c713e838b7522a626de"  # app5 - develop-cometbft
 
   # Disable reputation for localnet testing (simple endpoint selection)
   reputation_config:
@@ -102,7 +103,7 @@ gateway_config:
   active_health_checks:
     enabled: false
 
-  # Service configurations - 4 localnet services
+  # Service configurations - 5 localnet services
   services:
     - id: develop-http
       type: "generic"
@@ -119,6 +120,10 @@ gateway_config:
     - id: develop-grpc
       type: "generic"
       rpc_types: ["grpc"]
+      latency_profile: "standard"
+    - id: develop-cometbft
+      type: "generic"
+      rpc_types: ["comet_bft"]
       latency_profile: "standard"
 """.format(port=port, metrics_port=metrics_port, redis_host=redis_host)
 
@@ -144,7 +149,7 @@ metadata:
   labels:
     app: path
 spec:
-  replicas: 1
+  replicas: {replicas}
   selector:
     matchLabels:
       app: path
@@ -209,7 +214,7 @@ spec:
   - name: metrics
     port: {metrics_port}
     targetPort: metrics
-""".format(image=full_image, port=port, metrics_port=metrics_port)
+""".format(image=full_image, port=port, metrics_port=metrics_port, replicas=path_config.get("replicas", 0))
 
     k8s_yaml(blob(path_deployment))
 

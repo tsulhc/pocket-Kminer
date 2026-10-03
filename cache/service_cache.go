@@ -359,77 +359,52 @@ func (c *serviceCache) InvalidateAll(ctx context.Context) error {
 // warmupSingleService loads a single service from Redis (L2) into L1 cache.
 // This is called by the orchestrator's pond worker pool for parallel warmup.
 func (c *serviceCache) warmupSingleService(ctx context.Context, id string) error {
-	// Load from Redis (L2) into local cache (L1)
-	redisKey := c.redisClient.KB().CacheKey(serviceCacheType, id)
-	data, err := c.redisClient.Get(ctx, redisKey).Bytes()
-	if err != nil {
-		// Key doesn't exist in Redis, skip
-		return nil
-	}
-
-	svc := &sharedtypes.Service{}
-	if err := proto.Unmarshal(data, svc); err != nil {
-		c.logger.Warn().
-			Err(err).
-			Str(logging.FieldServiceID, id).
-			Msg("failed to unmarshal service during warmup")
-		return err
-	}
-
-	c.localCache.Store(id, serviceCacheL1Entry{svc: svc, cachedAt: time.Now()})
-	return nil
+	return warmupKeyedFromRedis(
+		ctx, c.redisClient, c.logger,
+		serviceCacheType,
+		logging.FieldServiceID,
+		"failed to unmarshal service during warmup",
+		id,
+		func(data []byte) (*sharedtypes.Service, error) {
+			svc := &sharedtypes.Service{}
+			if err := proto.Unmarshal(data, svc); err != nil {
+				return nil, err
+			}
+			return svc, nil
+		},
+		func(id string, svc *sharedtypes.Service) {
+			c.localCache.Store(id, serviceCacheL1Entry{svc: svc, cachedAt: time.Now()})
+		},
+	)
 }
 
 // queryChainWithLock queries the chain with distributed locking to prevent
-// duplicate queries from multiple instances.
+// duplicate queries from multiple instances. The lock/sleep/retry/chain skeleton
+// lives in queryKeyedChainWithLock; only the service-specific decode, L1 warm and
+// chain call are supplied here.
 func (c *serviceCache) queryChainWithLock(ctx context.Context, serviceID string) (*sharedtypes.Service, error) {
-	lockKey := c.redisClient.KB().CacheLockKey(serviceCacheType, serviceID)
-
-	// Try to acquire distributed lock
-	locked, err := c.redisClient.SetNX(ctx, lockKey, "1", 5*time.Second).Result()
-	if err != nil {
-		return nil, fmt.Errorf("failed to acquire lock: %w", err)
-	}
-	defer c.redisClient.Del(ctx, lockKey)
-
-	if !locked {
-		// Another instance is querying, wait and retry L2
-		lockAcquisitions.WithLabelValues(serviceCacheType, "contended").Inc()
-		c.logger.Debug().
-			Str(logging.FieldServiceID, serviceID).
-			Msg("another instance is querying service, waiting")
-		time.Sleep(5 * time.Millisecond)
-
-		// Retry L2 after waiting
-		redisKey := c.redisClient.KB().CacheKey(serviceCacheType, serviceID)
-		data, err := c.redisClient.Get(ctx, redisKey).Bytes()
-		if err == nil {
-			svc := &sharedtypes.Service{} // CRITICAL FIX: Allocate on heap, not stack
-			if err := proto.Unmarshal(data, svc); err == nil {
-				c.localCache.Store(serviceID, serviceCacheL1Entry{svc: svc, cachedAt: time.Now()})
-				cacheHits.WithLabelValues(serviceCacheType, CacheLevelL2Retry).Inc()
-				return svc, nil
+	return queryKeyedChainWithLock(ctx, c.redisClient, c.logger, serviceID, keyedQueryLockSpec[*sharedtypes.Service]{
+		cacheType:   serviceCacheType,
+		chainLabel:  "service",
+		logKeyField: logging.FieldServiceID,
+		waitingMsg:  "another instance is querying service, waiting",
+		loadFromRedis: func(ctx context.Context, serviceID string) (*sharedtypes.Service, bool) {
+			redisKey := c.redisClient.KB().CacheKey(serviceCacheType, serviceID)
+			data, err := c.redisClient.Get(ctx, redisKey).Bytes()
+			if err != nil {
+				return nil, false
 			}
-		}
-
-		// If still not in Redis, query chain anyway
-	} else {
-		lockAcquisitions.WithLabelValues(serviceCacheType, "acquired").Inc()
-	}
-
-	// Query chain
-	chainQueries.WithLabelValues("service").Inc()
-	chainStart := time.Now()
-
-	svc, err := c.queryClient.GetService(ctx, serviceID)
-	chainQueryLatency.WithLabelValues("service").Observe(time.Since(chainStart).Seconds())
-
-	if err != nil {
-		chainQueryErrors.WithLabelValues("service").Inc()
-		return nil, err
-	}
-
-	return svc, nil
+			svc := &sharedtypes.Service{} // CRITICAL FIX: Allocate on heap, not stack
+			if err := proto.Unmarshal(data, svc); err != nil {
+				return nil, false
+			}
+			return svc, true
+		},
+		onRetryHit: func(serviceID string, svc *sharedtypes.Service) {
+			c.localCache.Store(serviceID, serviceCacheL1Entry{svc: svc, cachedAt: time.Now()})
+		},
+		queryChain: c.queryClient.GetService,
+	})
 }
 
 // handleInvalidation handles cache invalidation events from pub/sub.
@@ -438,19 +413,21 @@ func (c *serviceCache) handleInvalidation(ctx context.Context, payload string) e
 		Str("payload", payload).
 		Msg("received service invalidation event")
 
+	// Empty-object payload means invalidate ALL entries (bulk clear-all).
+	// Must be checked before unmarshal: "{}" parses successfully into the
+	// event struct, so a check inside the error branch is unreachable.
+	if payload == "{}" {
+		c.localCache.Clear()
+		cacheInvalidations.WithLabelValues(serviceCacheType, SourcePubSub).Inc()
+		return nil
+	}
+
 	// Parse payload to get service_id
 	var event struct {
 		ServiceID string `json:"service_id"`
 	}
 
 	if err := json.Unmarshal([]byte(payload), &event); err != nil {
-		// Empty payload means invalidate all
-		if payload == "{}" {
-			c.localCache.Clear()
-			cacheInvalidations.WithLabelValues(serviceCacheType, SourcePubSub).Inc()
-			return nil
-		}
-
 		c.logger.Warn().
 			Err(err).
 			Str("payload", payload).

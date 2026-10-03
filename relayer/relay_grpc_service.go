@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,19 +20,31 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
+	"github.com/rs/zerolog"
+
 	"github.com/pokt-network/pocket-relay-miner/logging"
 	"github.com/pokt-network/pocket-relay-miner/pool"
 	"github.com/pokt-network/pocket-relay-miner/transport"
 	servicetypes "github.com/pokt-network/poktroll/x/service/types"
 )
 
-var errBackendMisconfigured = errors.New("backend misconfigured for relay type")
-
 // RelayServiceMethodPath is the gRPC method path for the relay service.
-// Clients (e.g., PATH gateway) call this method with a RelayRequest message.
+// Clients (e.g., a gateway) call this method with a RelayRequest message.
 const RelayServiceMethodPath = "/pocket.service.RelayService/SendRelay"
 
+// grpcPublishTimeout bounds the detached mining/WAL-publish work for a gRPC relay.
+// It is independent of the request/backend timeout: the response is already sent to
+// the client before publishing runs, so publication must survive request
+// cancellation but still cannot hang forever.
 const grpcPublishTimeout = 30 * time.Second
+
+// errBackendMisconfigured marks failures that happen before any network call:
+// missing backend, an unparseable/undialable backend URL, or a scheme that
+// cannot be dialed for the resolved RPC type. These are operator/config errors,
+// not backend health signals, so they MUST NOT feed the circuit breaker — a
+// handful of misrouted relays used to trip the shared endpoint's breaker and
+// fast-fail the whole service. Callers use errors.Is to skip RecordResult.
+var errBackendMisconfigured = errors.New("backend misconfigured for relay type")
 
 // RelayGRPCService implements a gRPC service that properly handles the relay protocol.
 // It receives RelayRequest messages, extracts metadata, forwards to backends, and
@@ -46,8 +57,27 @@ type RelayGRPCService struct {
 	relayProcessor RelayProcessor
 	relayPipeline  *RelayPipeline // Unified relay processing pipeline
 
+	// simVerifier owns the simulated-relay Admission zone (optional). relayMeter
+	// is used only for the simulated path's non-mutating meter health probe.
+	simVerifier      *SimulationVerifier
+	publishQueueFull func() bool
+	storeSaturated   func() bool
+	relayMeter       *RelayMeter
+
+	// live holds the cancel of every relay being handled, so they can all be cut
+	// at once when Redis stops taking writes.
+	liveMu  sync.Mutex
+	live    map[uint64]context.CancelCauseFunc
+	liveSeq uint64
+
 	// Function to get HTTP client for a service (supports per-service timeout profiles)
-	getHTTPClient  func(serviceID string) *http.Client
+	getHTTPClient func(serviceID string) *http.Client
+
+	// grpcHTTPClient dials gRPC backends over HTTP/2 cleartext (h2c) with prior
+	// knowledge -- the wire form of a native gRPC unary/server-streaming call.
+	// The per-service HTTP/1.1 client cannot speak it, so gRPC forwarding uses
+	// this dedicated client. Per-service timeouts still apply through the
+	// request context (set in handleSendRelay), same as the HTTP path.
 	grpcHTTPClient *http.Client
 
 	// Function to get service timeout (from timeout profile)
@@ -59,14 +89,17 @@ type RelayGRPCService struct {
 	// Function to get backend config for circuit breaker threshold
 	getBackendConfig func(serviceID, rpcType string) *BackendConfig
 
-	// Backend gRPC connections for passthrough mode
-	grpcBackends sync.Map // map[string]*grpc.ClientConn
-
 	// Block height tracking
 	currentBlockHeight *atomic.Int64
 
 	// Max response body size
-	maxBodySize int64
+	// maxRequestBodySizeAcrossServices bounds what the transport will accept at
+	// all, before the service is known -- the gRPC counterpart of the HTTP
+	// pre-parse read. Per-service bounds are applied once the RelayRequest has
+	// been received, through the two resolvers below.
+	maxRequestBodySizeAcrossServices int64
+	getServiceMaxRequestBodySize     func(serviceID string) int64
+	getServiceMaxResponseBodySize    func(serviceID string) int64
 
 	// Buffer pool for reading backend responses efficiently
 	bufferPool *BufferPool
@@ -74,14 +107,21 @@ type RelayGRPCService struct {
 
 // RelayGRPCServiceConfig contains configuration for the relay gRPC service.
 type RelayGRPCServiceConfig struct {
-	ServiceConfigs     map[string]ServiceConfig
-	ResponseSigner     *ResponseSigner
-	Publisher          transport.MinedRelayPublisher
-	RelayProcessor     RelayProcessor
-	RelayPipeline      *RelayPipeline // Unified relay processing pipeline
-	CurrentBlockHeight *atomic.Int64
-	MaxBodySize        int64
-	BufferPool         *BufferPool
+	ServiceConfigs map[string]ServiceConfig
+	ResponseSigner *ResponseSigner
+	Publisher      transport.MinedRelayPublisher
+	RelayProcessor RelayProcessor
+	RelayPipeline  *RelayPipeline // Unified relay processing pipeline
+	SimVerifier    *SimulationVerifier
+	// PublishQueueFull is the batch queue admission gate (ProxyServer.queueFull).
+	PublishQueueFull                 func() bool
+	StoreSaturated                   func() bool // the storage gate (ProxyServer.storeSaturated)
+	RelayMeter                       *RelayMeter
+	CurrentBlockHeight               *atomic.Int64
+	MaxRequestBodySizeAcrossServices int64
+	GetServiceMaxRequestBodySize     func(serviceID string) int64
+	GetServiceMaxResponseBodySize    func(serviceID string) int64
+	BufferPool                       *BufferPool
 	// GetHTTPClient returns the HTTP client for a service (supports per-service timeout profiles)
 	GetHTTPClient func(serviceID string) *http.Client
 	// GetServiceTimeout returns the request timeout for a service (from timeout profile)
@@ -121,9 +161,17 @@ func NewRelayGRPCService(logger logging.Logger, config RelayGRPCServiceConfig) *
 		}
 	}
 
-	maxBodySize := config.MaxBodySize
+	maxBodySize := config.MaxRequestBodySizeAcrossServices
 	if maxBodySize == 0 {
 		maxBodySize = 10 * 1024 * 1024 // 10MB default
+	}
+	getServiceMaxRequestBodySize := config.GetServiceMaxRequestBodySize
+	if getServiceMaxRequestBodySize == nil {
+		getServiceMaxRequestBodySize = func(string) int64 { return maxBodySize }
+	}
+	getServiceMaxResponseBodySize := config.GetServiceMaxResponseBodySize
+	if getServiceMaxResponseBodySize == nil {
+		getServiceMaxResponseBodySize = func(string) int64 { return maxBodySize }
 	}
 
 	bufferPool := config.BufferPool
@@ -132,61 +180,50 @@ func NewRelayGRPCService(logger logging.Logger, config RelayGRPCServiceConfig) *
 		bufferPool = NewBufferPool(maxBodySize)
 	}
 
+	// Dedicated client for forwarding to gRPC backends. h2c (HTTP/2 cleartext,
+	// prior knowledge) with HTTP/1.1 disabled is exactly how a native gRPC
+	// client opens a non-TLS connection. HTTP/2 over TLS is enabled too, for the
+	// https:// and grpcs:// backends: measured on Go 1.26, a TLS request with
+	// only UnencryptedHTTP2 set does NOT fail -- it silently negotiates HTTP/1.1
+	// and returns 200, which cannot carry gRPC. A silent downgrade to a protocol
+	// that cannot serve the request is harder to diagnose than a dial error.
+	// No client-level Timeout: the per-request context deadline (service
+	// timeout) governs, matching the HTTP path.
 	grpcTransport := &http.Transport{}
 	grpcTransport.Protocols = new(http.Protocols)
 	grpcTransport.Protocols.SetUnencryptedHTTP2(true)
+	grpcTransport.Protocols.SetHTTP2(true)
 	grpcTransport.Protocols.SetHTTP1(false)
 	grpcHTTPClient := &http.Client{
 		Transport: grpcTransport,
+		// Never follow redirects -- pass them through, as the HTTP client does.
 		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
 	}
 
 	return &RelayGRPCService{
-		logger:             logger.With().Str(logging.FieldComponent, "grpc_relay_service").Logger(),
-		serviceConfigs:     config.ServiceConfigs,
-		responseSigner:     config.ResponseSigner,
-		publisher:          config.Publisher,
-		relayProcessor:     config.RelayProcessor,
-		relayPipeline:      config.RelayPipeline,
-		currentBlockHeight: config.CurrentBlockHeight,
-		maxBodySize:        maxBodySize,
-		bufferPool:         bufferPool,
-		getHTTPClient:      getHTTPClient,
-		grpcHTTPClient:     grpcHTTPClient,
-		getServiceTimeout:  getServiceTimeout,
-		getPool:            config.GetPool,
-		getBackendConfig:   config.GetBackendConfig,
+		logger:                           logger.With().Str(logging.FieldComponent, "grpc_relay_service").Logger(),
+		serviceConfigs:                   config.ServiceConfigs,
+		responseSigner:                   config.ResponseSigner,
+		publisher:                        countPublished(config.Publisher),
+		relayProcessor:                   config.RelayProcessor,
+		relayPipeline:                    config.RelayPipeline,
+		simVerifier:                      config.SimVerifier,
+		publishQueueFull:                 config.PublishQueueFull,
+		storeSaturated:                   config.StoreSaturated,
+		relayMeter:                       config.RelayMeter,
+		currentBlockHeight:               config.CurrentBlockHeight,
+		maxRequestBodySizeAcrossServices: maxBodySize,
+		getServiceMaxRequestBodySize:     getServiceMaxRequestBodySize,
+		getServiceMaxResponseBodySize:    getServiceMaxResponseBodySize,
+		bufferPool:                       bufferPool,
+		getHTTPClient:                    getHTTPClient,
+		grpcHTTPClient:                   grpcHTTPClient,
+		getServiceTimeout:                getServiceTimeout,
+		getPool:                          config.GetPool,
+		getBackendConfig:                 config.GetBackendConfig,
 	}
-}
-
-// RegisterWithServer registers the relay service handler with a gRPC server.
-// This uses the UnknownServiceHandler pattern to intercept calls to our method path.
-func (s *RelayGRPCService) RegisterWithServer(server *grpc.Server) {
-	// Note: We use UnknownServiceHandler in the server options instead of registering here.
-	// This is because we're handling a dynamically defined service.
-	s.logger.Info().Msg("relay gRPC service registered")
-}
-
-func resolveGRPCRelayRPCType(md metadata.MD, poktReq *sdktypes.POKTHTTPRequest, svcConfig *ServiceConfig) string {
-	for _, value := range md.Get("rpc-type") {
-		if value != "" {
-			return RPCTypeToBackendType(value)
-		}
-	}
-
-	if poktReq != nil && poktReq.Header != nil {
-		if contentType, ok := poktReq.Header["Content-Type"]; ok && len(contentType.Values) > 0 && strings.HasPrefix(contentType.Values[0], "application/grpc") {
-			return BackendTypeGRPC
-		}
-	}
-
-	if svcConfig != nil && svcConfig.DefaultBackend != "" {
-		return RPCTypeToBackendType(svcConfig.DefaultBackend)
-	}
-
-	return DefaultBackendType
 }
 
 // HandleUnknownService is a gRPC stream handler that processes relay requests.
@@ -206,9 +243,55 @@ func (s *RelayGRPCService) HandleUnknownService(srv interface{}, stream grpc.Ser
 	return s.handleSendRelay(stream)
 }
 
-// handleSendRelay processes a SendRelay gRPC call.
+// handleSendRelay processes a SendRelay gRPC call. Its first gate is Redis being
+// able to take writes; once admitted, the relay is cancelled if Redis stops
+// taking them before it finishes.
 func (s *RelayGRPCService) handleSendRelay(stream grpc.ServerStream) error {
-	ctx := stream.Context()
+	if s.storeSaturated != nil && s.storeSaturated() {
+		relaysRejected.WithLabelValues(metricLabelUnknown, BackendTypeGRPC, rejectReasonStorageSaturated).Inc()
+		return status.Error(codes.ResourceExhausted, "relayer is not admitting relays: storage saturated")
+	}
+	ctx, done := s.trackLiveRelay(stream.Context())
+	defer done()
+	err := s.serveSendRelay(stream, ctx)
+	if err != nil && errors.Is(context.Cause(ctx), errStorageSaturated) {
+		return status.Error(codes.ResourceExhausted, "relay cut: storage saturated")
+	}
+	return err
+}
+
+// trackLiveRelay registers a cancellable context for one relay; done unregisters
+// and releases it.
+func (s *RelayGRPCService) trackLiveRelay(parent context.Context) (context.Context, func()) {
+	ctx, cancel := context.WithCancelCause(parent)
+	s.liveMu.Lock()
+	if s.live == nil {
+		s.live = make(map[uint64]context.CancelCauseFunc)
+	}
+	s.liveSeq++
+	id := s.liveSeq
+	s.live[id] = cancel
+	s.liveMu.Unlock()
+	return ctx, func() {
+		s.liveMu.Lock()
+		delete(s.live, id)
+		s.liveMu.Unlock()
+		cancel(nil)
+	}
+}
+
+// cutLiveRelays cancels every relay in flight with cause, and returns how many.
+func (s *RelayGRPCService) cutLiveRelays(cause error) int {
+	s.liveMu.Lock()
+	defer s.liveMu.Unlock()
+	for _, cancel := range s.live {
+		cancel(cause)
+	}
+	return len(s.live)
+}
+
+// serveSendRelay is handleSendRelay past its gate, on the relay's own context.
+func (s *RelayGRPCService) serveSendRelay(stream grpc.ServerStream, ctx context.Context) error {
 	arrivalTime := time.Now()
 	arrivalHeight := int64(0)
 	if s.currentBlockHeight != nil {
@@ -218,13 +301,13 @@ func (s *RelayGRPCService) handleSendRelay(stream grpc.ServerStream) error {
 	// Receive the RelayRequest message (typed proto message)
 	relayRequest := &servicetypes.RelayRequest{}
 	if err := stream.RecvMsg(relayRequest); err != nil {
-		grpcRelayErrors.WithLabelValues("unknown", "recv_error").Inc()
+		relaysRejected.WithLabelValues(metricLabelUnknown, BackendTypeGRPC, rejectReasonRecvError).Inc()
 		return status.Errorf(codes.InvalidArgument, "failed to receive request: %v", err)
 	}
 
 	// Extract metadata from RelayRequest.Meta
 	if relayRequest.Meta.SessionHeader == nil {
-		grpcRelayErrors.WithLabelValues("unknown", "missing_session_header").Inc()
+		relaysRejected.WithLabelValues(metricLabelUnknown, BackendTypeGRPC, rejectReasonInvalidRelayRequest).Inc()
 		return status.Error(codes.InvalidArgument, "missing session header in RelayRequest")
 	}
 
@@ -238,12 +321,12 @@ func (s *RelayGRPCService) handleSendRelay(stream grpc.ServerStream) error {
 	sessionCtx := logging.SessionContextPartial(sessionID, serviceID, supplierOperatorAddr, applicationAddr, sessionEndHeight)
 
 	if serviceID == "" {
-		grpcRelayErrors.WithLabelValues("unknown", "missing_service_id").Inc()
+		relaysRejected.WithLabelValues(metricLabelUnknown, BackendTypeGRPC, rejectReasonMissingServiceID).Inc()
 		return status.Error(codes.InvalidArgument, "missing service ID in session header")
 	}
 
 	if supplierOperatorAddr == "" {
-		grpcRelayErrors.WithLabelValues(serviceID, "missing_supplier_address").Inc()
+		relaysRejected.WithLabelValues(serviceID, BackendTypeGRPC, rejectReasonMissingSupplierAddress).Inc()
 		return status.Error(codes.InvalidArgument, "missing supplier operator address in RelayRequest")
 	}
 
@@ -252,15 +335,24 @@ func (s *RelayGRPCService) handleSendRelay(stream grpc.ServerStream) error {
 
 	// Verify we have a signer for this supplier
 	if s.responseSigner == nil || !s.responseSigner.HasSigner(supplierOperatorAddr) {
-		grpcRelayErrors.WithLabelValues(serviceID, "no_signer").Inc()
+		relaysRejected.WithLabelValues(serviceID, BackendTypeGRPC, rejectReasonNoLocalSigner).Inc()
 		return status.Errorf(codes.FailedPrecondition, "no signer for supplier %s", supplierOperatorAddr)
 	}
 
 	// Get service configuration
 	svcConfig, ok := s.serviceConfigs[serviceID]
 	if !ok {
-		grpcRelayErrors.WithLabelValues(serviceID, "unknown_service").Inc()
+		relaysRejected.WithLabelValues(serviceID, BackendTypeGRPC, rejectReasonUnknownService).Inc()
 		return status.Errorf(codes.NotFound, "unknown service: %s", serviceID)
+	}
+
+	// The service's own request bound, the counterpart of the HTTP check. The
+	// transport-level bound above is the widest any service allows, so without
+	// this a service's configured limit would not apply on gRPC at all.
+	if maxRequest := s.getServiceMaxRequestBodySize(serviceID); int64(len(relayRequest.Payload)) > maxRequest {
+		relaysRejected.WithLabelValues(serviceID, BackendTypeGRPC, rejectReasonBodyTooLarge).Inc()
+		return status.Errorf(codes.ResourceExhausted,
+			"request body too large for service: %d > %d", len(relayRequest.Payload), maxRequest)
 	}
 
 	// Apply service timeout to context (from timeout profile)
@@ -268,11 +360,41 @@ func (s *RelayGRPCService) handleSendRelay(stream grpc.ServerStream) error {
 	ctx, cancel := context.WithTimeout(ctx, serviceTimeout)
 	defer cancel()
 
-	// Validate and meter the relay if pipeline is available
+	// SIMULATION SEAM — the only simulation-aware line on the gRPC normal path.
+	// Admitted eagerly here, before the pipeline validate/meter and before any
+	// publish. Reuses the shared data-path primitives (forwardToBackend +
+	// response signer) inside serveSimulatedGRPC. Header ignored when disabled.
+	md, _ := metadata.FromIncomingContext(ctx)
+	if directive := SimDirectiveFromGRPC(md); directive.KeyID != "" && s.simVerifier != nil && s.simVerifier.Enabled() {
+		return s.serveSimulatedGRPC(stream, ctx, relayRequest, serviceID, svcConfig, supplierOperatorAddr, directive.KeyID, md)
+	}
+
+	// Nothing would validate or charge this relay: refuse it rather than serve it free.
+	// Before the queue gate, as in HTTP: a process wired without a pipeline says so.
+	if s.relayPipeline == nil {
+		relaysRejected.WithLabelValues(serviceID, BackendTypeGRPC, rejectReasonMeteringNotConfigured).Inc()
+		return status.Error(codes.Internal, "relayer is not admitting relays right now")
+	}
+
+	// Stop admitting while the batch queue is full.
+	if s.publishQueueFull != nil && s.publishQueueFull() {
+		relaysRejected.WithLabelValues(serviceID, BackendTypeGRPC, rejectReasonPublishQueueFull).Inc()
+		return status.Error(codes.Unavailable, "relayer is not admitting relays right now")
+	}
+
+	// What the relay holds against its budget between admission and serving. Every
+	// exit that does not serve it gives the reservation back.
+	var reservation Reservation
+	settled := false
+	defer func() {
+		if !settled {
+			s.relayPipeline.ReleaseRelay(reservation)
+		}
+	}()
+
+	// The pipeline is non-nil past the guard above; the check stays so the block
+	// reads as its own scope.
 	if s.relayPipeline != nil {
-		// TODO: Get actual compute units from service config
-		// For now, use default value of 1 (will be refined in future PR)
-		computeUnits := uint64(1)
 
 		// Build relay context for validation/metering
 		relayCtx := &RelayContext{
@@ -280,30 +402,73 @@ func (s *RelayGRPCService) handleSendRelay(stream grpc.ServerStream) error {
 			ServiceID:          serviceID,
 			SupplierAddress:    supplierOperatorAddr,
 			SessionID:          sessionID,
-			ComputeUnits:       computeUnits,
 			ArrivalBlockHeight: arrivalHeight,
 		}
 
 		// Validate relay request (ring signature + session)
 		if err := s.relayPipeline.ValidateRelay(ctx, relayCtx); err != nil {
-			grpcRelayErrors.WithLabelValues(serviceID, "validation_failed").Inc()
-			logging.WithSessionContext(s.logger.Warn(), sessionCtx).
+			// A client that left while the relay was being checked is a disconnect, not a
+			// failed check. The stream's context, as in classifyGRPCBackendError: ctx here
+			// also carries this service's own timeout.
+			if stream.Context().Err() != nil {
+				relaysRejected.WithLabelValues(serviceID, BackendTypeGRPC, rejectReasonClientDisconnected).Inc()
+				return status.Error(codes.Canceled, "client disconnected")
+			}
+			reason := rejectReasonValidationFailed
+			if errors.Is(err, ErrSessionExpired) {
+				reason = rejectReasonSessionExpired
+			}
+			relaysRejected.WithLabelValues(serviceID, BackendTypeGRPC, reason).Inc()
+			logging.WithSessionContext(s.logger.Debug(), sessionCtx).
 				Err(err).
 				Msg("relay validation failed")
 			return status.Errorf(codes.PermissionDenied, "relay validation failed: %v", err)
 		}
 
+		// Refuse what cannot be priced, immediately before the charge and not
+		// earlier: the miner's manifest has not arrived, so AdmitRelay would
+		// reserve against state nobody published. A relay that fails validation
+		// never reaches a charge, so it never needs a price -- placing this
+		// above ValidateRelay would make a process-wide condition decide the
+		// fate of relays that were going to be rejected anyway. Unavailable and
+		// not Internal: it clears itself the moment the miner publishes.
+		if !s.relayPipeline.Priced() {
+			relaysRejected.WithLabelValues(serviceID, BackendTypeGRPC, rejectReasonPricingUnavailable).Inc()
+			return status.Error(codes.Unavailable, "relayer is not admitting relays right now")
+		}
+
 		// Meter relay (check stake before serving)
-		allowed, meterErr := s.relayPipeline.MeterRelay(ctx, relayCtx)
-		if meterErr != nil {
-			// Fail-open: log warning but allow relay
-			logging.WithSessionContext(s.logger.Warn(), sessionCtx).
+		res, allowed, meterErr := s.relayPipeline.AdmitRelay(ctx, relayCtx)
+		reservation = res
+		if meterErr != nil && allowed {
+			// The meter could not answer, but not because OUR store was
+			// unreadable -- a chain query it depends on blinked. The relay is
+			// served and passed on: the miner re-derives what it needs when it
+			// claims, and it retries. See RelayMeter.handleMeterError.
+			relayMeterUnbilled.WithLabelValues(serviceID).Inc()
+			logging.WithSessionContext(s.logger.Debug(), sessionCtx).
 				Err(meterErr).
-				Msg("relay metering error (fail-open: allowing relay)")
+				Msg("relay served unmetered; the miner arbitrates")
+		} else if meterErr != nil {
+			// A client that left while the meter read its store fails that read too, and
+			// the meter reports it as its store being down. Count the disconnect instead,
+			// so meter_error keeps meaning the store.
+			if stream.Context().Err() != nil {
+				relaysRejected.WithLabelValues(serviceID, BackendTypeGRPC, rejectReasonClientDisconnected).Inc()
+				return status.Error(codes.Canceled, "client disconnected")
+			}
+			// The meter's own store is unreadable, so what this session has
+			// already consumed is unknown. This is admission: it is refused,
+			// and the message says nothing about which store or why.
+			relaysRejected.WithLabelValues(serviceID, BackendTypeGRPC, rejectReasonMeterError).Inc()
+			logging.WithSessionContext(s.logger.Debug(), sessionCtx).
+				Err(meterErr).
+				Msg("relay rejected - unable to verify session budget")
+			return status.Error(codes.Unavailable, "unable to process relay request")
 		} else if !allowed {
 			// Stake limit exceeded - reject relay
-			grpcRelayErrors.WithLabelValues(serviceID, "meter_rejected").Inc()
-			logging.WithSessionContext(s.logger.Warn(), sessionCtx).
+			relaysRejected.WithLabelValues(serviceID, BackendTypeGRPC, rejectReasonStakeExhausted).Inc()
+			logging.WithSessionContext(s.logger.Debug(), sessionCtx).
 				Msg("relay rejected - stake limit exceeded")
 			return status.Error(codes.ResourceExhausted, "relay rejected - stake limit exceeded")
 		}
@@ -312,18 +477,25 @@ func (s *RelayGRPCService) handleSendRelay(stream grpc.ServerStream) error {
 	// Deserialize the POKTHTTPRequest from the relay payload
 	poktHTTPRequest, err := sdktypes.DeserializeHTTPRequest(relayRequest.Payload)
 	if err != nil {
-		grpcRelayErrors.WithLabelValues(serviceID, "payload_deserialize_error").Inc()
+		relaysRejected.WithLabelValues(serviceID, BackendTypeGRPC, rejectReasonInvalidRelayRequest).Inc()
 		return status.Errorf(codes.InvalidArgument, "failed to deserialize POKTHTTPRequest: %v", err)
 	}
 
 	logging.WithSessionContext(s.logger.Debug(), sessionCtx).
 		Str("method", poktHTTPRequest.Method).
-		Str("url", poktHTTPRequest.Url).
+		// Func: per-relay path, so the redaction parse is only paid when
+		// Debug is actually enabled (arguments evaluate regardless).
+		Func(func(e *zerolog.Event) { e.Str("url", logging.RedactURL(poktHTTPRequest.Url)) }).
 		Int("body_size", len(poktHTTPRequest.BodyBz)).
 		Msg("deserialized POKTHTTPRequest from relay payload")
 
-	// Resolve backend via pool-based API for circuit breaker integration.
-	md, _ := metadata.FromIncomingContext(ctx)
+	// Resolve backend RPC type for pool lookup and forwarding. Precedence mirrors
+	// the HTTP path (proxy.go:719-728): the client's declared "rpc-type" gRPC
+	// metadata wins, then the inner Content-Type heuristic, then the service
+	// default. Honouring the metadata is what fixes native gRPC relays -- the CLI
+	// declares metadata.Pairs("rpc-type","1"); the inner request is still typed
+	// application/json, so the old Content-Type-only logic mislabeled every gRPC
+	// relay as "rest" and misrouted it.
 	grpcRPCType := resolveGRPCRelayRPCType(md, poktHTTPRequest, &svcConfig)
 
 	var grpcEndpoint *pool.BackendEndpoint
@@ -343,21 +515,31 @@ func (s *RelayGRPCService) handleSendRelay(stream grpc.ServerStream) error {
 	grpcEndpoint = grpcPool.Next()
 
 	// Forward request to backend and get response
-	requestID := PocketRequestIDFromRelayRequest(relayRequest)
-	respBody, respHeaders, respStatus, err := s.forwardToBackend(ctx, serviceID, &svcConfig, poktHTTPRequest, grpcEndpoint, grpcRPCType, requestID)
+	respBody, respHeaders, respStatus, err := s.forwardToBackend(ctx, serviceID, &svcConfig, poktHTTPRequest, grpcEndpoint, grpcRPCType)
 
-	// Record result for circuit breaker (covers both success and error paths)
+	// Record result for circuit breaker (covers both success and network-error
+	// paths). Config/misroute errors (errBackendMisconfigured) are excluded: the
+	// breaker measures backend health, and a misrouted relay that never touched
+	// the network says nothing about it -- counting it would fast-fail the whole
+	// endpoint on a handful of mistyped relays.
 	if grpcEndpoint != nil && grpcPool != nil && !errors.Is(err, errBackendMisconfigured) {
 		threshold := s.getCircuitBreakerThreshold(serviceID, grpcRPCType)
 		transition := grpcPool.RecordResult(grpcEndpoint, respStatus, err, threshold)
 		if transition != nil {
-			s.logCircuitBreakerTransition(transition, serviceID, grpcRPCType)
+			logCircuitBreakerTransition(s.logger, transition, serviceID, grpcRPCType, threshold)
 		}
 	}
 
 	if err != nil {
-		grpcRelayErrors.WithLabelValues(serviceID, "backend_error").Inc()
-		logging.WithSessionContext(s.logger.Error(), sessionCtx).
+		// Cut because Redis stopped taking writes: the backend did not fail, so
+		// there is no backend error to count or to answer with.
+		if errors.Is(context.Cause(ctx), errStorageSaturated) {
+			return status.Error(codes.ResourceExhausted, "relay cut: storage saturated")
+		}
+		relaysRejected.WithLabelValues(serviceID, BackendTypeGRPC, classifyGRPCBackendError(stream.Context(), err)).Inc()
+		// Per-request; the state change (backend down) is the circuit
+		// breaker transition logged above.
+		logging.WithSessionContext(s.logger.Debug(), sessionCtx).
 			Err(err).
 			Msg("failed to forward request to backend")
 
@@ -372,7 +554,17 @@ func (s *RelayGRPCService) handleSendRelay(stream grpc.ServerStream) error {
 			return status.Errorf(codes.Internal, "failed to build error response: %v", buildErr)
 		}
 
-		// Send error response (typed proto message)
+		// Send error response (typed proto message) so the client learns the
+		// relay failed. This is a transport/config failure: forwardToBackend
+		// returned err != nil, meaning the backend produced NO real response
+		// (connection refused, timeout, misroute/errBackendMisconfigured). Such a
+		// relay is NOT publishable — mirror the HTTP path (proxy.go), which on a
+		// forward error returns an error to the client and publishes nothing.
+		// Publishing here would mine a supplier-fabricated 500 for a relay the
+		// backend never answered, inflating the WAL with unclaimable garbage and
+		// diverging from HTTP. A backend that DID answer (4xx/5xx with a body)
+		// sets err == nil and is handled by the success/5xx branches below, so
+		// legitimately claimable error relays are unaffected.
 		if sendErr := stream.SendMsg(relayResponse); sendErr != nil {
 			return status.Errorf(codes.Internal, "failed to send error response: %v", sendErr)
 		}
@@ -384,8 +576,8 @@ func (s *RelayGRPCService) handleSendRelay(stream grpc.ServerStream) error {
 	// 2xx-4xx are valid relays (client/backend logic errors that should be paid)
 	// 5xx are infrastructure/backend failures (supplier should not be compensated)
 	if respStatus >= http.StatusInternalServerError {
-		grpcRelayErrors.WithLabelValues(serviceID, "backend_5xx").Inc()
-		logging.WithSessionContext(s.logger.Warn(), sessionCtx).
+		relaysRejected.WithLabelValues(serviceID, BackendTypeGRPC, rejectReasonBackend5xx).Inc()
+		logging.WithSessionContext(s.logger.Debug(), sessionCtx).
 			Int("status_code", respStatus).
 			Msg("backend returned 5xx error - relay not mined")
 		// Return gRPC error without wrapping/signing/mining
@@ -400,29 +592,72 @@ func (s *RelayGRPCService) handleSendRelay(stream grpc.ServerStream) error {
 		respStatus,
 	)
 	if err != nil {
-		grpcRelayErrors.WithLabelValues(serviceID, "sign_error").Inc()
+		relaysRejected.WithLabelValues(serviceID, BackendTypeGRPC, rejectReasonSigningError).Inc()
 		return status.Errorf(codes.Internal, "failed to build/sign response: %v", err)
 	}
 
 	// Send the response (typed proto message)
 	if err := stream.SendMsg(relayResponse); err != nil {
-		grpcRelayErrors.WithLabelValues(serviceID, "send_error").Inc()
+		relaysRejected.WithLabelValues(serviceID, BackendTypeGRPC, rejectReasonSendError).Inc()
 		return status.Errorf(codes.Internal, "failed to send response: %v", err)
 	}
+
+	// Served: the reservation becomes a charge.
+	s.relayPipeline.SettleRelay(reservation)
+	settled = true
+
+	// SERVED: the client has the response. Counted here and not after the
+	// publish below, for the same reason as every other transport -- a relay
+	// served but not published must land in the drop rate's denominator.
+	//
+	// The other two SendMsg sites in this file deliberately do NOT count:
+	// the one on the forward-error branch is the REJECTED path (HTTP does the
+	// same, relaysRejected + return before its own relaysServed at
+	// proxy.go:1302), and the one in serveSimulatedGRPC must leave this counter
+	// flat -- docs/SIMULATED_RELAYS.md states that as the isolation contract.
+	relaysServed.WithLabelValues(serviceID, BackendTypeGRPC, statusCodeNoHTTP).Inc()
+
+	// Latency ends HERE, where the client has the response and before the
+	// publish below: the same span relay_latency_seconds measures for HTTP, which
+	// records it before submitting the publish task. Observed after the publish,
+	// a slow store would show up as a slow gRPC relay the client never waited for.
+	relayLatency.WithLabelValues(serviceID, BackendTypeGRPC).Observe(time.Since(arrivalTime).Seconds())
 
 	// Use RelayProcessor for consistent relay processing (mining difficulty, deduplication, publishing)
 	if s.relayProcessor != nil {
 		// Marshal request and response for ProcessRelay
 		reqBz, err := relayRequest.Marshal()
 		if err != nil {
-			logging.WithSessionContext(s.logger.Warn(), sessionCtx).
+			relaysDropped.WithLabelValues(serviceID, BackendTypeGRPC, dropReasonMarshalFailed).Inc()
+			logging.WithSessionContext(s.logger.Debug(), sessionCtx).
 				Err(err).
 				Msg("failed to marshal relay request for processing")
 		} else {
-			publishCtx, publishCancel := context.WithTimeout(context.WithoutCancel(ctx), grpcPublishTimeout)
+			// publishCtx detaches the mining + WAL publish from the request
+			// lifetime. It is created HERE — after the backend forward and after
+			// the signed response was already sent to the client — so its full
+			// grpcPublishTimeout budget starts at publish time, NOT at handler
+			// entry. Creating it earlier would let a slow-but-successful backend
+			// consume the budget: an already-served relay would then fail to
+			// publish (context deadline exceeded) and never reach the WAL — no
+			// session/claim/proof, lost reward. context.WithoutCancel drops the
+			// request/backend deadline (already spent) while keeping publication
+			// alive past client cancellation. Mirrors the HTTP path, which
+			// publishes on a fresh detached context created at publish time.
+			publishCtx, publishCancel := context.WithTimeout(WithRPCType(context.WithoutCancel(ctx), BackendTypeGRPC), grpcPublishTimeout)
 			defer publishCancel()
 
-			// Process relay (includes difficulty check, cache warming, deduplication, publishing)
+			// Mine the RAW backend response body, exactly like the HTTP path
+			// (proxy.go executePublish passes task.respBody). ProcessRelay builds
+			// and signs its OWN RelayResponse over this body and derives
+			// PayloadHash = sha256(respBody). Handing it the already-marshaled
+			// relayResponseBz instead would make PayloadHash cover a
+			// RelayResponse-wrapped-in-a-RelayResponse — the wrong bytes — and
+			// diverge from what the HTTP path mines.
+			//
+			// ProcessRelay only BUILDS the message; without the Publish call below
+			// the relay never reaches the miner's WAL and no session/claim/proof is
+			// ever created for it.
 			msg, err := s.relayProcessor.ProcessRelay(
 				publishCtx,
 				reqBz,
@@ -432,7 +667,8 @@ func (s *RelayGRPCService) handleSendRelay(stream grpc.ServerStream) error {
 				arrivalHeight,
 			)
 			if err != nil {
-				logging.WithSessionContext(s.logger.Warn(), sessionCtx).
+				relaysDropped.WithLabelValues(serviceID, BackendTypeGRPC, dropReasonProcessFailed).Inc()
+				logging.WithSessionContext(s.logger.Debug(), sessionCtx).
 					Err(err).
 					Msg("failed to process relay")
 			} else if msg == nil {
@@ -440,23 +676,21 @@ func (s *RelayGRPCService) handleSendRelay(stream grpc.ServerStream) error {
 				logging.WithSessionContext(s.logger.Debug(), sessionCtx).
 					Msg("gRPC relay skipped (did not meet mining difficulty)")
 			} else if s.publisher == nil {
+				relaysDropped.WithLabelValues(serviceID, BackendTypeGRPC, dropReasonNoPublisher).Inc()
 				logging.WithSessionContext(s.logger.Warn(), sessionCtx).
-					Msg("gRPC relay processed but publisher is not configured")
-			} else if publishErr := s.publisher.Publish(publishCtx, msg); publishErr != nil {
-				logging.WithSessionContext(s.logger.Warn(), sessionCtx).
-					Err(publishErr).
-					Msg("failed to publish processed gRPC relay")
+					Msg("no publisher configured, skipping relay publication")
+			} else if pubErr := s.publisher.Publish(publishCtx, msg); pubErr != nil {
+				relaysDropped.WithLabelValues(serviceID, BackendTypeGRPC, dropReasonPublishFailed).Inc()
+				logging.WithSessionContext(s.logger.Debug(), sessionCtx).
+					Err(pubErr).
+					Msg("failed to publish mined relay")
 			} else {
+				// Relay was successfully processed and published
 				logging.WithSessionContext(s.logger.Debug(), sessionCtx).
 					Msg("gRPC relay processed and published")
-				grpcRelaysPublished.WithLabelValues(serviceID).Inc()
 			}
 		}
 	}
-
-	// Update metrics
-	grpcRelaysTotal.WithLabelValues(serviceID).Inc()
-	grpcRelayLatency.WithLabelValues(serviceID).Observe(time.Since(arrivalTime).Seconds())
 
 	logging.WithSessionContext(s.logger.Debug(), sessionCtx).
 		Int("response_size", len(relayResponseBz)).
@@ -466,74 +700,113 @@ func (s *RelayGRPCService) handleSendRelay(stream grpc.ServerStream) error {
 	return nil
 }
 
-// forwardToBackend forwards the request to the appropriate backend service.
-// If endpoint is non-nil, its URL is used for backend selection (pool-based).
-// Otherwise, falls back to config-based URL lookup (legacy path).
-func normalizeBackendURLForRPCType(backendURL, rpcType string) (string, error) {
-	if backendURL == "" {
-		return "", fmt.Errorf("%w: no backend configured for rpc type %q", errBackendMisconfigured, rpcType)
+// simGRPCCode maps a simulation admission error to a gRPC status code. The
+// metric result label comes from SimResultForError (transport-agnostic).
+func simGRPCCode(err error) codes.Code {
+	switch {
+	case errors.Is(err, ErrSimReplay):
+		return codes.AlreadyExists
+	case errors.Is(err, ErrSimServiceUnknown):
+		return codes.NotFound
+	case errors.Is(err, ErrSimSupplierMissing), errors.Is(err, ErrSimBadSessionID):
+		return codes.InvalidArgument
+	case errors.Is(err, ErrSimDedupUnavailable):
+		return codes.Unavailable
+	default:
+		return codes.PermissionDenied
 	}
-	if rpcType == BackendTypeGRPC && !strings.Contains(backendURL, "://") {
-		backendURL = "http://" + backendURL
+}
+
+// serveSimulatedGRPC serves a simulated relay over native gRPC. It runs the
+// simulation Admission zone (global slot -> pinned-ring/binding/freshness
+// Verify -> per-key rate), then the SHARED data path (the SAME forwardToBackend
+// and response signer the real gRPC path uses), skipping Accounting entirely
+// (no meter consume, no publish). Always eager-admission.
+func (s *RelayGRPCService) serveSimulatedGRPC(
+	stream grpc.ServerStream,
+	ctx context.Context,
+	relayRequest *servicetypes.RelayRequest,
+	serviceID string,
+	svcConfig ServiceConfig,
+	supplier, keyID string,
+	md metadata.MD,
+) error {
+	const transportLabel = "grpc"
+	record := func(result string) {
+		simulatedRelaysTotal.WithLabelValues(transportLabel, serviceID, supplier, result).Inc()
 	}
-	parsed, err := url.Parse(backendURL)
+
+	release, ok := s.simVerifier.AcquireGlobal()
+	if !ok {
+		record(SimResultRateLimited)
+		return status.Error(codes.ResourceExhausted, "simulation concurrency limit reached")
+	}
+	defer release()
+
+	if err := s.simVerifier.Verify(ctx, keyID, relayRequest); err != nil {
+		record(SimResultForError(err))
+		return status.Errorf(simGRPCCode(err), "simulation rejected: %v", err)
+	}
+	if !s.simVerifier.AllowKey(keyID) {
+		record(SimResultRateLimited)
+		return status.Error(codes.ResourceExhausted, "simulation rate limit reached")
+	}
+
+	// SHARED DATA PATH — deserialize, resolve backend type, forward.
+	poktHTTPRequest, err := sdktypes.DeserializeHTTPRequest(relayRequest.Payload)
 	if err != nil {
-		return "", fmt.Errorf("%w: failed to parse backend URL: %w", errBackendMisconfigured, err)
+		record(SimResultVerifyFailed)
+		return status.Errorf(codes.InvalidArgument, "failed to deserialize payload: %v", err)
 	}
-	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return "", fmt.Errorf("%w: backend scheme %q is not dialable for rpc type %q", errBackendMisconfigured, parsed.Scheme, rpcType)
-	}
-	return backendURL, nil
-}
-
-func mergeTrailersIntoHeader(header, trailer http.Header) http.Header {
-	if len(trailer) == 0 {
-		return header
-	}
-	merged := header.Clone()
-	if merged == nil {
-		merged = make(http.Header, len(trailer))
-	}
-	for key, values := range trailer {
-		for _, value := range values {
-			merged.Add(key, value)
+	grpcRPCType := resolveGRPCRelayRPCType(md, poktHTTPRequest, &svcConfig)
+	var grpcEndpoint *pool.BackendEndpoint
+	if s.getPool != nil {
+		grpcPool := s.getPool(serviceID, grpcRPCType)
+		if grpcPool == nil || !grpcPool.HasHealthy() {
+			record(SimResultBackendError)
+			return status.Error(codes.Unavailable, "backend unavailable")
 		}
+		grpcEndpoint = grpcPool.Next()
 	}
-	return merged
-}
-
-func fallbackBackendConfig(svcConfig *ServiceConfig, rpcType string) *BackendConfig {
-	if svcConfig == nil {
-		return nil
+	respBody, respHeaders, respStatus, err := s.forwardToBackend(ctx, serviceID, &svcConfig, poktHTTPRequest, grpcEndpoint, grpcRPCType)
+	if err != nil {
+		record(SimResultBackendError)
+		return status.Errorf(codes.Unavailable, "backend error: %v", err)
 	}
-	candidates := []string{rpcType, svcConfig.DefaultBackend, BackendTypeJSONRPC, BackendTypeREST}
-	seen := make(map[string]struct{}, len(candidates))
-	for _, candidate := range candidates {
-		if candidate == "" {
-			continue
-		}
-		if _, ok := seen[candidate]; ok {
-			continue
-		}
-		seen[candidate] = struct{}{}
-		if backend, ok := svcConfig.Backends[candidate]; ok {
-			config := backend
-			return &config
-		}
+	if respStatus >= 500 {
+		record(SimResultBackendError)
+		return status.Errorf(codes.Unavailable, "backend service error: HTTP %d", respStatus)
 	}
 
-	keys := make([]string, 0, len(svcConfig.Backends))
-	for key := range svcConfig.Backends {
-		keys = append(keys, key)
+	// SHARED DATA PATH — same response signer as the real path.
+	relayResponse, _, err := s.responseSigner.BuildAndSignRelayResponseFromBody(relayRequest, respBody, respHeaders, respStatus)
+	if err != nil {
+		record(SimResultSignFailed)
+		return status.Errorf(codes.Internal, "failed to sign response: %v", err)
 	}
-	sort.Strings(keys)
-	if len(keys) > 0 {
-		config := svcConfig.Backends[keys[0]]
-		return &config
+	if err := stream.SendMsg(relayResponse); err != nil {
+		record(SimResultBackendError)
+		return status.Errorf(codes.Internal, "failed to send response: %v", err)
 	}
+
+	// ACCOUNTING gated off: no publish. Dry meter probe feeds the result label.
+	result := SimResultSuccess
+	if s.relayMeter != nil {
+		if healthErr := s.relayMeter.CheckRelayHealth(ctx, serviceID); healthErr != nil {
+			result = SimResultMeterDegraded
+		}
+	}
+	record(result)
 	return nil
 }
 
+// forwardToBackend forwards the request to the appropriate backend service.
+// If endpoint is non-nil, its URL is used for backend selection (pool-based).
+// Otherwise, falls back to config-based URL lookup (legacy path).
+//
+// rpcType is resolved by the caller (see resolveGRPCRelayRPCType) so backend
+// selection, URL normalization, and transport choice all follow the client's
+// declared transport rather than re-deriving it from the inner Content-Type.
 func (s *RelayGRPCService) forwardToBackend(
 	ctx context.Context,
 	serviceID string,
@@ -541,13 +814,11 @@ func (s *RelayGRPCService) forwardToBackend(
 	poktHTTPRequest *sdktypes.POKTHTTPRequest,
 	endpoint *pool.BackendEndpoint,
 	rpcType string,
-	requestID string,
 ) ([]byte, http.Header, int, error) {
 	// Find the backend configuration
 	var backendURL string
 	var configHeaders map[string]string
 	var auth *AuthenticationConfig
-	var backendConfig *BackendConfig
 
 	// Use pool endpoint URL if available (circuit breaker integration)
 	if endpoint != nil {
@@ -555,23 +826,45 @@ func (s *RelayGRPCService) forwardToBackend(
 	}
 
 	// Get headers and auth from backend config (always needed regardless of pool usage)
-	if s.getBackendConfig != nil {
-		backendConfig = s.getBackendConfig(serviceID, rpcType)
-	}
-	if backendConfig == nil {
-		backendConfig = fallbackBackendConfig(svcConfig, rpcType)
-	}
-	if backendConfig != nil {
+	//
+	// pool.NormalizeGRPCScheme is applied on these fallbacks too: they read the
+	// configured URL directly instead of going through pool.NewBackendEndpoint,
+	// so without it a grpc:// backend reached by this path would still fail as
+	// an undialable scheme. Reachable when no pool is wired (getPool == nil).
+	if backend, ok := svcConfig.Backends[rpcType]; ok {
 		if backendURL == "" {
-			backendURL = backendConfig.URL
+			backendURL = pool.NormalizeGRPCScheme(backend.URL)
 		}
-		configHeaders = backendConfig.Headers
-		auth = backendConfig.Authentication
+		configHeaders = backend.Headers
+		auth = backend.Authentication
+	} else if backend, ok := svcConfig.Backends["rest"]; ok {
+		if backendURL == "" {
+			backendURL = pool.NormalizeGRPCScheme(backend.URL)
+		}
+		configHeaders = backend.Headers
+		auth = backend.Authentication
+	} else {
+		// Use any available backend
+		for _, backend := range svcConfig.Backends {
+			if backendURL == "" {
+				backendURL = pool.NormalizeGRPCScheme(backend.URL)
+			}
+			configHeaders = backend.Headers
+			auth = backend.Authentication
+			break
+		}
 	}
 
+	if backendURL == "" {
+		return nil, nil, 0, fmt.Errorf("%w: no backend configured for service %s", errBackendMisconfigured, serviceID)
+	}
+
+	// Normalize the backend URL for the resolved RPC type. gRPC backends are
+	// conventionally configured as bare host:port (e.g. "backend:50051"), which
+	// url.Parse reads as scheme "backend" and http.NewRequest then rejects.
 	backendURL, err := normalizeBackendURLForRPCType(backendURL, rpcType)
 	if err != nil {
-		return nil, nil, 0, err
+		return nil, nil, 0, fmt.Errorf("%w: %v", errBackendMisconfigured, err)
 	}
 
 	// Build the request URL
@@ -582,7 +875,14 @@ func (s *RelayGRPCService) forwardToBackend(
 
 	backendParsed, err := url.Parse(backendURL)
 	if err != nil {
-		return nil, nil, 0, fmt.Errorf("failed to parse backend URL: %w", err)
+		return nil, nil, 0, fmt.Errorf("%w: failed to parse backend URL: %v", errBackendMisconfigured, err)
+	}
+
+	// After normalization the backend must be dialable over HTTP(S); anything
+	// else (e.g. a scheme-less REST backend, or ws://) would fail deep inside
+	// http.NewRequest as a raw error and poison the breaker. Treat it as config.
+	if backendParsed.Scheme != "http" && backendParsed.Scheme != "https" {
+		return nil, nil, 0, fmt.Errorf("%w: backend scheme %q is not dialable for rpc type %q", errBackendMisconfigured, backendParsed.Scheme, rpcType)
 	}
 
 	// Merge URLs
@@ -591,6 +891,8 @@ func (s *RelayGRPCService) forwardToBackend(
 	if backendParsed.Path != "" && backendParsed.Path != "/" {
 		requestURL.Path = backendParsed.Path + requestURL.Path
 	}
+	// Normalize multi-slash artifacts (e.g. "//") before dispatch — raw
+	// backends without a normalizing proxy return 404 for `POST //`. See #8.
 	requestURL.Path = normalizeBackendPath(requestURL.Path)
 
 	// Create HTTP request
@@ -608,29 +910,14 @@ func (s *RelayGRPCService) forwardToBackend(
 		}
 	}
 
-	// Add config headers (override any matching keys)
-	for key, value := range configHeaders {
-		req.Header.Set(key, value)
-	}
-
-	// Add authentication if configured
-	if auth != nil {
-		if auth.Username != "" && auth.Password != "" {
-			req.SetBasicAuth(auth.Username, auth.Password)
-		} else if auth.BearerToken != "" {
-			req.Header.Set("Authorization", "Bearer "+auth.BearerToken)
-		} else if auth.PlainToken != "" {
-			req.Header.Set("Authorization", auth.PlainToken)
-		}
-	}
-	if requestID != "" {
-		req.Header.Set(HeaderPocketRequestID, requestID)
-	}
+	// Apply backend config headers + authentication (shared with HTTP path).
+	applyBackendAuthAndHeaders(req, configHeaders, auth)
 
 	// Set host header
 	req.Host = backendParsed.Host
 
-	// Execute request using service-specific HTTP client
+	// Execute request. gRPC backends need the dedicated h2c client; everything
+	// else uses the per-service HTTP/1.1 client with its pool/timeout profile.
 	client := s.getHTTPClient(serviceID)
 	if rpcType == BackendTypeGRPC {
 		client = s.grpcHTTPClient
@@ -643,12 +930,90 @@ func (s *RelayGRPCService) forwardToBackend(
 
 	// Read response body using buffer pool to avoid RAM exhaustion
 	// The buffer pool enforces the size limit and reuses buffers
-	respBody, err := s.bufferPool.ReadWithBuffer(resp.Body)
+	respBody, err := s.bufferPool.ReadWithBufferLimit(resp.Body, s.getServiceMaxResponseBodySize(serviceID))
 	if err != nil {
 		return nil, nil, 0, fmt.Errorf("failed to read response: %w", err)
 	}
 
+	// gRPC carries its status (grpc-status/grpc-message) in HTTP trailers, sent
+	// after the body -- so they are only readable now that the body reached EOF.
+	// gRPC clients need grpc-status to interpret the reply, so fold trailers into
+	// the returned headers. This covers unary and buffered server-streaming; it
+	// does not model full-duplex streaming, which this proxy does not forward.
 	return respBody, mergeTrailersIntoHeader(resp.Header, resp.Trailer), resp.StatusCode, nil
+}
+
+// resolveGRPCRelayRPCType determines the backend RPC type for a gRPC relay.
+// Precedence mirrors the HTTP path (proxy.go:719-728): the client declares its
+// intended transport through the "rpc-type" gRPC metadata, and that intent must
+// win over the inner POKTHTTPRequest Content-Type, which is only a heuristic
+// fallback. Order: (1) metadata "rpc-type", (2) inner Content-Type
+// "application/grpc*", (3) service DefaultBackend, (4) global default.
+func resolveGRPCRelayRPCType(md metadata.MD, poktReq *sdktypes.POKTHTTPRequest, svcConfig *ServiceConfig) string {
+	// 1. Explicit client declaration via gRPC metadata (numeric code or name).
+	for _, v := range md.Get("rpc-type") {
+		if v != "" {
+			return RPCTypeToBackendType(v)
+		}
+	}
+
+	// 2. Heuristic: the inner request advertises application/grpc.
+	if poktReq != nil && poktReq.Header != nil {
+		if ct, ok := poktReq.Header["Content-Type"]; ok && len(ct.Values) > 0 {
+			if strings.HasPrefix(ct.Values[0], "application/grpc") {
+				return BackendTypeGRPC
+			}
+		}
+	}
+
+	// 3. Service-configured default backend (normalized the same as the header).
+	if svcConfig != nil && svcConfig.DefaultBackend != "" {
+		return RPCTypeToBackendType(svcConfig.DefaultBackend)
+	}
+
+	// 4. Global default.
+	return DefaultBackendType
+}
+
+// normalizeBackendURLForRPCType makes a gRPC backend URL dialable over h2c.
+// Only gRPC is rewritten: a bare host:port (the conventional gRPC backend form,
+// e.g. "backend:50051") gets an "http://" scheme so url.Parse/http.NewRequest
+// can dial it as cleartext HTTP/2. URLs that already carry http/https are left
+// alone; any other explicit scheme (ws://, ftp://, ...) is a misconfiguration.
+// Non-gRPC types are returned untouched -- a genuine problem there surfaces as
+// an undialable scheme downstream, still classified as a config error.
+func normalizeBackendURLForRPCType(backendURL, rpcType string) (string, error) {
+	if rpcType != BackendTypeGRPC {
+		return backendURL, nil
+	}
+	if strings.HasPrefix(backendURL, "http://") || strings.HasPrefix(backendURL, "https://") {
+		return backendURL, nil
+	}
+	// No "://" means a bare host:port -- treat it as h2c cleartext.
+	if scheme, _, found := strings.Cut(backendURL, "://"); found {
+		return "", fmt.Errorf("gRPC backend URL %q has undialable scheme %q", backendURL, scheme)
+	}
+	return "http://" + backendURL, nil
+}
+
+// mergeTrailersIntoHeader returns header extended with every value from trailer.
+// When trailer is empty the original header is returned unchanged (no copy).
+// Keys are canonicalized by http.Header, so callers read grpc-status via
+// Get("Grpc-Status") regardless of the wire casing.
+func mergeTrailersIntoHeader(header, trailer http.Header) http.Header {
+	if len(trailer) == 0 {
+		return header
+	}
+	merged := header.Clone()
+	if merged == nil {
+		merged = make(http.Header, len(trailer))
+	}
+	for key, values := range trailer {
+		for _, value := range values {
+			merged.Add(key, value)
+		}
+	}
+	return merged
 }
 
 // getCircuitBreakerThreshold returns the unhealthy threshold for circuit breaker evaluation.
@@ -663,98 +1028,54 @@ func (s *RelayGRPCService) getCircuitBreakerThreshold(serviceID, rpcType string)
 	return pool.DefaultUnhealthyThreshold
 }
 
-// logCircuitBreakerTransition logs a circuit breaker state transition.
-func (s *RelayGRPCService) logCircuitBreakerTransition(transition *pool.TransitionEvent, serviceID, rpcType string) {
-	if transition.OldHealthy && !transition.NewHealthy {
-		event := s.logger.Warn().
-			Str("backend", transition.Endpoint.Name).
-			Str("url", transition.Endpoint.RawURL).
-			Str(logging.FieldServiceID, serviceID).
-			Str("rpc_type", rpcType).
-			Int32("consecutive_failures", transition.Failures).
-			Int32("threshold", pool.DefaultUnhealthyThreshold)
-
-		if transition.StatusCode > 0 {
-			event = event.Int("trigger_http_status", transition.StatusCode)
-		}
-		if transition.Error != nil {
-			event = event.Str("trigger_error", transition.Error.Error())
-		}
-
-		event.Msg("BACKEND DOWN: circuit breaker tripped, traffic will failover to other backends")
-	} else if !transition.OldHealthy && transition.NewHealthy {
-		event := s.logger.Info().
-			Str("backend", transition.Endpoint.Name).
-			Str("url", transition.Endpoint.RawURL).
-			Str(logging.FieldServiceID, serviceID).
-			Str("rpc_type", rpcType)
-
-		if transition.DowntimeDuration > 0 {
-			event = event.Dur("downtime", transition.DowntimeDuration)
-		}
-
-		event.Msg("BACKEND UP: circuit breaker recovered, backend is healthy again")
-	}
-}
-
-// Unused - reserved for future gRPC streaming support
-// connectToGRPCBackend establishes a gRPC connection to a backend (for future streaming support).
-// func (s *RelayGRPCService) connectToGRPCBackend(backendURL string) (*grpc.ClientConn, error) {
-// 	// Check cache
-// 	if conn, ok := s.grpcBackends.Load(backendURL); ok {
-// 		return conn.(*grpc.ClientConn), nil
-// 	}
-//
-// 	// Parse URL to determine TLS
-// 	useTLS := strings.HasPrefix(backendURL, "grpcs://") || strings.HasPrefix(backendURL, "https://")
-//
-// 	// Strip scheme
-// 	address := backendURL
-// 	address = strings.TrimPrefix(address, "grpcs://")
-// 	address = strings.TrimPrefix(address, "grpc://")
-// 	address = strings.TrimPrefix(address, "https://")
-// 	address = strings.TrimPrefix(address, "http://")
-//
-// 	var opts []grpc.DialOption
-// 	if useTLS {
-// 		opts = append(opts, grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{
-// 			MinVersion: tls.VersionTLS12,
-// 		})))
-// 	} else {
-// 		opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
-// 	}
-//
-// 	conn, err := grpc.NewClient(address, opts...)
-// 	if err != nil {
-// 		return nil, err
-// 	}
-//
-// 	s.grpcBackends.Store(backendURL, conn)
-// 	return conn, nil
-// }
-
-// Close closes all backend connections.
-func (s *RelayGRPCService) Close() error {
-	var lastErr error
-	s.grpcBackends.Range(func(key, value interface{}) bool {
-		if conn, ok := value.(*grpc.ClientConn); ok {
-			if err := conn.Close(); err != nil {
-				lastErr = err
-			}
-		}
-		return true
-	})
-	return lastErr
-}
-
 // NewGRPCServerForRelayService creates a gRPC server configured for the relay service.
 // It uses the standard proto codec and handles typed RelayRequest/RelayResponse messages.
 // Includes panic recovery interceptors for both unary and stream RPCs.
 func NewGRPCServerForRelayService(service *RelayGRPCService) *grpc.Server {
+	// Without MaxRecvMsgSize gRPC keeps grpc-go's 4 MiB default, so a service
+	// configured for more was cut off at 4 MiB on this transport and served in
+	// full over HTTP -- the same config, two answers. Worse, that rejection
+	// happens inside grpc-go before any of our code runs, so it increments no
+	// counter of ours and leaves no reason: from the miner's side the relay
+	// simply never existed. The bound here is the widest any service allows;
+	// each service's own, narrower bound is applied in the handler.
 	server := grpc.NewServer(
+		grpc.MaxRecvMsgSize(int(service.maxRequestBodySizeAcrossServices)),
 		grpc.UnknownServiceHandler(service.HandleUnknownService),
 		grpc.UnaryInterceptor(UnaryPanicRecoveryInterceptor(service.logger)),
 		grpc.StreamInterceptor(StreamPanicRecoveryInterceptor(service.logger)),
 	)
 	return server
+}
+
+// Rejections of the stream itself: the request could not be read off it, or the
+// signed response could not be written back to it.
+const (
+	rejectReasonRecvError = "recv_error"
+	rejectReasonSendError = "send_error"
+)
+
+// classifyGRPCBackendError names a failed backend forward with the three reasons
+// HTTP uses (classifyBackendOutcome), in the same precedence: the client going
+// away first, then our own deadline, then everything else.
+//
+// It reads the errors and not their text, because nothing on the gRPC path wraps
+// them with the reason strings HTTP's matcher looks for. What makes errors.Is
+// enough, read in the go1.26.5 source: net/http returns context.Cause(ctx) for a
+// request whose context ended (transport.go:677), its own timeout error reports
+// itself as context.DeadlineExceeded (timeoutError.Is, transport.go:2775), and
+// url.Error unwraps (net/url/url.go:38).
+//
+// clientCtx is the STREAM's context, not the per-service timeout derived from
+// it: that one is cancelled by our own deadline too, so it cannot tell the two
+// apart.
+func classifyGRPCBackendError(clientCtx context.Context, err error) string {
+	switch {
+	case clientCtx.Err() != nil:
+		return rejectReasonClientDisconnected
+	case errors.Is(err, context.DeadlineExceeded):
+		return rejectReasonBackendTimeout
+	default:
+		return rejectReasonBackendNetworkError
+	}
 }

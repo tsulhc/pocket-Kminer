@@ -3,45 +3,15 @@
 package relayer
 
 import (
-	"context"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/pokt-network/pocket-relay-miner/pool"
 )
-
-func TestNewHTTPServerSupportsH2C(t *testing.T) {
-	protocol := make(chan string, 1)
-	server := newHTTPServer("127.0.0.1:0", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		protocol <- r.Proto
-		w.WriteHeader(http.StatusNoContent)
-	}), time.Second)
-	listener, err := net.Listen("tcp", server.Addr)
-	require.NoError(t, err)
-	serveErr := make(chan error, 1)
-	go func() {
-		serveErr <- server.Serve(listener)
-	}()
-	t.Cleanup(func() {
-		require.NoError(t, server.Shutdown(context.Background()))
-		require.ErrorIs(t, <-serveErr, http.ErrServerClosed)
-	})
-
-	clientProtocols := new(http.Protocols)
-	clientProtocols.SetUnencryptedHTTP2(true)
-	client := &http.Client{Transport: &http.Transport{Protocols: clientProtocols}}
-	response, err := client.Get("http://" + listener.Addr().String())
-	require.NoError(t, err)
-	require.NoError(t, response.Body.Close())
-	require.Equal(t, http.StatusNoContent, response.StatusCode)
-	require.Equal(t, "HTTP/2.0", <-protocol)
-}
 
 // --- sendServiceUnavailable Tests ---
 
@@ -57,30 +27,6 @@ func TestSendServiceUnavailable(t *testing.T) {
 	assert.Contains(t, w.Header().Get("Content-Type"), "application/json")
 	assert.Contains(t, w.Body.String(), "service temporarily unavailable")
 	assert.Contains(t, w.Body.String(), "develop-http")
-}
-
-func TestCopyHeaders_InnerRequestContentTypeWins(t *testing.T) {
-	p := &ProxyServer{logger: testLogger()}
-
-	dst := httptest.NewRequest(
-		http.MethodPost,
-		"http://backend:8545/",
-		nil,
-	)
-	dst.Header.Set("Content-Type", "application/json")
-
-	src := httptest.NewRequest(
-		http.MethodPost,
-		"http://relayer/service",
-		nil,
-	)
-	src.Header.Set("Content-Type", "application/x-protobuf")
-	src.Header.Set("Accept-Encoding", "gzip")
-
-	p.copyHeaders(dst, src)
-
-	require.Equal(t, "application/json", dst.Header.Get("Content-Type"))
-	require.Equal(t, "gzip", dst.Header.Get("Accept-Encoding"))
 }
 
 // --- HTTP Fast-Fail Pre-Check Tests ---
@@ -212,6 +158,10 @@ func TestMergeBackendPath(t *testing.T) {
 	}
 }
 
+// TestNormalizeBackendPath covers issue #8: gateway-style clients may forward
+// `//` (double-slash) as the request path, and raw backends without a
+// normalizing reverse proxy return 404 for `POST //`. The normalize step
+// applied at the dispatch site collapses these artifacts.
 func TestNormalizeBackendPath(t *testing.T) {
 	tests := []struct {
 		name string
@@ -227,12 +177,41 @@ func TestNormalizeBackendPath(t *testing.T) {
 		{"trailing slash dropped", "/foo/", "/foo"},
 		{"plain path unchanged", "/v1/users", "/v1/users"},
 	}
-
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			assert.Equal(t, tt.want, normalizeBackendPath(tt.in))
 		})
 	}
+}
+
+// TestCopyHeaders_InnerRequestContentTypeWins covers a production relay bug: the
+// backend request is first given the inner POKTHTTPRequest's headers (via
+// CopyToHTTPHeader) — e.g. Content-Type: application/json, which is what the
+// backend actually needs — and copyHeaders then folds in wrapper-request headers.
+// copyHeaders must NOT overwrite a header the inner request already set, because
+// the wrapper's Content-Type is the relay envelope's (application/x-protobuf) and
+// a strict JSON-RPC backend (e.g. Anvil) rejects a non-json Content-Type with
+// "-32600 Invalid request". Headers the inner request did not set are still
+// copied from the wrapper.
+func TestCopyHeaders_InnerRequestContentTypeWins(t *testing.T) {
+	p := &ProxyServer{logger: testLogger()}
+
+	// Backend request already carries the inner request's Content-Type.
+	dst := httptest.NewRequest("POST", "http://backend:8545/", nil)
+	dst.Header.Set("Content-Type", "application/json")
+
+	// Wrapper (outer relay) request carries the relay envelope Content-Type plus
+	// headers a backend may want.
+	src := httptest.NewRequest("POST", "http://relayer/pnf-anvil", nil)
+	src.Header.Set("Content-Type", "application/x-protobuf")
+	src.Header.Set("Accept-Encoding", "gzip")
+
+	p.copyHeaders(dst, src)
+
+	require.Equal(t, "application/json", dst.Header.Get("Content-Type"),
+		"the inner request's backend Content-Type must not be overwritten by the relay envelope's")
+	require.Equal(t, "gzip", dst.Header.Get("Accept-Encoding"),
+		"headers the inner request did not set are still copied from the wrapper")
 }
 
 func TestShouldCompressResponse(t *testing.T) {

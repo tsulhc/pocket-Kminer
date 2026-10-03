@@ -1,7 +1,6 @@
 package relay_client
 
 import (
-	"context"
 	"encoding/hex"
 	"fmt"
 
@@ -11,8 +10,6 @@ import (
 	ring_secp256k1 "github.com/pokt-network/go-dleq/secp256k1"
 	"github.com/pokt-network/ring-go"
 
-	"github.com/pokt-network/poktroll/pkg/crypto"
-	apptypes "github.com/pokt-network/poktroll/x/application/types"
 	servicetypes "github.com/pokt-network/poktroll/x/service/types"
 )
 
@@ -41,11 +38,11 @@ type Signer struct {
 //
 // Example:
 //
-//	signer, err := NewSignerFromHex("2d00ef074d9b51e46886dc9a1df11e7b986611d0f336bdcf1f0adce3e037ec0a")
+//	signer, err := NewSignerFromHex("c188c43496351a963762a5d9de78ff887ac66b4ba5de5967efd55a6d1e71ddda")
 //	if err != nil {
 //	    return fmt.Errorf("failed to create signer: %w", err)
 //	}
-//	address := signer.GetAddress() // pokt1mrqt5f7qh8uxs27cjm9t7v9e74a9vvdnq5jva4
+//	address := signer.GetAddress() // pokt1pyr6a2yz9rrdhlgg8ff0xqhlsv3qsxcmm3yp8z
 func NewSignerFromHex(privKeyHex string) (*Signer, error) {
 	if privKeyHex == "" {
 		return nil, fmt.Errorf("private key hex is empty")
@@ -84,99 +81,15 @@ func NewSignerFromHex(privKeyHex string) (*Signer, error) {
 // "pokt" prefix and is derived from the secp256k1 public key.
 //
 // Returns:
-//   - string: Bech32 address (e.g., "pokt1mrqt5f7qh8uxs27cjm9t7v9e74a9vvdnq5jva4")
+//   - string: Bech32 address (e.g., "pokt1pyr6a2yz9rrdhlgg8ff0xqhlsv3qsxcmm3yp8z")
 func (s *Signer) GetAddress() string {
 	return s.address
 }
 
-// SignRelayRequest signs a relay request with a ring signature.
-//
-// This implements the Pocket Network relay authentication protocol using ring signatures,
-// which allows an application or gateway to sign relay requests while maintaining privacy
-// about which specific key (application or delegated gateway) is signing.
-//
-// Signing flow:
-//  1. Get the application ring from the RingClient (includes app + delegate gateways)
-//  2. Get the signable bytes hash from the relay request
-//  3. Convert the private key to a scalar for ring signature operations
-//  4. Sign the hash using the ring signature with the private key
-//  5. Serialize and set the signature in the request metadata
-//
-// Parameters:
-//   - ctx: Context for cancellation and deadlines
-//   - relayRequest: The relay request to sign (must have valid session header)
-//   - app: The application from the blockchain (used for ring construction)
-//   - ringClient: Client to fetch the application ring at session end height
-//
-// Returns:
-//   - error: If relay request is nil, missing session header, ring fetch fails, or signing fails
-//
-// The signature is set directly in relayRequest.Meta.Signature.
-//
-// Gateway Mode: When the signer's address differs from the app's address, this enables
-// gateway signing mode (matching PATH's approach). The ring is still constructed from
-// the app's address + delegated gateways, but signed with the signer's private key.
-func (s *Signer) SignRelayRequest(
-	ctx context.Context,
-	relayRequest *servicetypes.RelayRequest,
-	app *apptypes.Application,
-	ringClient crypto.RingClient,
-) error {
-	if relayRequest == nil {
-		return fmt.Errorf("relay request is nil")
-	}
-	if relayRequest.Meta.SessionHeader == nil {
-		return fmt.Errorf("relay request missing session header")
-	}
-
-	// Get session end height for ring construction
-	sessionEndHeight := relayRequest.Meta.SessionHeader.SessionEndBlockHeight
-
-	// Get the application ring using the APP'S address (not the signer's address)
-	// This is critical for gateway mode where the signer is a gateway but the ring
-	// must be constructed from the app's delegations.
-	appRing, err := ringClient.GetRingForAddressAtHeight(ctx, app.Address, sessionEndHeight)
-	if err != nil {
-		return fmt.Errorf("failed to get application ring: %w", err)
-	}
-
-	// Get signable bytes hash from relay request
-	relayReqSignableBz, err := relayRequest.GetSignableBytesHash()
-	if err != nil {
-		return fmt.Errorf("failed to get signable bytes hash: %w", err)
-	}
-
-	// Convert private key to scalar for ring signature
-	curve := ring_secp256k1.NewCurve()
-	signingKey, err := curve.DecodeToScalar(s.privKey.Bytes())
-	if err != nil {
-		return fmt.Errorf("failed to convert private key to scalar: %w", err)
-	}
-
-	// Sign the relay request with the signer's private key using ring signature
-	// In gateway mode, this is the gateway's key; in app mode, this is the app's key
-	signature, err := appRing.Sign(relayReqSignableBz, signingKey)
-	if err != nil {
-		return fmt.Errorf("failed to sign relay request: %w", err)
-	}
-
-	// Serialize the ring signature
-	signatureBz, err := signature.Serialize()
-	if err != nil {
-		return fmt.Errorf("failed to serialize signature: %w", err)
-	}
-
-	// Set the signature in the relay request metadata
-	relayRequest.Meta.Signature = signatureBz
-
-	return nil
-}
-
 // SignRelayRequestWithRing signs a relay request using a pre-built ring.
 //
-// This is an optimized version of SignRelayRequest that takes a pre-built ring
-// instead of fetching it each time. This enables ring caching at the client level,
-// matching PATH's caching approach where rings are built once per session.
+// The ring is fetched and cached by the caller (once per session, as a
+// gateway caches it) rather than per request.
 //
 // The ring should be built from the app's address + delegated gateways using
 // RingClient.GetRingForAddressAtHeight(). The signer's private key is used for signing,
@@ -233,6 +146,20 @@ func (s *Signer) SignRelayRequestWithRing(
 	relayRequest.Meta.Signature = signatureBz
 
 	return nil
+}
+
+// PubKeyHexFromPrivKeyHex derives the compressed secp256k1 public key hex for
+// a hex-encoded private key, without retaining a Signer or address. The CLI
+// uses this to default a simulated relay's ring pubkeys
+// (--sim-app-pubkey/--sim-gateway-pubkeys) from the already-resolved
+// --app-priv-key/--gateway-priv-key hex when the operator does not pass an
+// explicit override.
+func PubKeyHexFromPrivKeyHex(privKeyHex string) (string, error) {
+	signer, err := NewSignerFromHex(privKeyHex)
+	if err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(signer.GetPrivKey().PubKey().Bytes()), nil
 }
 
 // deriveAddressFromPubKey derives a Bech32-encoded Pocket address from a public key.

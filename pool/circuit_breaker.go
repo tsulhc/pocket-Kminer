@@ -37,6 +37,11 @@ type TransitionEvent struct {
 	Error error
 	// DowntimeDuration is how long the backend was unhealthy (only set on recovery transitions).
 	DowntimeDuration time.Duration
+	// AutoRecovered is true when the recovery was triggered by the half-open
+	// recovery timeout (IsHealthy) rather than by traffic succeeding while
+	// the endpoint was still marked unhealthy. The event is still emitted by
+	// RecordResult on the first success after the silent flip.
+	AutoRecovered bool
 }
 
 // isFailure returns true if the result should increment the circuit breaker's
@@ -47,7 +52,7 @@ type TransitionEvent struct {
 //
 // What is NOT a failure:
 //   - context.Canceled: the caller cut the request short (client timeout,
-//     PATH disconnect). That's the client's budget, not the backend's fault.
+//     gateway disconnect). That's the client's budget, not the backend's fault.
 //   - context.DeadlineExceeded / net.Error with Timeout()=true: slow but
 //     possibly healthy backend; tripping on timeouts blackholes traffic.
 //   - HTTP 1xx-4xx: application-level responses from a working backend.

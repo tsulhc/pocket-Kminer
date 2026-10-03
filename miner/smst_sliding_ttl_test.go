@@ -32,46 +32,38 @@ import (
 func (s *RedisSMSTTestSuite) TestFlushOrphansWithLiveRoot_RefreshesTTL() {
 	supplier := "pokt1sliding_ttl"
 	sessionID := "session_sliding_ttl"
-	// Short cache TTL so the refresh is observable without real-time
-	// sleeps. miniredis.FastForward lets us age keys deterministically.
+	// Short cache TTL so the refresh is observable without real-time sleeps:
+	// the key's remaining TTL is set directly rather than waited out.
 	const cacheTTL = 30 * time.Second
 
 	config := RedisSMSTManagerConfig{
-		SupplierAddress:            supplier,
-		CacheTTL:                   cacheTTL,
-		LiveRootCheckpointInterval: 1, // checkpoint every update
+		SupplierAddress: supplier,
+		CacheTTL:        cacheTTL,
 	}
 	mgr := NewRedisSMSTManager(zerolog.Nop(), s.redisClient, config)
 
 	nodesKey := s.redisClient.KB().SMSTNodesKey(supplier, sessionID)
 	liveKey := s.redisClient.KB().SMSTLiveRootKey(supplier, sessionID)
 
-	// First update creates the tree AND hits the checkpoint branch
-	// (updateCount == 1). Both keys should have TTL ≈ cacheTTL.
+	// The first update, and the checkpoint the relay batch runs after it. Both
+	// keys should have TTL ≈ cacheTTL.
 	s.Require().NoError(mgr.UpdateTree(s.ctx, sessionID, []byte("k1"), []byte("v1"), 10))
+	s.checkpoint(mgr, sessionID)
 
-	ttlNodes := s.miniRedis.TTL(nodesKey)
-	ttlLive := s.miniRedis.TTL(liveKey)
-	s.Require().Equalf(cacheTTL, ttlNodes,
-		"first checkpoint must refresh nodes-hash TTL to cache_ttl (got %s)", ttlNodes)
-	s.Require().Equalf(cacheTTL, ttlLive,
-		"first checkpoint must refresh live_root TTL to cache_ttl (got %s)", ttlLive)
+	s.requireTTLNear(nodesKey, cacheTTL, "first checkpoint must refresh nodes-hash TTL to cache_ttl")
+	s.requireTTLNear(liveKey, cacheTTL, "first checkpoint must refresh live_root TTL to cache_ttl")
 
 	// Age both keys most of the way to expiry without crossing it.
-	s.miniRedis.FastForward(cacheTTL - 5*time.Second)
-	ttlNodesAged := s.miniRedis.TTL(nodesKey)
-	s.Require().Lessf(ttlNodesAged, cacheTTL-time.Second,
-		"after fast-forward the TTL must have decayed (got %s)", ttlNodesAged)
+	s.ageKeyTo(nodesKey, 5*time.Second)
+	s.ageKeyTo(liveKey, 5*time.Second)
+	s.requireTTLNear(nodesKey, 5*time.Second, "the aged key must be near expiry before the refresh")
 
 	// Another checkpoint MUST push the TTL back out to cache_ttl.
 	s.Require().NoError(mgr.UpdateTree(s.ctx, sessionID, []byte("k2"), []byte("v2"), 10))
+	s.checkpoint(mgr, sessionID)
 
-	ttlNodesRefreshed := s.miniRedis.TTL(nodesKey)
-	ttlLiveRefreshed := s.miniRedis.TTL(liveKey)
-	s.Require().Equalf(cacheTTL, ttlNodesRefreshed,
-		"subsequent checkpoint must refresh nodes-hash TTL (got %s)", ttlNodesRefreshed)
-	s.Require().Equalf(cacheTTL, ttlLiveRefreshed,
-		"subsequent checkpoint must refresh live_root TTL (got %s)", ttlLiveRefreshed)
+	s.requireTTLNear(nodesKey, cacheTTL, "subsequent checkpoint must refresh nodes-hash TTL")
+	s.requireTTLNear(liveKey, cacheTTL, "subsequent checkpoint must refresh live_root TTL")
 }
 
 // TestFlushOrphansWithLiveRoot_NoTTLWhenCacheTTLZero verifies that
@@ -84,14 +76,13 @@ func (s *RedisSMSTTestSuite) TestFlushOrphansWithLiveRoot_NoTTLWhenCacheTTLZero(
 
 	mgr := s.createTestRedisSMSTManager(supplier) // CacheTTL=0 by default
 	s.Require().NoError(mgr.UpdateTree(s.ctx, sessionID, []byte("k1"), []byte("v1"), 10))
+	s.checkpoint(mgr, sessionID)
 
 	nodesKey := s.redisClient.KB().SMSTNodesKey(supplier, sessionID)
 	liveKey := s.redisClient.KB().SMSTLiveRootKey(supplier, sessionID)
 
-	s.Require().Equalf(time.Duration(0), s.miniRedis.TTL(nodesKey),
-		"cache_ttl=0 must leave nodes-hash without a TTL")
-	s.Require().Equalf(time.Duration(0), s.miniRedis.TTL(liveKey),
-		"cache_ttl=0 must leave live_root without a TTL")
+	s.requirePersistent(nodesKey, "cache_ttl=0 must leave nodes-hash without a TTL")
+	s.requirePersistent(liveKey, "cache_ttl=0 must leave live_root without a TTL")
 }
 
 // TestEvictCorruptSession_PreservesRedisState verifies that the
@@ -109,12 +100,13 @@ func (s *RedisSMSTTestSuite) TestEvictCorruptSession_PreservesRedisState() {
 		s.Require().NoError(mgr.UpdateTree(s.ctx, sessionID,
 			[]byte{byte(i)}, []byte{byte(i + 100)}, 10))
 	}
+	s.checkpoint(mgr, sessionID)
 
 	nodesKey := s.redisClient.KB().SMSTNodesKey(supplier, sessionID)
 	liveKey := s.redisClient.KB().SMSTLiveRootKey(supplier, sessionID)
 
-	s.Require().True(s.miniRedis.Exists(nodesKey), "nodes hash must exist after seeding")
-	s.Require().True(s.miniRedis.Exists(liveKey), "live_root must exist after seeding")
+	s.Require().True(s.keyExists(nodesKey), "nodes hash must exist after seeding")
+	s.Require().True(s.keyExists(liveKey), "live_root must exist after seeding")
 	s.Require().Equal(1, mgr.GetTreeCount(), "one in-memory tree before eviction")
 
 	// Trigger eviction directly (bypassing the corruption path).
@@ -122,28 +114,28 @@ func (s *RedisSMSTTestSuite) TestEvictCorruptSession_PreservesRedisState() {
 
 	s.Require().Equal(0, mgr.GetTreeCount(),
 		"eviction must drop the in-memory tree")
-	s.Require().Truef(s.miniRedis.Exists(nodesKey),
+	s.Require().Truef(s.keyExists(nodesKey),
 		"eviction MUST preserve the nodes hash so resume can recover (got missing)")
-	s.Require().Truef(s.miniRedis.Exists(liveKey),
+	s.Require().Truef(s.keyExists(liveKey),
 		"eviction MUST preserve live_root so resume can recover (got missing)")
 }
 
 // TestEvictCorruptSession_ResumePathRecoversIntactState closes the loop:
 // after a memory-only eviction on a non-corrupt Redis state, the next
 // UpdateTree must resume the tree via resumeTreeFromRedisLocked and
-// preserve the pre-eviction relay count, modulo the expected
-// interval-1 checkpoint-window loss. Interval=1 isolates the eviction
-// behavior from the checkpoint behavior so the count is exact.
+// preserve the pre-eviction relay count. The seed is checkpointed before
+// the eviction, so the count is exact.
 func (s *RedisSMSTTestSuite) TestEvictCorruptSession_ResumePathRecoversIntactState() {
 	supplier := "pokt1evict_resume"
 	sessionID := "session_evict_resume"
 
-	mgr := s.createTestRedisSMSTManagerWithInterval(supplier, 1)
+	mgr := s.createTestRedisSMSTManager(supplier)
 	const preEvictionUpdates = 5
 	for i := 0; i < preEvictionUpdates; i++ {
 		s.Require().NoError(mgr.UpdateTree(s.ctx, sessionID,
 			[]byte{byte(i)}, []byte{byte(i + 100)}, 10))
 	}
+	s.checkpoint(mgr, sessionID)
 
 	mgr.evictCorruptSession(s.ctx, sessionID, "test_manual")
 
@@ -157,8 +149,8 @@ func (s *RedisSMSTTestSuite) TestEvictCorruptSession_ResumePathRecoversIntactSta
 	s.Require().NoError(err)
 	count, sum, err := mgr.GetTreeStats(sessionID)
 	s.Require().NoError(err)
-	// With interval=1 every update checkpoints, so live_root =
-	// R_{preEvictionUpdates} at eviction time. Resume picks up there
+	// The checkpoint after the seed wrote live_root =
+	// R_{preEvictionUpdates} before the eviction. Resume picks up there
 	// and adds the post-eviction relay, total = 6.
 	s.Require().Equal(uint64(preEvictionUpdates+1), count,
 		"memory-only eviction must let the next UpdateTree resume and preserve pre-eviction count")

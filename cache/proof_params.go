@@ -82,7 +82,7 @@ func NewProofParamsCache(
 	blockTimeSeconds int64,
 ) SingletonEntityCache[*prooftypes.Params] {
 	if blockTimeSeconds <= 0 {
-		blockTimeSeconds = defaultBlockTimeSeconds
+		blockTimeSeconds = DefaultBlockTimeSeconds
 	}
 
 	return &proofParamsCache{
@@ -317,11 +317,19 @@ func (c *proofParamsCache) WarmupFromRedis(ctx context.Context) error {
 func (c *proofParamsCache) queryChainWithLock(ctx context.Context) (*prooftypes.Params, error) {
 	lockKey := c.redisClient.KB().ParamsProofLockKey()
 	// Try to acquire distributed lock
-	locked, err := c.redisClient.SetNX(ctx, lockKey, "1", 5*time.Second).Result()
+	lockToken := newLockToken()
+	locked, err := c.redisClient.SetNX(ctx, lockKey, lockToken, 5*time.Second).Result()
 	if err != nil {
 		return nil, fmt.Errorf("failed to acquire lock: %w", err)
 	}
-	defer c.redisClient.Del(ctx, lockKey)
+	// Release the lock only when this instance actually acquired it: an
+	// unconditional deferred Del from a contended loser deletes the WINNER's
+	// still-held lock on exit, letting a third instance acquire immediately
+	// and re-fire the duplicate chain query the lock exists to prevent
+	// (same fix as cache/keyed_query_lock.go).
+	if locked {
+		defer releaseCacheLock(ctx, c.redisClient, lockKey, lockToken)
+	}
 
 	if !locked {
 		// Another instance is querying, wait and retry L2

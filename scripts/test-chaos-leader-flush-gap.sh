@@ -15,11 +15,11 @@
 # the flush→proof gap (or hit a non-leader pod).
 #
 # Timing (with current localnet genesis):
-#   num_blocks_per_session:          10
-#   claim_window_open_offset_blocks: 1   → flush at block 10N+1
-#   claim_window_close_offset:       8
-#   proof_window_open_offset:        0   → proof window opens at 10N+9
-#   proof_window_close_offset:       8   → proof window closes at 10N+17
+#   num_blocks_per_session:          20
+#   claim_window_open_offset_blocks: 11  → flush at block 20N+11
+#   claim_window_close_offset:       10
+#   proof_window_open_offset:        1   → proof window opens at 20N+22
+#   proof_window_close_offset:       10  → proof window closes at 20N+32
 #   leader_ttl_seconds:              30  (config)
 #   heartbeat_rate_seconds:          10  (config)
 #
@@ -43,8 +43,13 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Build the relay CLI once (exports CLI_BIN / CLI_BIN_DIR; cleanup() below
+# removes the mktemp dir — see the no-trap contract in lib/cli-build.sh).
+. "$SCRIPT_DIR/lib/cli-build.sh"
+build_relay_cli || exit 1
+
 # ─── Configuration ───────────────────────────────────────────
-GATEWAY_URL="${GATEWAY_URL:-http://localhost:3069/v1}"
+RELAYER_URL="${RELAYER_URL:-http://localhost:8180}"
 HTTP_SERVICE="${HTTP_SERVICE:-develop-http}"
 K8S_CONTEXT="${K8S_CONTEXT:-kind-kind}"
 LOKI_URL="${LOKI_URL:-http://localhost:3100}"
@@ -53,7 +58,7 @@ REDIS_CMD="${REDIS_CMD:-redis-cli}"
 # Load params
 HTTP_RPS="${HTTP_RPS:-300}"
 HTTP_WORKERS="${HTTP_WORKERS:-100}"
-DURATION="${DURATION:-180}"            # covers ~2 session cycles (10 blocks each)
+DURATION="${DURATION:-420}"            # covers ~2 session cycles (20 blocks each)
 MAX_KILLS="${MAX_KILLS:-3}"             # kill leader after N flushes observed
 POLL_INTERVAL="${POLL_INTERVAL:-2}"     # seconds between flush-checks
 KILL_GRACE="${KILL_GRACE:-5}"           # k8s grace period (SIGTERM→SIGKILL)
@@ -113,6 +118,7 @@ LOAD_PID=""
 cleanup() {
     [ -n "$LOAD_PID" ] && kill "$LOAD_PID" 2>/dev/null || true
     wait 2>/dev/null || true
+    rm -rf "$CLI_BIN_DIR"
 }
 trap cleanup EXIT
 
@@ -122,22 +128,9 @@ log_phase "PRE-FLIGHT"
 command -v jq >/dev/null || { log_error "jq required"; exit 2; }
 command -v "$REDIS_CMD" >/dev/null || { log_error "redis-cli required"; exit 2; }
 
-# Pre-flight: wait up to 30s for a valid body (PATH may still be syncing sessions).
-RELAY_OK=false
-for i in $(seq 1 15); do
-    BODY=$(curl -s -m 5 -X POST \
-        -H "Content-Type: application/json" -H "Target-Service-Id: $HTTP_SERVICE" \
-        -d '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' \
-        "$GATEWAY_URL" 2>/dev/null || true)
-    if echo "$BODY" | grep -q '"result"'; then
-        RELAY_OK=true
-        log_info "Relay OK (attempt $i)"
-        break
-    fi
-    log_warn "Relay not ready yet (attempt $i/15, body=[${BODY:0:80}])"
-    sleep 2
-done
-$RELAY_OK || { log_error "Relay never returned a valid body in 30s"; exit 1; }
+# Pre-flight: wait up to 30s for a signed relay (sessions may still be syncing)
+wait_relay_ready "$HTTP_SERVICE" "$RELAYER_URL" 15 || { log_error "Relay never served a signed relay in 30s"; exit 1; }
+log_info "Relay OK (signed end to end)"
 
 MINER_PODS=$(kubectl --context "$K8S_CONTEXT" get pods -l app=miner --no-headers 2>/dev/null | grep -c Running || true)
 [ "$MINER_PODS" -lt 2 ] && {
@@ -177,13 +170,10 @@ echo ""
 log_phase "LAUNCHING LOAD (${DURATION}s)"
 
 log_info "HTTP: $HTTP_RPS RPS × $HTTP_WORKERS workers"
-go run "$SCRIPT_DIR/loadtest/http-verify.go" \
-    -url "$GATEWAY_URL" \
-    -service "$HTTP_SERVICE" \
-    -rps "$HTTP_RPS" \
-    -workers "$HTTP_WORKERS" \
-    -duration "${DURATION}s" \
-    -report 30 > /tmp/leader-chaos-load.txt 2>&1 &
+"$CLI_BIN" relay jsonrpc --localnet --service "$HTTP_SERVICE" \
+    --relayer-url "$RELAYER_URL" \
+    --load-test -n "$((HTTP_RPS * DURATION))" --rps "$HTTP_RPS" \
+    --concurrency "$HTTP_WORKERS" --all-suppliers > /tmp/leader-chaos-load.txt 2>&1 &
 LOAD_PID=$!
 log_info "Load PID: $LOAD_PID"
 

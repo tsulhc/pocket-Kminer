@@ -10,15 +10,14 @@ import (
 	"time"
 
 	sdkmath "cosmossdk.io/math"
-	"github.com/alicebob/miniredis/v2"
 	"github.com/alitto/pond/v2"
 	cosmostypes "github.com/cosmos/cosmos-sdk/types"
 	"github.com/hashicorp/go-version"
 	"github.com/stretchr/testify/require"
 
 	"github.com/pokt-network/pocket-relay-miner/cache"
+	localclient "github.com/pokt-network/pocket-relay-miner/client"
 	"github.com/pokt-network/pocket-relay-miner/logging"
-	redisutil "github.com/pokt-network/pocket-relay-miner/transport/redis"
 
 	"github.com/pokt-network/poktroll/pkg/client"
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
@@ -65,6 +64,11 @@ func (b *fakeBlockClient) CommittedBlocksSequence(context.Context) client.BlockR
 func (b *fakeBlockClient) GetChainVersion() *version.Version { return nil }
 
 func (b *fakeBlockClient) Close() {}
+
+// Subscribe delivers no blocks; see mockBlockClient.Subscribe.
+func (b *fakeBlockClient) Subscribe(context.Context, int) <-chan *localclient.SimpleBlock {
+	return make(chan *localclient.SimpleBlock)
+}
 
 type fakeBlock struct{ h int64 }
 
@@ -116,18 +120,15 @@ func servicesForSupplierFromCache(t *testing.T, sc *cache.SupplierCache, addr st
 
 func newManagerForHistoryTest(t *testing.T, km *fakeKeyManager, qc *historySupplierQueryClient, bc *fakeBlockClient) (*SupplierManager, *cache.SupplierCache, func()) {
 	t.Helper()
-	mr, err := miniredis.Run()
-	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	redisClient, err := redisutil.NewClient(ctx, redisutil.ClientConfig{URL: fmt.Sprintf("redis://%s", mr.Addr())})
-	require.NoError(t, err)
+	redisClient, _ := newTestRedis(t)
 
 	supplierCache := cache.NewSupplierCache(
 		logging.NewLoggerFromConfig(logging.DefaultConfig()),
 		redisClient,
-		cache.SupplierCacheConfig{KeyPrefix: "ha:supplier"},
+		cache.SupplierCacheConfig{},
 	)
 	require.NoError(t, supplierCache.Start(ctx))
 
@@ -161,7 +162,6 @@ func newManagerForHistoryTest(t *testing.T, km *fakeKeyManager, qc *historySuppl
 		_ = redisClient.Close()
 		pool.StopAndWait()
 		cancel()
-		mr.Close()
 	}
 	return mgr, supplierCache, cleanup
 }

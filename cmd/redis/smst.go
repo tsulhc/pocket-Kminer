@@ -2,12 +2,14 @@ package redis
 
 import (
 	"context"
-	"encoding/hex"
 	"fmt"
 	"os"
+	"strings"
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
+
+	"github.com/pokt-network/pocket-relay-miner/miner"
 )
 
 func SMSTCmd() *cobra.Command {
@@ -22,7 +24,7 @@ func SMSTCmd() *cobra.Command {
 		Long: `Inspect Sparse Merkle Sum Tree (SMST) nodes stored in Redis.
 
 SMST data is stored at:
-  - Key: ha:smst:{sessionID}:nodes (Hash)
+  - Key: {base}:smst:{supplier}:{sessionID}:nodes (Hash)
   - Fields: Hex-encoded SMST node keys
   - Values: Raw SMST node data
 
@@ -47,26 +49,42 @@ This shows the number of nodes and sample keys.`,
 }
 
 func inspectSMST(ctx context.Context, client *DebugRedisClient, sessionID string, limit int64) error {
-	key := fmt.Sprintf("ha:smst:%s:nodes", sessionID)
-
-	// Check if key exists
-	exists, err := client.Exists(ctx, key).Result()
+	// Production writes per-supplier SMST keys ({base}:smst:{supplier}:{session}:nodes),
+	// so a session can have several trees (one per supplier that served it).
+	// Scan every supplier's tree for this session rather than the legacy
+	// single-arg key ({base}:smst:{session}:nodes) that production no longer
+	// writes — that shape silently reported "No SMST data found" for every
+	// real key.
+	pattern := client.KB().SMSTSessionNodesPattern(sessionID)
+	keys, err := clusterAwareScanAllKeys(ctx, client, pattern)
 	if err != nil {
-		return fmt.Errorf("failed to check SMST existence: %w", err)
+		return fmt.Errorf("failed to scan SMST keys: %w", err)
 	}
 
-	if exists == 0 {
+	if len(keys) == 0 {
 		fmt.Printf("No SMST data found for session: %s\n", sessionID)
 		return nil
 	}
 
+	for _, key := range keys {
+		if err := displaySMSTTree(ctx, client, key, limit); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// displaySMSTTree prints node count and a sample of nodes for one SMST tree key
+// (one supplier's tree for a session).
+func displaySMSTTree(ctx context.Context, client *DebugRedisClient, key string, limit int64) error {
 	// Get total node count
 	count, err := client.HLen(ctx, key).Result()
 	if err != nil {
-		return fmt.Errorf("failed to get SMST node count: %w", err)
+		return fmt.Errorf("failed to get SMST node count for %s: %w", key, err)
 	}
 
-	fmt.Printf("SMST Tree for Session: %s\n", sessionID)
+	fmt.Printf("SMST Tree: %s\n", key)
 	fmt.Printf("Total Nodes: %d\n\n", count)
 
 	if count == 0 {
@@ -79,19 +97,19 @@ func inspectSMST(ctx context.Context, client *DebugRedisClient, sessionID string
 	var sampleValues []string
 
 	for len(sampleKeys) < int(limit) {
-		keys, newCursor, err := client.HScan(ctx, key, cursor, "*", limit).Result()
+		nodes, newCursor, err := client.HScan(ctx, key, cursor, "*", limit).Result()
 		if err != nil {
-			return fmt.Errorf("failed to scan SMST nodes: %w", err)
+			return fmt.Errorf("failed to scan SMST nodes for %s: %w", key, err)
 		}
 
 		// HScan returns alternating key-value pairs
-		for i := 0; i < len(keys); i += 2 {
+		for i := 0; i < len(nodes); i += 2 {
 			if len(sampleKeys) >= int(limit) {
 				break
 			}
-			sampleKeys = append(sampleKeys, keys[i])
-			if i+1 < len(keys) {
-				sampleValues = append(sampleValues, keys[i+1])
+			sampleKeys = append(sampleKeys, nodes[i])
+			if i+1 < len(nodes) {
+				sampleValues = append(sampleValues, nodes[i+1])
 			}
 		}
 
@@ -108,22 +126,34 @@ func inspectSMST(ctx context.Context, client *DebugRedisClient, sessionID string
 
 	for i, keyHex := range sampleKeys {
 		var valueSize int
+		var note string
 		if i < len(sampleValues) {
-			// Decode hex to get actual size
-			decoded, err := hex.DecodeString(sampleValues[i])
-			if err == nil {
-				valueSize = len(decoded)
+			// A stored value may be one zstd frame of the node (item 398, the
+			// miner's node codec). The size an operator needs is the NODE's:
+			// printing the frame's length under a column that says VALUE SIZE
+			// would report the compressed size as the node's.
+			//
+			// The previous code hex-decoded this value, which was never hex —
+			// the fields are hex, the values are raw bytes — so it always fell
+			// through to the length of the string.
+			node, decErr := miner.DecodeStoredNode([]byte(sampleValues[i]))
+			if decErr != nil {
+				valueSize, note = len(sampleValues[i]), " (stored; could not be decoded)"
 			} else {
-				valueSize = len(sampleValues[i])
+				valueSize = len(node)
 			}
 		}
-		_, _ = fmt.Fprintf(w, "%s\t%d bytes\n", keyHex, valueSize)
+		_, _ = fmt.Fprintf(w, "%s\t%d bytes%s\n", keyHex, valueSize, note)
 	}
 
 	_ = w.Flush()
 
-	// Offer to delete
-	fmt.Printf("\nTo delete this SMST tree, use: redis-debug flush --pattern 'ha:smst:%s:*'\n", sessionID)
+	// Offer to delete. Suggest the whole per-tree pattern (:nodes, :root,
+	// :stats, :live_root), not just the :nodes hash — deleting only :nodes
+	// would orphan the sibling keys. Derived from the scanned key, which is
+	// KeyBuilder-shaped ({base}:smst:{supplier}:{session}:nodes).
+	treePattern := strings.TrimSuffix(key, ":nodes") + ":*"
+	fmt.Printf("\nTo delete this SMST tree, use: pocket-relay-miner redis flush --pattern '%s'\n\n", treePattern)
 
 	return nil
 }

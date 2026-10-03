@@ -2,7 +2,6 @@ package observability
 
 import (
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
 const (
@@ -23,229 +22,37 @@ var (
 )
 
 var (
-	// InstructionTimeSeconds tracks the duration of individual instructions.
-	InstructionTimeSeconds = promauto.NewHistogramVec(
-		prometheus.HistogramOpts{
-			Namespace: metricsNamespace,
-			Subsystem: metricsSubsystem,
-			Name:      "instruction_duration_seconds",
-			Help:      "Duration of individual instructions in the relay/mining pipeline",
-			Buckets:   []float64{0.00001, 0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5},
-		},
-		[]string{"component", "instruction"},
-	)
 
-	// OperationDurationSeconds tracks the duration of high-level operations.
-	OperationDurationSeconds = promauto.NewHistogramVec(
-		prometheus.HistogramOpts{
-			Namespace: metricsNamespace,
-			Subsystem: metricsSubsystem,
-			Name:      "operation_duration_seconds",
-			Help:      "Duration of high-level operations (claim, proof, relay processing)",
-			Buckets:   []float64{0.001, 0.01, 0.05, 0.1, 0.5, 1, 5, 10, 30, 60},
-		},
-		[]string{"component", "operation", "status"},
-	)
-
-	// RedisOperationDurationSeconds tracks Redis operation latencies.
-	RedisOperationDurationSeconds = promauto.NewHistogramVec(
-		prometheus.HistogramOpts{
-			Namespace: metricsNamespace,
-			Subsystem: metricsSubsystem,
-			Name:      "redis_operation_duration_seconds",
-			Help:      "Duration of Redis operations",
-			Buckets:   []float64{0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1},
-		},
-		[]string{"operation", "status"},
-	)
-
-	// RedisOperationsTotal counts Redis operations.
-	RedisOperationsTotal = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Namespace: metricsNamespace,
-			Subsystem: metricsSubsystem,
-			Name:      "redis_operations_total",
-			Help:      "Total number of Redis operations",
-		},
-		[]string{"operation", "status"},
-	)
-
-	// OnchainQueryDurationSeconds tracks on-chain query latencies.
-	OnchainQueryDurationSeconds = promauto.NewHistogramVec(
-		prometheus.HistogramOpts{
-			Namespace: metricsNamespace,
-			Subsystem: metricsSubsystem,
-			Name:      "onchain_query_duration_seconds",
-			Help:      "Duration of on-chain queries",
-			Buckets:   []float64{0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5},
-		},
-		[]string{"query_type", "status"},
-	)
-
-	// OnchainQueriesTotal counts on-chain queries.
-	OnchainQueriesTotal = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Namespace: metricsNamespace,
-			Subsystem: metricsSubsystem,
-			Name:      "onchain_queries_total",
-			Help:      "Total number of on-chain queries",
-		},
-		[]string{"query_type", "status"},
-	)
-
-	// TxSubmissionDurationSeconds tracks transaction submission latencies.
-	TxSubmissionDurationSeconds = promauto.NewHistogramVec(
-		prometheus.HistogramOpts{
-			Namespace: metricsNamespace,
-			Subsystem: metricsSubsystem,
-			Name:      "tx_submission_duration_seconds",
-			Help:      "Duration of transaction submissions (claim/proof)",
-			Buckets:   []float64{0.5, 1, 2, 5, 10, 20, 30, 60},
-		},
-		[]string{"tx_type", "status"},
-	)
-
-	// TxSubmissionsTotal counts transaction submissions.
-	TxSubmissionsTotal = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Namespace: metricsNamespace,
-			Subsystem: metricsSubsystem,
-			Name:      "tx_submissions_total",
-			Help:      "Total number of transaction submissions",
-		},
-		[]string{"tx_type", "status"},
-	)
-
-	// SigningDurationSeconds tracks signing operation latencies.
-	SigningDurationSeconds = promauto.NewHistogramVec(
-		prometheus.HistogramOpts{
-			Namespace: metricsNamespace,
-			Subsystem: metricsSubsystem,
-			Name:      "signing_duration_seconds",
-			Help:      "Duration of signing operations",
-			Buckets:   []float64{0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1},
-		},
-		[]string{"operation"},
-	)
-
-	// CacheHitRatio tracks cache hit/miss ratios.
-	CacheOperationsTotal = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Namespace: metricsNamespace,
-			Subsystem: metricsSubsystem,
-			Name:      "cache_operations_total",
-			Help:      "Total cache operations (hits/misses)",
-		},
-		[]string{"cache_name", "result"},
-	)
-
-	// MemoryUsageBytes tracks memory usage of various components.
-	MemoryUsageBytes = promauto.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Namespace: metricsNamespace,
-			Subsystem: metricsSubsystem,
-			Name:      "memory_usage_bytes",
-			Help:      "Memory usage in bytes",
-		},
-		[]string{"component"},
-	)
-
-	// GoroutineCount tracks the number of goroutines per component.
-	GoroutineCount = promauto.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Namespace: metricsNamespace,
-			Subsystem: metricsSubsystem,
-			Name:      "goroutine_count",
-			Help:      "Number of active goroutines per component",
-		},
-		[]string{"component"},
-	)
-
-	// QueueDepth tracks the depth of various internal queues.
-	QueueDepth = promauto.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Namespace: metricsNamespace,
-			Subsystem: metricsSubsystem,
-			Name:      "queue_depth",
-			Help:      "Current depth of internal queues",
-		},
-		[]string{"queue_name"},
-	)
-
-	// QueueCapacity tracks the capacity of various internal queues.
-	QueueCapacity = promauto.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Namespace: metricsNamespace,
-			Subsystem: metricsSubsystem,
-			Name:      "queue_capacity",
-			Help:      "Capacity of internal queues",
-		},
-		[]string{"queue_name"},
-	)
-
-	// ErrorsTotal counts errors by type and component.
-	ErrorsTotal = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Namespace: metricsNamespace,
-			Subsystem: metricsSubsystem,
-			Name:      "errors_total",
-			Help:      "Total number of errors",
-		},
-		[]string{"component", "error_type"},
-	)
-
-	// ProcessInfo provides static information about the process.
-	ProcessInfo = promauto.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Namespace: metricsNamespace,
-			Subsystem: metricsSubsystem,
-			Name:      "process_info",
-			Help:      "Information about the running process",
-		},
-		[]string{"version", "component"},
-	)
-
-	// StartupDurationSeconds tracks startup time of components.
-	StartupDurationSeconds = promauto.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Namespace: metricsNamespace,
-			Subsystem: metricsSubsystem,
-			Name:      "startup_duration_seconds",
-			Help:      "Time taken to start components",
-		},
-		[]string{"component"},
-	)
-
-	// SMSTRedisOperations tracks Redis operations for SMST storage.
-	SMSTRedisOperations = MinerFactory.NewCounterVec(
+	// SMSTStoreOperations tracks store operations for SMST storage.
+	SMSTStoreOperations = MinerFactory.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: metricsNamespace,
 			Subsystem: "smst",
-			Name:      "redis_operations_total",
-			Help:      "Total number of Redis operations for SMST storage",
+			Name:      "store_operations_total",
+			Help:      "Total number of store operations for SMST storage",
 		},
 		[]string{"operation", "result"},
 	)
 
-	// SMSTRedisOperationDuration tracks latency of Redis operations for SMST.
-	SMSTRedisOperationDuration = MinerFactory.NewHistogramVec(
+	// SMSTStoreOperationDuration tracks latency of store operations for SMST.
+	SMSTStoreOperationDuration = MinerFactory.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Namespace: metricsNamespace,
 			Subsystem: "smst",
-			Name:      "redis_operation_duration_seconds",
-			Help:      "Duration of Redis operations for SMST storage",
+			Name:      "store_operation_duration_seconds",
+			Help:      "Duration of store operations for SMST storage",
 			Buckets:   MicroLatencyBuckets,
 		},
 		[]string{"operation"},
 	)
 
-	// SMSTRedisErrors tracks Redis error counts for SMST storage.
-	SMSTRedisErrors = MinerFactory.NewCounterVec(
+	// SMSTStoreErrors tracks store error counts for SMST storage.
+	SMSTStoreErrors = MinerFactory.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: metricsNamespace,
 			Subsystem: "smst",
-			Name:      "redis_errors_total",
-			Help:      "Total number of Redis errors for SMST storage",
+			Name:      "store_errors_total",
+			Help:      "Total number of store errors for SMST storage",
 		},
 		[]string{"operation", "error_type"},
 	)
@@ -292,8 +99,136 @@ var (
 			Namespace: metricsNamespace,
 			Subsystem: "smst",
 			Name:      "corruption_purged_total",
-			Help:      "Sessions whose Redis-backed SMST state was purged after repeated corruption evictions (escalation past persistentCorruptionThreshold)",
+			Help:      "Sessions whose stored SMST state was purged after repeated corruption evictions (escalation past persistentCorruptionThreshold)",
 		},
 		[]string{"supplier", "reason"},
+	)
+
+	// SMSTLeavesCompacted counts persisted SMST leaves whose in-memory
+	// value has been dropped by CompactPersistedLeaves. A non-zero rate is
+	// the only way to confirm
+	// compaction is actually running: it is deliberately wired to be
+	// mandatory (see commitLocked), so its absence is a build-time or
+	// startup-log signal, not a metric.
+	SMSTLeavesCompacted = MinerFactory.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: "smst",
+			Name:      "leaves_compacted_total",
+			Help:      "Persisted SMST leaves whose in-memory value was dropped by CompactPersistedLeaves",
+		},
+		[]string{"supplier"},
+	)
+
+	// SMSTPendingLeafBytes is the relay bytes held by SMST leaves that were
+	// updated and whose in-memory value has not been dropped yet: with a nil value
+	// hasher a leaf keeps the raw relay until the commit compacts it, so this is
+	// the tree's share of the relays the miner holds between read and commit.
+	SMSTPendingLeafBytes = MinerFactory.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Subsystem: "smst",
+			Name:      "pending_leaf_bytes",
+			Help:      "Relay bytes held in memory by SMST leaves updated since their tree's last successful leaf compaction",
+		},
+		[]string{"supplier"},
+	)
+
+	// SMSTColdCompactions counts attempts to replace a claimed tree's nodes
+	// hash with its leaves blob, by result: compacted, already_compacted,
+	// no_tree, not_ready, read_failed, set_failed, delete_failed, mismatch.
+	// Only "compacted" deleted a nodes hash. "mismatch" means the leaves read
+	// from the hash did not rebuild the claimed root: the hash was kept, and a
+	// sustained rate is a stored tree that does not match its own claim.
+	SMSTColdCompactions = MinerFactory.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: "smst",
+			Name:      "cold_compactions_total",
+			Help:      "Attempts to store a claimed SMST as its leaves only and delete its nodes hash, by result",
+		},
+		[]string{"supplier", "result"},
+	)
+
+	// SMSTColdCompactionBytes adds, for each compacted tree, the bytes of the
+	// nodes hash it replaced (kind="hash": field and value lengths as read, not
+	// Redis MEMORY USAGE) and of the blob that replaced it (kind="blob").
+	SMSTColdCompactionBytes = MinerFactory.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: "smst",
+			Name:      "cold_compaction_bytes_total",
+			Help:      "Bytes of compacted SMST nodes hashes (kind=hash) and of the leaves blobs that replaced them (kind=blob)",
+		},
+		[]string{"supplier", "kind"},
+	)
+
+	// SMSTColdRebuilds counts trees rebuilt from a leaves blob to generate a
+	// proof, by result: ok, missing (no blob), failed (unreadable or
+	// undecodable), mismatch (rebuilt root is not the claimed root; no proof).
+	SMSTColdRebuilds = MinerFactory.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: "smst",
+			Name:      "cold_rebuilds_total",
+			Help:      "SMSTs rebuilt from a leaves blob to generate a proof, by result",
+		},
+		[]string{"supplier", "result"},
+	)
+
+	// SMSTColdDuration is the wall time of a compaction (operation="compact":
+	// read the leaves, store the blob, read it back and rebuild, delete the
+	// hash) and of a rebuild for a proof (operation="rebuild", including the
+	// wait for a rebuild slot).
+	SMSTColdDuration = MinerFactory.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: metricsNamespace,
+			Subsystem: "smst",
+			Name:      "cold_duration_seconds",
+			Help:      "Duration of SMST cold compactions and of rebuilds from a leaves blob",
+			Buckets:   FineGrainedLatencyBuckets,
+		},
+		[]string{"supplier", "operation"},
+	)
+
+	// SMSTRebuildWaiting is how many rebuilds of compacted trees wait for
+	// memory, by kind (proof, compaction). While kind="proof" is above zero the
+	// stream consumers do not read.
+	SMSTRebuildWaiting = MinerFactory.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Subsystem: "smst",
+			Name:      "rebuild_waiting",
+			Help:      "Rebuilds of compacted SMSTs waiting for memory, by kind",
+		},
+		[]string{"kind"},
+	)
+
+	// SMSTRebuildHeapGrowthOverEstimate is how much the heap's objects grew
+	// from a rebuild's admission until its tree loaded, over the estimate it
+	// was admitted with, by kind. It counts what other goroutines allocated
+	// meanwhile, and a GC during the load lowers it.
+	SMSTRebuildHeapGrowthOverEstimate = MinerFactory.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: metricsNamespace,
+			Subsystem: "smst",
+			Name:      "rebuild_heap_growth_over_estimate",
+			Help:      "Growth of the heap's objects while a compacted SMST loaded, over its admission estimate, by kind",
+			Buckets:   []float64{0.25, 0.5, 1, 1.5, 2, 2.5, 3, 3.5, 4, 5, 6, 8, 10, 15, 20},
+		},
+		[]string{"kind"},
+	)
+
+	// SMSTRebuildWaitSeconds is how long a rebuild waited for memory before it
+	// was admitted, by kind.
+	SMSTRebuildWaitSeconds = MinerFactory.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: metricsNamespace,
+			Subsystem: "smst",
+			Name:      "rebuild_wait_seconds",
+			Help:      "Time a rebuild of a compacted SMST waited for memory, by kind",
+			Buckets:   FineGrainedLatencyBuckets,
+		},
+		[]string{"kind"},
 	)
 )

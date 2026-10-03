@@ -1,12 +1,12 @@
 name: Release
 
 on:
-  # Release/deploy is an explicit operator action. Merging to main or dev must
-  # never publish registry artifacts by itself.
-  workflow_dispatch:
   push:
+    branches:
+      - dev      # Development builds → dev tag
+      - main     # Release candidates → rc tag
     tags:
-      - 'v*'     # Explicit production release → version + latest tags
+      - 'v*'     # Releases → version + latest; pre-releases (v1.0.0-rc.1) → version only
 
 permissions:
   contents: write
@@ -21,9 +21,10 @@ jobs:
       commit: ${{ steps.meta.outputs.commit }}
       build_date: ${{ steps.meta.outputs.build_date }}
       tags: ${{ steps.meta.outputs.tags }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -39,10 +40,19 @@ jobs:
           echo "build_date=${BUILD_DATE}" >> $GITHUB_OUTPUT
 
           # Determine image tags based on ref type and branch
-          if [[ $GITHUB_REF == refs/tags/v* ]]; then
-            # Git tag (e.g., v1.0.0) → version tag + latest
-            # Example: v1.0.0 → tags: 1.0.0, latest
-            VERSION_TAG=$(echo $GITHUB_REF | sed 's|refs/tags/v||')
+          PRERELEASE=false
+          if [[ $GITHUB_REF == refs/tags/v*-* ]]; then
+            # Pre-release tag (semver, e.g. v1.0.0-rc.1) → that tag only.
+            # latest stays on the last release: a candidate is deployed by
+            # its own tag, never picked up by whoever pulls latest.
+            VERSION_TAG="${GITHUB_REF#refs/tags/}"
+            TAGS="ghcr.io/pokt-network/pocket-relay-miner:${VERSION_TAG}"
+            PRERELEASE=true
+            echo "🧪 Pre-release: ${VERSION_TAG}"
+          elif [[ $GITHUB_REF == refs/tags/v* ]]; then
+            # Git tag (e.g., v1.0.0) → the same tag, v included, + latest
+            # Example: v1.0.0 → tags: v1.0.0, latest
+            VERSION_TAG="${GITHUB_REF#refs/tags/}"
             TAGS="ghcr.io/pokt-network/pocket-relay-miner:${VERSION_TAG},ghcr.io/pokt-network/pocket-relay-miner:latest"
             echo "🚀 Production Release: ${VERSION_TAG}"
           elif [[ $GITHUB_REF == refs/heads/main ]]; then
@@ -63,6 +73,7 @@ jobs:
           fi
 
           echo "tags=${TAGS}" >> $GITHUB_OUTPUT
+          echo "prerelease=${PRERELEASE}" >> $GITHUB_OUTPUT
 
   build-amd64:
     name: Build AMD64
@@ -70,22 +81,22 @@ jobs:
     needs: metadata
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push AMD64 image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           push: true
@@ -113,22 +124,22 @@ jobs:
     needs: metadata
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push ARM64 image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           push: true
@@ -156,7 +167,7 @@ jobs:
     needs: [metadata, build-amd64, build-arm64]
     steps:
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -182,82 +193,92 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
-      - name: Generate changelog
-        id: changelog
-        run: |
-          # Get the previous tag for changelog range
-          PREVIOUS_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
-          CURRENT_TAG="${GITHUB_REF#refs/tags/}"
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-          if [ -z "$PREVIOUS_TAG" ]; then
-            echo "First release - generating full changelog"
-            RANGE=""
+      - name: Extract the binaries from the published images
+        run: |
+          # The attached binaries are the ones inside the images, not a second
+          # build: one recipe (the Dockerfile), the same bytes in both places.
+          # The per-arch images are single-platform and never started, so the
+          # arm64 one is read on this amd64 runner without emulation.
+          set -euo pipefail
+          TAG="${GITHUB_REF#refs/tags/}"
+          IMAGE=ghcr.io/pokt-network/pocket-relay-miner:${{ needs.metadata.outputs.version }}
+          mkdir -p dist
+          for ARCH in amd64 arm64; do
+            id=$(docker create --platform "linux/${ARCH}" "${IMAGE}-${ARCH}")
+            mkdir -p "dist/${ARCH}"
+            docker cp "${id}:/usr/local/bin/pocket-relay-miner" "dist/${ARCH}/pocket-relay-miner"
+            docker rm "${id}" >/dev/null
+            file "dist/${ARCH}/pocket-relay-miner" | grep -q 'statically linked'
+            tar -czf "dist/pocket-relay-miner_${TAG}_linux_${ARCH}.tar.gz" \
+              --owner=0 --group=0 --numeric-owner -C "dist/${ARCH}" pocket-relay-miner
+          done
+          dist/amd64/pocket-relay-miner version | grep -F "${TAG}"
+          (cd dist && sha256sum pocket-relay-miner_*.tar.gz > checksums.txt)
+
+      - name: Skip if the release already exists
+        id: existing
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # A release created by hand, or a re-run of this job, keeps its notes:
+          # the action below would replace the body with the image stub.
+          # Only "release not found" means there is no release. Any other
+          # failure (auth, network, rate limit, 5xx) stops the job: treating it
+          # as "absent" would create a draft and overwrite hand-written notes.
+          if err=$(gh release view "${GITHUB_REF#refs/tags/}" --repo "${{ github.repository }}" 2>&1 >/dev/null); then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          elif printf '%s' "$err" | grep -q 'release not found'; then
+            echo "exists=false" >> "$GITHUB_OUTPUT"
           else
-            echo "Generating changelog from ${PREVIOUS_TAG} to ${CURRENT_TAG}"
-            RANGE="${PREVIOUS_TAG}..${CURRENT_TAG}"
+            echo "gh release view failed: $err" >&2
+            exit 1
           fi
 
-          # Generate changelog content
-          VERSION_NUMBER="${CURRENT_TAG#v}"
+      - name: Write the draft release body
+        if: steps.existing.outputs.exists == 'false'
+        run: |
+          # The release is created as a DRAFT with only the image references.
+          # Its notes are written by hand and published with the release's
+          # attachments; a list generated from git log would replace them.
+          CURRENT_TAG="${GITHUB_REF#refs/tags/}"
           cat > RELEASE_NOTES.md << EOF
-          ## Docker Images
+          ## Docker images
 
-          **Multi-arch images available:**
           \`\`\`bash
-          docker pull ghcr.io/pokt-network/pocket-relay-miner:${VERSION_NUMBER}
-          docker pull ghcr.io/pokt-network/pocket-relay-miner:latest
+          docker pull ghcr.io/pokt-network/pocket-relay-miner:${CURRENT_TAG}
           \`\`\`
 
-          **Architecture-specific:**
-          - AMD64: \`ghcr.io/pokt-network/pocket-relay-miner:${VERSION_NUMBER}-amd64\`
-          - ARM64: \`ghcr.io/pokt-network/pocket-relay-miner:${VERSION_NUMBER}-arm64\`
+          Architecture-specific: \`ghcr.io/pokt-network/pocket-relay-miner:${CURRENT_TAG}-amd64\`, \`ghcr.io/pokt-network/pocket-relay-miner:${CURRENT_TAG}-arm64\`.
 
-          ## What's Changed
-
-          EOF
-
-          # Group commits by conventional commit type
-          echo "### 🚀 Features" >> RELEASE_NOTES.md
-          git log $RANGE --pretty=format:"- %s ([%h](https://github.com/${{ github.repository }}/commit/%H))" --grep="^feat" >> RELEASE_NOTES.md || echo "_No new features_" >> RELEASE_NOTES.md
-          echo -e "\n" >> RELEASE_NOTES.md
-
-          echo "### 🐛 Bug Fixes" >> RELEASE_NOTES.md
-          git log $RANGE --pretty=format:"- %s ([%h](https://github.com/${{ github.repository }}/commit/%H))" --grep="^fix" >> RELEASE_NOTES.md || echo "_No bug fixes_" >> RELEASE_NOTES.md
-          echo -e "\n" >> RELEASE_NOTES.md
-
-          echo "### ⚡ Performance Improvements" >> RELEASE_NOTES.md
-          git log $RANGE --pretty=format:"- %s ([%h](https://github.com/${{ github.repository }}/commit/%H))" --grep="^perf" >> RELEASE_NOTES.md || echo "_No performance improvements_" >> RELEASE_NOTES.md
-          echo -e "\n" >> RELEASE_NOTES.md
-
-          echo "### 🔧 Configuration & Build" >> RELEASE_NOTES.md
-          git log $RANGE --pretty=format:"- %s ([%h](https://github.com/${{ github.repository }}/commit/%H))" --grep="^build\|^ci\|^chore" >> RELEASE_NOTES.md || echo "_No configuration changes_" >> RELEASE_NOTES.md
-          echo -e "\n" >> RELEASE_NOTES.md
-
-          echo "### 📚 Documentation" >> RELEASE_NOTES.md
-          git log $RANGE --pretty=format:"- %s ([%h](https://github.com/${{ github.repository }}/commit/%H))" --grep="^docs" >> RELEASE_NOTES.md || echo "_No documentation changes_" >> RELEASE_NOTES.md
-          echo -e "\n" >> RELEASE_NOTES.md
-
-          # Add version info footer
-          cat >> RELEASE_NOTES.md << EOF
-          ---
-
-          **Full Changelog**: https://github.com/${{ github.repository }}/compare/${PREVIOUS_TAG}...${CURRENT_TAG}
-
-          **Build Info:**
-          - Version: ${CURRENT_TAG}
-          - Commit: ${{ needs.metadata.outputs.commit }}
-          - Build Date: ${{ needs.metadata.outputs.build_date }}
+          Commit: ${{ needs.metadata.outputs.commit }} · Build date: ${{ needs.metadata.outputs.build_date }}
           EOF
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        if: steps.existing.outputs.exists == 'false'
+        uses: softprops/action-gh-release@v3
         with:
           body_path: RELEASE_NOTES.md
-          draft: false
-          prerelease: false
+          draft: true
+          prerelease: ${{ needs.metadata.outputs.prerelease == 'true' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload the release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Runs on a re-run too: --clobber replaces the assets and leaves the
+          # hand-written body alone.
+          gh release upload "${GITHUB_REF#refs/tags/}" --repo "${{ github.repository }}" \
+            --clobber dist/pocket-relay-miner_*.tar.gz dist/checksums.txt

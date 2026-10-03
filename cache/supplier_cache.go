@@ -1,15 +1,17 @@
 package cache
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	redisutil "github.com/pokt-network/pocket-relay-miner/transport/redis"
 
+	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 	"github.com/puzpuzpuz/xsync/v4"
 	"github.com/redis/go-redis/v9"
 
@@ -17,9 +19,6 @@ import (
 )
 
 const (
-	// DefaultSupplierKeyPrefix is the default Redis key prefix for supplier state.
-	DefaultSupplierKeyPrefix = "ha:supplier"
-
 	// SupplierStatusActive indicates the supplier is active and accepting relays.
 	SupplierStatusActive = "active"
 
@@ -37,9 +36,83 @@ const (
 	// Lock key prefix for distributed locking during L3 query
 	// supplierLockPrefix = "ha:cache:lock:supplier:"
 
-	// Default TTL for supplier cache (5 minutes)
-	// supplierCacheTTL = 5 * time.Minute
+	// defaultSupplierCacheTTL is the fallback used when SupplierCacheConfig.TTL
+	// is unset and SupplierCacheTTLFromParams could not compute one (chain
+	// unreachable at startup). Same order of magnitude as proof_params.go's
+	// own "10-minute safety net" convention, not a new arbitrary number.
+	defaultSupplierCacheTTL = 10 * time.Minute
+
+	// supplierCacheTTLMultiplier: margin beyond the protocol deadline the TTL
+	// is meant to outlive, so a missed reconcile tick does not race the
+	// expiry. shared_params_singleton.go's calculateTTLFromParams calls this
+	// same formula (SupplierCacheTTLFromParams) rather than keeping its own copy.
+	supplierCacheTTLMultiplier = 2
 )
+
+// SupplierCacheTTLFromParams computes the Redis TTL for a SupplierCache entry
+// from the chain's own session length, not an arbitrary constant.
+//
+// The miner rewrites an active supplier's entry every reconcile pass, so this
+// TTL only matters once nothing writes it anymore — the decommissioned-
+// supplier case. Before this,
+// SetSupplierState wrote with no TTL at all, so a supplier whose signing key
+// left the miner's keyring mid-teardown froze at its last-written state —
+// often still "staked, serving" — forever, with no cache layer left to
+// notice.
+//
+// A supplier legitimately stays IsActive() while Status == unstaking: poktroll
+// keeps it serving until the current session ends. Verified against
+// x/supplier/keeper/msg_server_unstake_supplier.go (poktroll@v0.1.35):
+// Supplier.UnstakeSessionEndHeight is set in the SAME block as
+// MsgUnstakeSupplier (so IsUnbonding() is true immediately), but
+// ServiceConfigHistory[].DeactivationHeight is deferred to the NEXT session
+// boundary only — "the supplier MUST continue to provide service until the
+// end of the current session". So the entry must outlive one session, not
+// one full unbonding period.
+//
+// SupplierUnbondingPeriodSessions is the WRONG axis for this, and an earlier
+// version of this function used it: that param answers "how long until the
+// stake unlocks" (an economic-security window), not "how long until services
+// deactivate" (always <= 1 session, regardless of the unbonding period's
+// length). Verified live against mainnet (sauron-api.infra.pocket.network,
+// x/shared/params, 2026-08-20): num_blocks_per_session=20 but
+// supplier_unbonding_period_sessions=1429 — using the unbonding axis would
+// have produced a ~40-day TTL, keeping a decommissioned supplier servable and
+// its orphaned stream invisible for over a month. num_blocks_per_session is
+// the parameter that actually bounds when services deactivate.
+//
+// The 2x multiplier (Jorge, 2026-08-20) is margin, not a second deadline: one
+// session for the protocol's own boundary, one more so a delayed reconcile
+// pass does not race the expiry — comfortably above the reconcile interval
+// (DefaultSupplierReconcileInterval = 60s; see the margin check in
+// TestSupplierCacheTTLFromParams). An operator who removes the signing key
+// before that window closes loses their own rewards — this repo does not try
+// to protect against that (there is no recovering a signature we no longer
+// hold the key for); the TTL only bounds how long the resulting stale entry
+// can mislead the relayer into serving it, instead of freezing that lie
+// forever.
+//
+// ROLLING-UPGRADE GAP (review 2026-08-21, not fixed here): a supplier
+// decommissioned by a PRE-fix binary already has a Redis entry written with
+// no expiry at all (the old Set(ctx, key, data, 0)). Nothing rewrites an
+// entry for an address no longer in the keyring, so that specific entry
+// stays frozen post-upgrade too, until an operator clears it by hand (`redis
+// cache --type supplier --key <addr> --invalidate`) or it is otherwise
+// removed. Only entries written AFTER this fix ships get a bounded TTL; this
+// is not a live migration.
+func SupplierCacheTTLFromParams(params *sharedtypes.Params, blockTimeSeconds int64) time.Duration {
+	if params == nil || blockTimeSeconds <= 0 {
+		return defaultSupplierCacheTTL
+	}
+
+	blocksPerSession := params.GetNumBlocksPerSession()
+	if blocksPerSession == 0 {
+		return defaultSupplierCacheTTL
+	}
+
+	ttlSeconds := int64(supplierCacheTTLMultiplier*blocksPerSession) * blockTimeSeconds
+	return time.Duration(ttlSeconds) * time.Second
+}
 
 // supplierCacheL1TTL bounds how long an L1 (in-process) supplier entry — its
 // stake status and service list — is served before it is treated as a miss and
@@ -75,15 +148,31 @@ type SupplierState struct {
 	// Empty if not staked (Staked=false).
 	Services []string `json:"services"`
 
+	// StakedEndpoints is the per-transport view of what the supplier declared
+	// on-chain: one entry per (service, rpc_type) endpoint. Services above is the
+	// service-level projection of this; both are kept so an old relayer that does
+	// not know this field still gets Services.
+	//
+	// MIXED-FLEET BACK-COMPAT: an old miner does not publish this field, so a new
+	// relayer reading old state sees it empty, and TransportDeclared then reads
+	// every transport as undeclared. That is deliberate — see TransportDeclared
+	// — and it costs a warn plus a counter, never a relay. Adding a field is
+	// safe: old relayers ignore it.
+	StakedEndpoints []StakedEndpoint `json:"staked_endpoints,omitempty"`
+
 	// UnstakeSessionEndHeight is the session end height when unstaking takes effect.
 	// 0 means the supplier is active (not unstaking).
 	// >0 means the supplier is unstaking and will be fully unstaked at this session end height.
 	//
-	// TODO_IMPROVE: Handle unstaking grace period properly.
-	// When supplier unstakes, they should continue serving until current session ends.
-	// The unstaking takes effect at the next session boundary to prevent
-	// breaking sessions halfway for both gateway and supplier.
-	// This requires comparing against current session end height.
+	// It is INFORMATIONAL here and must not be turned into a serve gate. The grace
+	// period it describes is already enforced, one level down and more precisely, by
+	// Services: MsgUnstakeSupplier sets DeactivationHeight = next session start on
+	// every one of the supplier's service configs
+	// (x/supplier/keeper/msg_server_unstake_supplier.go:92-97), and Services is
+	// derived from GetActiveServiceConfigs at the observed height, so it empties at
+	// that boundary on its own. A second height comparison here would be redundant
+	// at best and would disagree with the per-service schedule at worst -- services
+	// can be deactivated individually, without any unstake.
 	UnstakeSessionEndHeight uint64 `json:"unstake_session_end_height"`
 
 	// OperatorAddress is the supplier's operator address.
@@ -103,7 +192,34 @@ type SupplierState struct {
 	UpdatedBy string `json:"updated_by,omitempty"`
 }
 
-// isContaminated returns true when the cached state looks like a failed-write
+// StakedEndpoint is one (service, transport) endpoint a supplier declared
+// on-chain. RpcType holds the canonical relayer backend-type string
+// (jsonrpc|rest|websocket|grpc|cometbft), i.e. the same key space as the
+// service config's backend keys, so the relayer can compare directly.
+type StakedEndpoint struct {
+	ServiceID string `json:"service_id"`
+	RpcType   string `json:"rpc_type"`
+}
+
+// TransportDeclared reports whether the supplier declared an on-chain endpoint
+// for (serviceID, backendType). An empty StakedEndpoints declares nothing, so
+// every pair answers false.
+//
+// This used to answer true on an empty list, so that a relayer reading state
+// written by an older miner never acted on a view that miner does not publish.
+// That knob is gone: the fleet is expected to run one version, and the only
+// caller warns rather than rejecting, so a wrong answer here costs a log line
+// and a counter, never a relay.
+func (s *SupplierState) TransportDeclared(serviceID, backendType string) bool {
+	for _, e := range s.StakedEndpoints {
+		if e.ServiceID == serviceID && e.RpcType == backendType {
+			return true
+		}
+	}
+	return false
+}
+
+// IsContaminated returns true when the cached state looks like a failed-write
 // artifact: staked+active with an empty services list. This anti-pattern is
 // produced by a separate bug in the write path (miner/supplier_manager.go).
 // Legitimate states that look similar are NOT contaminated:
@@ -112,14 +228,8 @@ type SupplierState struct {
 //
 // Only the exact tuple (Staked && Status==active && len(Services)==0) is
 // treated as contamination.
-func (s *SupplierState) isContaminated() bool {
-	return s.Staked && s.Status == SupplierStatusActive && len(s.Services) == 0
-}
-
-// IsContaminated is the exported version of isContaminated for use by
-// external packages (e.g. the cleanup CLI).
 func (s *SupplierState) IsContaminated() bool {
-	return s.isContaminated()
+	return s.Staked && s.Status == SupplierStatusActive && len(s.Services) == 0
 }
 
 // IsActive returns true if the supplier is active and should accept relays.
@@ -158,10 +268,15 @@ func (s *SupplierState) IsActiveForService(serviceID string) bool {
 // The cache subscribes to pub/sub invalidation events to stay synchronized
 // across all instances.
 type SupplierCache struct {
-	logger    logging.Logger
-	redis     *redisutil.Client
-	keyPrefix string
-	failOpen  bool
+	logger logging.Logger
+	redis  *redisutil.Client
+
+	// ttl is nanoseconds (time.Duration), atomic so SetTTL can update it after
+	// construction without a lock on the hot SetSupplierState write path. A
+	// caller that cannot afford to block startup on a chain query (see
+	// SetTTL's own doc comment) constructs with a safe default and upgrades
+	// it once the real value is available.
+	ttl atomic.Int64
 
 	// L1: In-memory cache (xsync for lock-free performance), TTL-bounded by
 	// supplierCacheL1TTL so an on-chain stake/services change is not frozen forever.
@@ -178,13 +293,11 @@ type SupplierCache struct {
 
 // SupplierCacheConfig contains configuration for SupplierCache.
 type SupplierCacheConfig struct {
-	// KeyPrefix is the Redis key prefix for supplier state.
-	KeyPrefix string
-
-	// FailOpen determines behavior when Redis is unavailable.
-	// If true, treat supplier as active when cache unavailable (safer for traffic).
-	// If false, treat supplier as inactive when cache unavailable (safer for validation).
-	FailOpen bool
+	// TTL bounds how long a written entry survives in Redis without being
+	// refreshed. See SupplierCacheTTLFromParams for how to derive it from
+	// live chain params. <= 0 falls back to defaultSupplierCacheTTL — never
+	// to no TTL at all; see SetSupplierState.
+	TTL time.Duration
 }
 
 // NewSupplierCache creates a new SupplierCache.
@@ -196,28 +309,57 @@ func NewSupplierCache(
 	redisClient *redisutil.Client,
 	config SupplierCacheConfig,
 ) *SupplierCache {
-	keyPrefix := config.KeyPrefix
-	if keyPrefix == "" {
-		keyPrefix = DefaultSupplierKeyPrefix
+	ttl := config.TTL
+	if ttl <= 0 {
+		ttl = defaultSupplierCacheTTL
 	}
 
-	return &SupplierCache{
+	c := &SupplierCache{
 		logger:     logging.ForComponent(logger, logging.ComponentQuerySupplier),
 		redis:      redisClient,
-		keyPrefix:  keyPrefix,
-		failOpen:   config.FailOpen,
 		localCache: xsync.NewMap[string, supplierCacheL1Entry](),
 	}
+	c.ttl.Store(int64(ttl))
+	return c
+}
+
+// SetTTL updates the TTL applied to every future SetSupplierState write.
+// Safe to call concurrently with writes (atomic) and at any time after
+// construction — in particular, from a caller that could not afford to
+// block on a chain query at construction time and constructed with the
+// safe default, then computed the real value asynchronously (see
+// miner/supplier_worker.go's use of this alongside its shared-params
+// advisory, both dispatched off the master pool so an unreachable node
+// does not lengthen startup).
+//
+// Does NOT retroactively touch entries already written with the old TTL;
+// only the transient mismatch on entries written in that window, at most
+// one reconcile cycle's worth, since the next write refreshes them anyway.
+func (c *SupplierCache) SetTTL(ttl time.Duration) {
+	if ttl <= 0 {
+		ttl = defaultSupplierCacheTTL
+	}
+	c.ttl.Store(int64(ttl))
 }
 
 // supplierKey returns the Redis key for a supplier's state.
 func (c *SupplierCache) supplierKey(operatorAddress string) string {
-	return fmt.Sprintf("%s:%s", c.keyPrefix, operatorAddress)
+	return c.redis.KB().SupplierStateKey(operatorAddress)
 }
 
 // GetSupplierState retrieves a supplier's state from the cache using L1 → L2 fallback.
-// Returns nil if the supplier is not in the cache.
-// If Redis is unavailable and FailOpen is true, returns a synthetic "active" state.
+//
+// Three answers, and they are distinct on purpose:
+//   - (state, nil)  the supplier's state, from L1 or L2.
+//   - (nil, nil)    the supplier is NOT in the cache. The caller serves
+//     optimistically on this one -- see decideSupplierServe -- because absence
+//     is the boot window before the miner has populated the store.
+//   - (nil, error)  the store could not be read. Never guessed around: the
+//     caller turns it into a fast 503 that says the state could not be
+//     verified, and says nothing about the supplier.
+//
+// The error is deliberately not described to the client beyond that. Which
+// store backs L2 is an implementation detail and stays one.
 func (c *SupplierCache) GetSupplierState(ctx context.Context, operatorAddress string) (*SupplierState, error) {
 	start := time.Now()
 
@@ -230,7 +372,7 @@ func (c *SupplierCache) GetSupplierState(ctx context.Context, operatorAddress st
 		// Defensive guard: a pre-fix binary (or a warmup before this guard
 		// existed) may have populated L1 with a contaminated entry. Evict
 		// it and treat as a miss so the caller re-hydrates via L3.
-		if cached != nil && cached.isContaminated() {
+		if cached != nil && cached.IsContaminated() {
 			supplierContaminated.WithLabelValues("l1_read").Inc()
 			c.localCache.Delete(operatorAddress)
 			c.logger.Warn().
@@ -260,24 +402,22 @@ func (c *SupplierCache) GetSupplierState(ctx context.Context, operatorAddress st
 			return nil, nil
 		}
 
-		// Redis error
-		c.logger.Warn().
+		// A store read that FAILED is reported, never guessed around. The
+		// caller turns it into a fast 503 saying the state could not be
+		// verified, rather than a claim about the supplier.
+		//
+		// Until 2026-08-31 this branch fabricated a "fail-open" state instead,
+		// and the fabrication did not even do what its name said: the synthetic
+		// value left Staked false, so decideSupplierServe rejected it anyway,
+		// with reason "supplier_inactive" and the message "supplier X is
+		// active". Three signals -- the log, the metric and the client body --
+		// all said something different from what happened. Measured, and the
+		// reason it is gone rather than repaired: the option existed to keep
+		// traffic flowing and it never did.
+		c.logger.Debug().
 			Err(err).
 			Str(logging.FieldSupplierOperator, operatorAddress).
-			Bool("fail_open", c.failOpen).
 			Msg("failed to get supplier state from cache")
-
-		if c.failOpen {
-			// Return synthetic active state to avoid blocking traffic
-			c.logger.Warn().
-				Str(logging.FieldSupplierOperator, operatorAddress).
-				Msg("fail-open: treating supplier as active due to cache error")
-			cacheGetLatency.WithLabelValues(supplierCacheType, "l2_error").Observe(time.Since(start).Seconds())
-			return &SupplierState{
-				Status:          SupplierStatusActive,
-				OperatorAddress: operatorAddress,
-			}, nil
-		}
 
 		cacheGetLatency.WithLabelValues(supplierCacheType, "l2_error").Observe(time.Since(start).Seconds())
 		return nil, fmt.Errorf("failed to get supplier state: %w", err)
@@ -293,7 +433,7 @@ func (c *SupplierCache) GetSupplierState(ctx context.Context, operatorAddress st
 	// services) produced by a separate write-path bug. Treat as a cache miss
 	// so the miner re-hydrates a clean entry from L3 on the next refresh,
 	// and do NOT populate L1 (avoid re-infecting followers).
-	if state.isContaminated() {
+	if state.IsContaminated() {
 		supplierContaminated.WithLabelValues("l2_read").Inc()
 		c.logger.Warn().
 			Str(logging.FieldSupplierOperator, operatorAddress).
@@ -337,8 +477,31 @@ func (c *SupplierCache) SetSupplierState(ctx context.Context, state *SupplierSta
 
 	key := c.supplierKey(state.OperatorAddress)
 
-	// No TTL - explicit state management only
-	if err := c.redis.Set(ctx, key, data, 0).Err(); err != nil {
+	// Whether this write carries new information, decided BEFORE the write --
+	// the write is what would make them equal.
+	//
+	// Only the invalidation below is suppressed; the write itself stays
+	// unconditional. Two reasons the write is not the thing to skip:
+	//
+	//  - The TTL is the only thing keeping this entry alive, and an expired
+	//    entry makes the relayer serve optimistically, which disables the
+	//    per-service gate exactly for the suppliers stable enough never to
+	//    trigger a rewrite.
+	//  - LastUpdated is what the CLI reports as "Last Updated"; refreshing only
+	//    the TTL would freeze it at the last CHANGE, so a healthy supplier that
+	//    has not changed in hours would read as one nothing is tracking.
+	//
+	// The write costs a round trip that happens either way; the publish is the
+	// expensive half, and the one worth suppressing.
+	unchanged := c.supplierStateUnchanged(ctx, key, state)
+
+	// Bounded TTL (see SupplierCacheTTLFromParams), refreshed on every write.
+	// An actively-tracked supplier is rewritten every reconcile pass, long
+	// before the TTL matters; it only fires once nothing writes this entry
+	// anymore, which is exactly the decommissioned-supplier case this TTL
+	// exists to bound (HIGH-1, review 2026-08-20). A TTL=0 write here is
+	// what let that entry freeze "still active" forever.
+	if err := c.redis.Set(ctx, key, data, time.Duration(c.ttl.Load())).Err(); err != nil {
 		return fmt.Errorf("failed to set supplier state: %w", err)
 	}
 
@@ -346,25 +509,114 @@ func (c *SupplierCache) SetSupplierState(ctx context.Context, state *SupplierSta
 	// and reload fresh data from L2 on next access.
 	// This fixes the bug where relayers show "supplier not staked for service"
 	// after services are updated but L1 cache still has stale data.
-	payload := fmt.Sprintf(`{"operator_address": "%s"}`, state.OperatorAddress)
-	if err := PublishInvalidation(ctx, c.redis, c.logger, supplierCacheType, payload); err != nil {
-		c.logger.Warn().
-			Err(err).
-			Str(logging.FieldSupplierOperator, state.OperatorAddress).
-			Msg("failed to publish supplier cache invalidation (other instances may have stale data)")
+	//
+	// Only when something actually changed. A reconcile pass rewrites EVERY
+	// tracked supplier every interval, so publishing unconditionally means
+	// dropping every supplier's L1 on every relayer for nothing: measured at
+	// rest with 17 suppliers and 2 miners, 34 invalidations/min per relayer,
+	// which is exactly 17 x 2 / 60s. At 594 suppliers it is ~1200/min, and it
+	// scales with the miner count.
+	if !unchanged {
+		payload := fmt.Sprintf(`{"operator_address": "%s"}`, state.OperatorAddress)
+		if err := PublishInvalidation(ctx, c.redis, c.logger, supplierCacheType, payload); err != nil {
+			c.logger.Warn().
+				Err(err).
+				Str(logging.FieldSupplierOperator, state.OperatorAddress).
+				Msg("failed to publish supplier cache invalidation (other instances may have stale data)")
+		}
 	}
 
 	c.logger.Debug().
 		Str(logging.FieldSupplierOperator, state.OperatorAddress).
 		Str("status", state.Status).
 		Uint64("unstake_session_end_height", state.UnstakeSessionEndHeight).
+		Bool("unchanged", unchanged).
 		Msg("updated supplier state in cache")
 
 	return nil
 }
 
+// supplierStateUnchanged reports whether the entry already stored at key
+// carries the same information as next.
+//
+// It compares CONTENT, not the stored bytes. SetSupplierState stamps
+// LastUpdated with the current second before marshalling, so a byte comparison
+// could only ever match two writes landing in the same second -- never two
+// reconcile passes 60s apart, which is the entire case worth suppressing. It
+// would look like it worked in a test that writes twice in a row and do nothing
+// in production.
+//
+// Re-marshalling the stored entry also normalises it, so an entry written by a
+// version that did not yet have a field (StakedEndpoints was added this way)
+// compares equal when the information is genuinely the same, instead of
+// republishing forever after an upgrade.
+//
+// Any failure to read or decode the stored entry answers false: republishing is
+// the safe direction, since the alternative is a relayer keeping stale services.
+func (c *SupplierCache) supplierStateUnchanged(
+	ctx context.Context,
+	key string,
+	next *SupplierState,
+) bool {
+	raw, err := c.redis.Get(ctx, key).Bytes()
+	if err != nil {
+		return false
+	}
+
+	var stored SupplierState
+	if err := json.Unmarshal(raw, &stored); err != nil {
+		return false
+	}
+
+	storedContent, err := supplierStateContent(&stored)
+	if err != nil {
+		return false
+	}
+
+	nextContent, err := supplierStateContent(next)
+	if err != nil {
+		return false
+	}
+
+	return bytes.Equal(storedContent, nextContent)
+}
+
+// supplierStateContent serialises a supplier state with the two fields that
+// describe the WRITE rather than the supplier normalised away, so two passes
+// carrying the same information about the network compare equal.
+//
+// LastUpdated is stamped with the current second on every write. UpdatedBy is
+// the writing miner's own instance ID, kept "for debugging" — and in a fleet it
+// ALTERNATES, because every miner reconciles every supplier: miner A writes and
+// finds B's value there, then B writes and finds A's. Comparing either one makes
+// every pass look like a change.
+//
+// Measured live (2026-08-21): with UpdatedBy compared, two miners and 17
+// suppliers produced 37.3 invalidations/min per side against a 34/min baseline —
+// the suppression bought nothing, while the stored value differed in nothing
+// else. Both fields are still WRITTEN; they are just not evidence that the
+// supplier changed.
+func supplierStateContent(state *SupplierState) ([]byte, error) {
+	content := *state
+	content.LastUpdated = 0
+	content.UpdatedBy = ""
+
+	return json.Marshal(&content)
+}
+
 // DeleteSupplierState removes a supplier's state from both L1 and L2 caches.
 // This should be called when a supplier is fully unstaked.
+//
+// UNUSED as of 2026-08-20 (review, "agujero 6" / LOW #4): removeSupplier no
+// longer calls this (see its own comment on why an immediate delete was
+// wrong — HIGH-1). SetSupplierState's TTL (SupplierCacheTTLFromParams) is
+// now the ONLY thing that ever clears this entry, and it is passive: it
+// bounds the blast radius but does not act the moment we KNOW a supplier is
+// gone. The still-open agujero-6 teardown design likely wants both — this
+// method for the confirmed-terminal moment, the TTL as the backstop for
+// crash/partition, where nothing ever reaches that moment. Kept unused
+// rather than deleted (against the repo's own "delete unused declarations"
+// rule) until that design lands and either calls it or removes it for real.
 func (c *SupplierCache) DeleteSupplierState(ctx context.Context, operatorAddress string) error {
 	// Remove from L1 (local cache)
 	c.localCache.Delete(operatorAddress)
@@ -393,40 +645,10 @@ func (c *SupplierCache) DeleteSupplierState(ctx context.Context, operatorAddress
 	return nil
 }
 
-// IsSupplierActiveForService checks if a supplier is active for a service.
-// This is a convenience method that combines GetSupplierState and IsActiveForService.
-// Returns (true, nil) if supplier is active for the service.
-// Returns (false, nil) if supplier is not active or not in cache.
-// Returns (false, error) if there was a cache error and FailOpen is false.
-func (c *SupplierCache) IsSupplierActiveForService(
-	ctx context.Context,
-	operatorAddress string,
-	serviceID string,
-) (bool, error) {
-	state, err := c.GetSupplierState(ctx, operatorAddress)
-	if err != nil {
-		return false, err
-	}
-
-	if state == nil {
-		// Supplier not in cache
-		if c.failOpen {
-			c.logger.Warn().
-				Str("operator_address", operatorAddress).
-				Str("service_id", serviceID).
-				Msg("fail-open: supplier not in cache, treating as active")
-			return true, nil
-		}
-		return false, nil
-	}
-
-	return state.IsActiveForService(serviceID), nil
-}
-
 // GetAllSupplierStates returns all supplier states from the cache.
 // This is useful for debugging and monitoring.
 func (c *SupplierCache) GetAllSupplierStates(ctx context.Context) (map[string]*SupplierState, error) {
-	pattern := fmt.Sprintf("%s:*", c.keyPrefix)
+	pattern := c.redis.KB().SupplierStatePattern()
 	keys, err := c.redis.Keys(ctx, pattern).Result()
 	if err != nil {
 		return nil, fmt.Errorf("failed to list supplier keys: %w", err)
@@ -499,17 +721,19 @@ func (c *SupplierCache) WarmupFromRedis(ctx context.Context, knownSupplierAddres
 	// If no addresses provided, discover all suppliers in Redis
 	if len(knownSupplierAddresses) == 0 {
 		c.logger.Info().Msg("discovering all suppliers in Redis for warmup")
-		pattern := fmt.Sprintf("%s:*", c.keyPrefix)
+		pattern := c.redis.KB().SupplierStatePattern()
 		keys, err := c.redis.Keys(ctx, pattern).Result()
 		if err != nil {
 			return fmt.Errorf("failed to discover suppliers: %w", err)
 		}
 
-		// Extract operator addresses from keys (ha:supplier:{operator} -> {operator})
+		// Extract operator addresses from keys (ha:supplier:{operator} -> {operator}).
+		// SupplierStateAddress, not a hand-built prefix: this runs on the RELAYER's
+		// startup path (cmd_relayer.go passes nil to reach this branch), so a trim
+		// that drifted from the key layout would leave L1 empty and send every
+		// relay to L2 -- degraded, silently.
 		for _, key := range keys {
-			// Remove prefix to get operator address
-			addr := strings.TrimPrefix(key, c.keyPrefix+":")
-			if addr != key { // Ensure prefix was found and removed
+			if addr, ok := c.redis.KB().SupplierStateAddress(key); ok {
 				knownSupplierAddresses = append(knownSupplierAddresses, addr)
 			}
 		}
@@ -548,7 +772,7 @@ func (c *SupplierCache) WarmupFromRedis(ctx context.Context, knownSupplierAddres
 
 			// Defensive guard: skip contaminated entries during warmup so a
 			// fleet restart doesn't re-infect L1 from stale L2 data.
-			if state.isContaminated() {
+			if state.IsContaminated() {
 				supplierContaminated.WithLabelValues("warmup_skip").Inc()
 				c.logger.Debug().
 					Str(logging.FieldSupplierOperator, addr).
@@ -576,19 +800,21 @@ func (c *SupplierCache) handleInvalidation(ctx context.Context, payload string) 
 		Str("payload", payload).
 		Msg("received supplier invalidation event")
 
+	// Empty-object payload means invalidate ALL entries (bulk clear-all).
+	// Must be checked before unmarshal: "{}" parses successfully into the
+	// event struct, so a check inside the error branch is unreachable.
+	if payload == "{}" {
+		c.localCache.Clear()
+		cacheInvalidations.WithLabelValues(supplierCacheType, SourcePubSub).Inc()
+		return nil
+	}
+
 	// Parse payload to get operator_address
 	var event struct {
 		OperatorAddress string `json:"operator_address"`
 	}
 
 	if err := json.Unmarshal([]byte(payload), &event); err != nil {
-		// Empty payload means invalidate all
-		if payload == "{}" {
-			c.localCache.Clear()
-			cacheInvalidations.WithLabelValues(supplierCacheType, SourcePubSub).Inc()
-			return nil
-		}
-
 		c.logger.Warn().
 			Err(err).
 			Str("payload", payload).
