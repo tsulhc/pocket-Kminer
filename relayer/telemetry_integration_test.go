@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alitto/pond/v2"
 	cryptotypes "github.com/cosmos/cosmos-sdk/crypto/types"
 	"github.com/gorilla/websocket"
 	ring_secp256k1 "github.com/pokt-network/go-dleq/secp256k1"
@@ -109,6 +110,13 @@ func TestTrustedRequestIDSurvivesInnerOuterAndConfigSpoof(t *testing.T) {
 
 	f, _, _, _ := newEagerChargeFixture(t, backend.URL, acceptAnyValidator{})
 	setConfigHeaderSpoof(t, f, "CONFIG-SPOOF")
+
+	// The served path submits the relay for publication; without a publish
+	// subpool submitPublishTask dereferences a nil pool. Production always
+	// wires one at startup; the fixture does not.
+	workers := pond.NewPool(2)
+	t.Cleanup(workers.StopAndWait)
+	f.proxy.publishSubpool = workers.NewSubpool(1)
 
 	inner := map[string]*sdktypes.Header{
 		"Pocket-Request-ID": {Key: "Pocket-Request-ID", Values: []string{"INNER-SPOOF"}},
@@ -214,6 +222,10 @@ func TestHTTPRetryKeepsSingleRequestID(t *testing.T) {
 	defer good.Close()
 
 	f, _, _, _ := newEagerChargeFixture(t, good.URL, acceptAnyValidator{})
+	// Served path needs a publish subpool; see the spoof test above.
+	retryWorkers := pond.NewPool(2)
+	t.Cleanup(retryWorkers.StopAndWait)
+	f.proxy.publishSubpool = retryWorkers.NewSubpool(1)
 	one := 1
 	svc := f.proxy.config.Services[simTestService]
 	svc.Backends["jsonrpc"] = BackendConfig{
