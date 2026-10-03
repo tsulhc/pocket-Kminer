@@ -310,11 +310,13 @@ func TestWebSocketRolloverKeepsPinnedIdentityWithDistinctRequestIDs(t *testing.T
 	logger := zerolog.New(sink).Level(zerolog.WarnLevel)
 	conn := newPublishingV1BridgeWithLogger(t, backendURL, signer, pipeline, published, logger)
 
-	sendRelay(t, conn, identityRelay("next-session-1", supplier, simWSTestService, ownerTestAppAddr, 91, 100))
+	relay1 := identityRelay("next-session-1", supplier, simWSTestService, ownerTestAppAddr, 91, 100)
+	sendRelay(t, conn, relay1)
 	readServedResponse(t, conn)
 	published.await(t, 1)
 
-	sendRelay(t, conn, identityRelay("next-session-2", supplier, simWSTestService, ownerTestAppAddr, 101, 110))
+	relay2 := identityRelay("next-session-2", supplier, simWSTestService, ownerTestAppAddr, 101, 110)
+	sendRelay(t, conn, relay2)
 	readServedResponse(t, conn)
 	published.await(t, 1)
 
@@ -323,6 +325,10 @@ func TestWebSocketRolloverKeepsPinnedIdentityWithDistinctRequestIDs(t *testing.T
 	require.NotEqual(t, records[0].RequestID, records[1].RequestID, "each relay gets its own request ID")
 	require.Len(t, records[0].RequestID, 32)
 	require.Len(t, records[1].RequestID, 32)
+	require.Equal(t, pocketRequestIDFromRelayRequest(relay1), records[0].RequestID,
+		"the observation carries the first frame's digest, not a spoofed or re-derived value")
+	require.Equal(t, pocketRequestIDFromRelayRequest(relay2), records[1].RequestID,
+		"the observation carries the second frame's digest, not a spoofed or re-derived value")
 	require.Equal(t, "next-session-1", records[0].SessionID)
 	require.Equal(t, "next-session-2", records[1].SessionID)
 	for _, rec := range records {
