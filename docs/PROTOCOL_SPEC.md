@@ -53,6 +53,7 @@ The Relayer acts as a proxy that:
 | `Pocket-Supplier`    | Yes  | Supplier operator address                         |
 | `Pocket-Service`     | Yes  | Service ID                                        |
 | `Pocket-Application` | Yes  | Application address                               |
+| `Pocket-Request-ID`  | Yes  | Trusted 32-hex correlation ID derived from the complete signed `RelayRequest` (SHA-256 first 16 bytes); overwrites any client or configured value |
 
 **Body**: Raw request body from `POKTHTTPRequest.BodyBz`
 
@@ -94,6 +95,7 @@ gRPC passthrough with metadata:
 | `pocket-supplier`    | Supplier operator address                   |
 | `pocket-service`     | Service ID                                  |
 | `pocket-application` | Application address (from incoming request) |
+| `Pocket-Request-ID`  | Trusted 32-hex correlation ID derived from the typed `RelayRequest` serialization; overwrites any inner or configured value |
 
 **Compression**: gRPC handles compression via `grpc-encoding` header automatically when both sides have the gzip compressor registered.
 
@@ -130,6 +132,8 @@ relayer's upgrader and its backend dialer).
 |----------------------------|--------------------------------------------|
 | `Pocket-Supplier`          | Supplier operator address                  |
 | `Pocket-Service`           | Service ID                                 |
+
+No per-relay `Pocket-Request-ID` header is sent on the fixed backend WebSocket connection (dialed once before per-relay frames arrive). WebSocket correlation is event-only via the structured `pocket_relay_observation` log carrying the same trusted request ID and pinned supplier/service/application with the rolling session ID.
 
 ### Message Flow
 
@@ -180,5 +184,6 @@ These headers are forwarded to backends for observability:
 | `Pocket-Supplier`    | Supplier operator address (e.g., `pokt1abc...`) |
 | `Pocket-Service`     | Service ID (e.g., `eth-mainnet`)                |
 | `Pocket-Application` | Application address from session                |
+| `Pocket-Request-ID`  | Trusted 32-hex request correlation ID (HTTP and gRPC only; WebSocket uses log correlation) |
 
-For gRPC, these are sent as lowercase metadata keys.
+For gRPC, these are sent as lowercase metadata keys. Operators needing their own correlation ID must use a different header name; any client or configured `Pocket-Request-ID` is overwritten with the derived value (removed when derivation is empty).

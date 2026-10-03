@@ -369,16 +369,26 @@ func (s *RelayGRPCService) serveSendRelay(stream grpc.ServerStream, ctx context.
 		return s.serveSimulatedGRPC(stream, ctx, relayRequest, serviceID, svcConfig, supplierOperatorAddr, directive.KeyID, md)
 	}
 
+	// W2 trusted request intelligence: ordinary-relay observation only.
+	// Initialized after the simulation seam; inner payload classification is
+	// refined after DeserializeHTTPRequest below. Telemetry only.
+	observation := newRelayObservation(relayRequest, nil, nil, serviceID, BackendTypeGRPC)
+	defer func() {
+		logRelayObservation(s.logger, relayRequest, observation)
+	}()
+
 	// Nothing would validate or charge this relay: refuse it rather than serve it free.
 	// Before the queue gate, as in HTTP: a process wired without a pipeline says so.
 	if s.relayPipeline == nil {
 		relaysRejected.WithLabelValues(serviceID, BackendTypeGRPC, rejectReasonMeteringNotConfigured).Inc()
+		observation.RejectReason = rejectReasonMeteringNotConfigured
 		return status.Error(codes.Internal, "relayer is not admitting relays right now")
 	}
 
 	// Stop admitting while the batch queue is full.
 	if s.publishQueueFull != nil && s.publishQueueFull() {
 		relaysRejected.WithLabelValues(serviceID, BackendTypeGRPC, rejectReasonPublishQueueFull).Inc()
+		observation.RejectReason = rejectReasonPublishQueueFull
 		return status.Error(codes.Unavailable, "relayer is not admitting relays right now")
 	}
 
@@ -412,6 +422,7 @@ func (s *RelayGRPCService) serveSendRelay(stream grpc.ServerStream, ctx context.
 			// also carries this service's own timeout.
 			if stream.Context().Err() != nil {
 				relaysRejected.WithLabelValues(serviceID, BackendTypeGRPC, rejectReasonClientDisconnected).Inc()
+				observation.RejectReason = rejectReasonClientDisconnected
 				return status.Error(codes.Canceled, "client disconnected")
 			}
 			reason := rejectReasonValidationFailed
@@ -422,8 +433,10 @@ func (s *RelayGRPCService) serveSendRelay(stream grpc.ServerStream, ctx context.
 			logging.WithSessionContext(s.logger.Debug(), sessionCtx).
 				Err(err).
 				Msg("relay validation failed")
+			observation.RejectReason = reason
 			return status.Errorf(codes.PermissionDenied, "relay validation failed: %v", err)
 		}
+		observation.SignatureVerified = true
 
 		// Refuse what cannot be priced, immediately before the charge and not
 		// earlier: the miner's manifest has not arrived, so AdmitRelay would
@@ -434,6 +447,7 @@ func (s *RelayGRPCService) serveSendRelay(stream grpc.ServerStream, ctx context.
 		// not Internal: it clears itself the moment the miner publishes.
 		if !s.relayPipeline.Priced() {
 			relaysRejected.WithLabelValues(serviceID, BackendTypeGRPC, rejectReasonPricingUnavailable).Inc()
+			observation.RejectReason = rejectReasonPricingUnavailable
 			return status.Error(codes.Unavailable, "relayer is not admitting relays right now")
 		}
 
@@ -455,6 +469,7 @@ func (s *RelayGRPCService) serveSendRelay(stream grpc.ServerStream, ctx context.
 			// so meter_error keeps meaning the store.
 			if stream.Context().Err() != nil {
 				relaysRejected.WithLabelValues(serviceID, BackendTypeGRPC, rejectReasonClientDisconnected).Inc()
+				observation.RejectReason = rejectReasonClientDisconnected
 				return status.Error(codes.Canceled, "client disconnected")
 			}
 			// The meter's own store is unreadable, so what this session has
@@ -464,12 +479,14 @@ func (s *RelayGRPCService) serveSendRelay(stream grpc.ServerStream, ctx context.
 			logging.WithSessionContext(s.logger.Debug(), sessionCtx).
 				Err(meterErr).
 				Msg("relay rejected - unable to verify session budget")
+			observation.RejectReason = rejectReasonMeterError
 			return status.Error(codes.Unavailable, "unable to process relay request")
 		} else if !allowed {
 			// Stake limit exceeded - reject relay
 			relaysRejected.WithLabelValues(serviceID, BackendTypeGRPC, rejectReasonStakeExhausted).Inc()
 			logging.WithSessionContext(s.logger.Debug(), sessionCtx).
 				Msg("relay rejected - stake limit exceeded")
+			observation.RejectReason = rejectReasonStakeExhausted
 			return status.Error(codes.ResourceExhausted, "relay rejected - stake limit exceeded")
 		}
 	}
@@ -478,6 +495,7 @@ func (s *RelayGRPCService) serveSendRelay(stream grpc.ServerStream, ctx context.
 	poktHTTPRequest, err := sdktypes.DeserializeHTTPRequest(relayRequest.Payload)
 	if err != nil {
 		relaysRejected.WithLabelValues(serviceID, BackendTypeGRPC, rejectReasonInvalidRelayRequest).Inc()
+		observation.RejectReason = rejectReasonInvalidRelayRequest
 		return status.Errorf(codes.InvalidArgument, "failed to deserialize POKTHTTPRequest: %v", err)
 	}
 
@@ -497,6 +515,11 @@ func (s *RelayGRPCService) serveSendRelay(stream grpc.ServerStream, ctx context.
 	// application/json, so the old Content-Type-only logic mislabeled every gRPC
 	// relay as "rest" and misrouted it.
 	grpcRPCType := resolveGRPCRelayRPCType(md, poktHTTPRequest, &svcConfig)
+	// Refine telemetry with the resolved route and already-parsed payload.
+	refined := classifyHTTPRequestWorkload(poktHTTPRequest, grpcRPCType)
+	observation.RPCType = refined.RPCType
+	observation.Workload = refined.Workload
+	observation.BackendRequestBytes = refined.BackendRequestBytes
 
 	var grpcEndpoint *pool.BackendEndpoint
 	var grpcPool *pool.Pool
@@ -509,13 +532,23 @@ func (s *RelayGRPCService) serveSendRelay(stream grpc.ServerStream, ctx context.
 	if grpcPool == nil || !grpcPool.HasHealthy() {
 		fastFailsTotal.WithLabelValues(serviceID).Inc()
 		s.logger.Debug().Str("service_id", serviceID).Msg("fast-fail: all gRPC backends unhealthy")
+		observation.RejectReason = rejectReasonBackendDialFailed
 		return status.Errorf(codes.Unavailable, "all backends unhealthy for service %s", serviceID)
 	}
 
 	grpcEndpoint = grpcPool.Next()
+	requestID := pocketRequestIDFromRelayRequest(relayRequest)
+	backendStart := time.Now()
 
 	// Forward request to backend and get response
-	respBody, respHeaders, respStatus, err := s.forwardToBackend(ctx, serviceID, &svcConfig, poktHTTPRequest, grpcEndpoint, grpcRPCType)
+	respBody, respHeaders, respStatus, err := s.forwardToBackend(ctx, serviceID, &svcConfig, poktHTTPRequest, grpcEndpoint, grpcRPCType, requestID)
+	observation.BackendLatency = time.Since(backendStart)
+	if grpcEndpoint != nil {
+		observation.BackendEndpoint = grpcEndpoint.Name
+	}
+	if respStatus > 0 {
+		observation.BackendStatusCode = respStatus
+	}
 
 	// Record result for circuit breaker (covers both success and network-error
 	// paths). Config/misroute errors (errBackendMisconfigured) are excluded: the
@@ -534,9 +567,14 @@ func (s *RelayGRPCService) serveSendRelay(stream grpc.ServerStream, ctx context.
 		// Cut because Redis stopped taking writes: the backend did not fail, so
 		// there is no backend error to count or to answer with.
 		if errors.Is(context.Cause(ctx), errStorageSaturated) {
+			observation.RejectReason = rejectReasonStorageSaturated
 			return status.Error(codes.ResourceExhausted, "relay cut: storage saturated")
 		}
-		relaysRejected.WithLabelValues(serviceID, BackendTypeGRPC, classifyGRPCBackendError(stream.Context(), err)).Inc()
+		backendReason := classifyGRPCBackendError(stream.Context(), err)
+		relaysRejected.WithLabelValues(serviceID, BackendTypeGRPC, backendReason).Inc()
+		observation.Outcome = relayOutcomeBackendError
+		observation.BackendOutcome = backendReason
+		observation.RejectReason = backendReason
 		// Per-request; the state change (backend down) is the circuit
 		// breaker transition logged above.
 		logging.WithSessionContext(s.logger.Debug(), sessionCtx).
@@ -580,6 +618,9 @@ func (s *RelayGRPCService) serveSendRelay(stream grpc.ServerStream, ctx context.
 		logging.WithSessionContext(s.logger.Debug(), sessionCtx).
 			Int("status_code", respStatus).
 			Msg("backend returned 5xx error - relay not mined")
+		observation.Outcome = relayOutcomeBackend5xx
+		observation.RejectReason = rejectReasonBackend5xx
+		observation.BackendStatusCode = respStatus
 		// Return gRPC error without wrapping/signing/mining
 		return status.Errorf(codes.Unavailable, "backend service error: HTTP %d", respStatus)
 	}
@@ -593,14 +634,22 @@ func (s *RelayGRPCService) serveSendRelay(stream grpc.ServerStream, ctx context.
 	)
 	if err != nil {
 		relaysRejected.WithLabelValues(serviceID, BackendTypeGRPC, rejectReasonSigningError).Inc()
+		observation.Outcome = relayOutcomeSigningError
+		observation.RejectReason = rejectReasonSigningError
+		observation.BackendResponseBytes = len(respBody)
 		return status.Errorf(codes.Internal, "failed to build/sign response: %v", err)
 	}
 
 	// Send the response (typed proto message)
 	if err := stream.SendMsg(relayResponse); err != nil {
 		relaysRejected.WithLabelValues(serviceID, BackendTypeGRPC, rejectReasonSendError).Inc()
+		observation.RejectReason = rejectReasonSendError
+		observation.BackendResponseBytes = len(respBody)
 		return status.Errorf(codes.Internal, "failed to send response: %v", err)
 	}
+	observation.Outcome = relayOutcomeServed
+	observation.BackendResponseBytes = len(respBody)
+	observation.TotalLatency = time.Since(arrivalTime)
 
 	// Served: the reservation becomes a charge.
 	s.relayPipeline.SettleRelay(reservation)
@@ -768,7 +817,8 @@ func (s *RelayGRPCService) serveSimulatedGRPC(
 		}
 		grpcEndpoint = grpcPool.Next()
 	}
-	respBody, respHeaders, respStatus, err := s.forwardToBackend(ctx, serviceID, &svcConfig, poktHTTPRequest, grpcEndpoint, grpcRPCType)
+	simRequestID := pocketRequestIDFromRelayRequest(relayRequest)
+	respBody, respHeaders, respStatus, err := s.forwardToBackend(ctx, serviceID, &svcConfig, poktHTTPRequest, grpcEndpoint, grpcRPCType, simRequestID)
 	if err != nil {
 		record(SimResultBackendError)
 		return status.Errorf(codes.Unavailable, "backend error: %v", err)
@@ -814,6 +864,7 @@ func (s *RelayGRPCService) forwardToBackend(
 	poktHTTPRequest *sdktypes.POKTHTTPRequest,
 	endpoint *pool.BackendEndpoint,
 	rpcType string,
+	requestID string,
 ) ([]byte, http.Header, int, error) {
 	// Find the backend configuration
 	var backendURL string
@@ -912,6 +963,9 @@ func (s *RelayGRPCService) forwardToBackend(
 
 	// Apply backend config headers + authentication (shared with HTTP path).
 	applyBackendAuthAndHeaders(req, configHeaders, auth)
+	// W2 trusted correlation: overwrite any inner or configured
+	// Pocket-Request-ID with the ID derived from the signed envelope.
+	setPocketRequestIDValue(req.Header, requestID)
 
 	// Set host header
 	req.Host = backendParsed.Host
