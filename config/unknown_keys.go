@@ -153,6 +153,59 @@ var retiredKeys = map[string]string{
 	"deduplication_ttl_blocks": "the miner never read it: it builds its relay deduplicator without " +
 		"it, so the window was a fixed 10 blocks whatever this said, and it still is -- converted to time " +
 		"with block_time_seconds. Expect no change in behaviour",
+
+	"ack_batch_size": "message acknowledgement is no longer batched by count: the miner acknowledges " +
+		"as part of each relay-batch flush, with no knob. Expect no change in behaviour, and delete the line",
+
+	"cache_prefix": "per-family Redis prefixes are removed: the key layout below base_prefix is now " +
+		"fixed in code, and this family uses \"cache\". If this said \"cache\", nothing moves -- just delete " +
+		"the line. If it said anything else, do NOT fold the old value into base_prefix: that moves the " +
+		"ENTIRE keyspace, including the relay WAL the miner consumes, instead of one family. If keys really " +
+		"live under it today, drain the fleet and migrate before upgrading",
+
+	"events_prefix": "per-family Redis prefixes are removed: the key layout below base_prefix is now " +
+		"fixed in code, and this family uses \"events\". If this said \"events\", nothing moves -- just delete " +
+		"the line. If it said anything else, do NOT fold the old value into base_prefix: that moves the " +
+		"ENTIRE keyspace, including the relay WAL the miner consumes, instead of one family. If keys really " +
+		"live under it today, drain the fleet and migrate before upgrading",
+
+	"streams_prefix": "per-family Redis prefixes are removed: the key layout below base_prefix is now " +
+		"fixed in code, and this family uses \"relays\". If this said \"relays\", nothing moves -- just delete " +
+		"the line. If it said anything else, do NOT fold the old value into base_prefix: that moves the " +
+		"ENTIRE keyspace, including the relay WAL the miner consumes, instead of one family. If keys really " +
+		"live under it today, drain the fleet and migrate before upgrading",
+
+	"miner_prefix": "per-family Redis prefixes are removed: the key layout below base_prefix is now " +
+		"fixed in code, and this family uses \"miner\". If this said \"miner\", nothing moves -- just delete " +
+		"the line. If it said anything else, do NOT fold the old value into base_prefix: that moves the " +
+		"ENTIRE keyspace, including the relay WAL the miner consumes, instead of one family. If keys really " +
+		"live under it today, drain the fleet and migrate before upgrading",
+
+	"supplier_prefix": "per-family Redis prefixes are removed: the key layout below base_prefix is now " +
+		"fixed in code, and this family uses \"supplier\". If this said \"supplier\", nothing moves -- just " +
+		"delete the line. Any other value made two families share one key: supplier_prefix \"suppliers\" " +
+		"produced one key with two writers against the registry family. Do NOT fold the old value into " +
+		"base_prefix: that moves the ENTIRE keyspace, including the relay WAL the miner consumes, instead " +
+		"of one family. If keys really live under it today, drain the fleet and migrate before upgrading",
+
+	"meter_prefix": "per-family Redis prefixes are removed: the key layout below base_prefix is now " +
+		"fixed in code, and metering keys use \"meter\". If this said \"meter\", nothing moves -- just delete " +
+		"the line. A different value moved meter keys mid-session and silently reset in-flight session " +
+		"budgets. Do NOT fold the old value into base_prefix: that moves the ENTIRE keyspace, including the " +
+		"relay WAL the miner consumes, instead of one family. Meter keys are ephemeral and session-scoped, " +
+		"so a drained fleet migrates with nothing to move",
+
+	"params_prefix": "per-family Redis prefixes are removed: the key layout below base_prefix is now " +
+		"fixed in code, and this family uses \"params\". If this said \"params\", nothing moves -- just delete " +
+		"the line. If it said anything else, do NOT fold the old value into base_prefix: that moves the " +
+		"ENTIRE keyspace, including the relay WAL the miner consumes, instead of one family. If keys really " +
+		"live under it today, drain the fleet and migrate before upgrading",
+
+	"consumer_group_prefix": "per-family Redis prefixes are removed. This one is the exception and its " +
+		"hazard is different: the consumer group is a NAME, not a key (it is dash-joined, \"ha-miners\", so " +
+		"it never sits in the keyspace). If this said \"miners\", just delete the line. Removing a line that " +
+		"said anything else renames the group, which orphans its pending-entries list -- relays already " +
+		"delivered and not yet acked are then never reclaimed",
 }
 
 // UnknownKeys reports every key in data that probe's type does not declare.

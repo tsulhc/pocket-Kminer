@@ -36,6 +36,14 @@ Submission is **batched by session-end height** (one tx per supplier per window,
 not one per session). There is no switch to disable it: 1 transaction per
 session would flood the node at scale and is a primary cause of missed windows.
 
+Proofs go the other way, and for the opposite reason: **one proof per
+transaction, always**. A batch dies whole, so one message the chain refuses
+would forfeit every other proof riding with it. The effect is a small
+transaction increase, not one per session -- a session needs a proof only when
+the protocol asks for one (`proof_request_probability` /
+`proof_requirement_threshold`). There is no switch to group them again, just as
+there is none to unbatch claims.
+
 ### Inclusion reconciler (the in-window safety net)
 
 A code-0 `BroadcastTx` only means *mempool acceptance*, not block inclusion. If a

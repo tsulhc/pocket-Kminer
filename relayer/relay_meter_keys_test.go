@@ -37,20 +37,19 @@ func TestRelayMeter_KeysFollowConfiguredNamespace(t *testing.T) {
 	testredis.Client(t) // fail fast with the "start one with ..." message
 	ctx := context.Background()
 
-	// The base is deliberately non-default. meter_prefix is set too, and it must
-	// have NO effect: it is a retired knob, so the assertions below prove the
-	// keys follow the base plus the fixed "meter" segment, and that nothing
-	// landed where the retired value would have put it. (A config that sets it
-	// is rejected at startup by RedisNamespaceConfig.Validate; this test builds
-	// the client directly, which is what lets it observe the key layout.)
-	// The base carries this test's isolation prefix as well: the server is
-	// shared, and a bare "prod" would collide with any other test that picked
-	// the same obvious placeholder.
+	// The base is deliberately non-default. There is no other knob: the
+	// per-family prefixes are deleted struct fields, so the assertions below
+	// prove the keys follow the base plus the fixed "meter" segment, and that
+	// nothing landed where the retired meter_prefix value would have put it.
+	// (A config file that sets it is reported by the unknown-keys pass; this
+	// test builds the client directly, which is what lets it observe the key
+	// layout.) The base carries this test's isolation prefix as well: the
+	// server is shared, and a bare "prod" would collide with any other test
+	// that picked the same obvious placeholder.
 	prefix := testredis.Prefix(t)
 	base := prefix + ":prod"
 	ns := config.RedisNamespaceConfig{
-		BasePrefix:  base,
-		MeterPrefix: "metering",
+		BasePrefix: base,
 	}
 
 	redisClient, err := redisutil.NewClient(ctx, redisutil.ClientConfig{
@@ -109,8 +108,7 @@ func TestRelayMeter_KeysFollowConfiguredNamespace(t *testing.T) {
 	metaKey := kb.MeterMetaKey(sessionID, supplier)
 	require.Equal(t, base+":meter:"+sessionID+":"+supplier+":meta", metaKey,
 		"the meta key must follow the configured BASE, and the fixed meter segment: "+
-			"the per-family prefix is no longer configurable, so a config that sets it "+
-			"cannot move these keys (it is rejected at startup instead)")
+			"the per-family prefix is no longer a config field, so nothing can move these keys")
 	requireKeyExists(t, redisClient, metaKey, "the meter must WRITE the key the KeyBuilder names: %s", metaKey)
 
 	consumedKey := kb.MeterConsumedKey(sessionID, supplier)

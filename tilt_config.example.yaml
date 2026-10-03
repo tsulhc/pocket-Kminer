@@ -222,8 +222,6 @@ relayer:
       url: redis://redis-standalone:6379
     relay_meter:
       cache_ttl: 2h
-      enabled: true
-      fail_behavior: open
     response_compression:
       enabled: false
       min_size_bytes: 1024
