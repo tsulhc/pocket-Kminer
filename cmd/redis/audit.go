@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"strconv"
@@ -401,7 +402,10 @@ func auditSubmissionFamily(ctx context.Context, client *DebugRedisClient, rep *a
 		}
 		rec, err := tr.GetRecord(ctx, supplier, end, session)
 		if err != nil {
-			if err == redis.Nil {
+			// GetRecord wraps the Redis error (%w), so errors.Is — not == —
+			// detects the raced-expiry case. Anything else (notably an
+			// undecodable record) fails the gate.
+			if errors.Is(err, redis.Nil) {
 				c.vanished++
 				continue
 			}
