@@ -91,6 +91,7 @@ func TestAuditSnapshot_ShortOnHealthyState(t *testing.T) {
 	require.Contains(t, out, "verdict=SHORT_CUTOVER_COMPATIBLE")
 	require.Contains(t, out, "family=sessions keys=3 ok=3 vanished=0 fail=0")
 	require.Contains(t, out, "family=submission keys=1 ok=1 vanished=0 fail=0")
+	require.Contains(t, out, "family=rebroadcast keys=3 ok=3 vanished=0 fail=0")
 	require.Contains(t, out, "family=metering keys=3 ok=3 vanished=0 fail=0")
 	require.Contains(t, out, "family=smst ")
 	require.NotContains(t, out, "fail=1")
@@ -121,6 +122,31 @@ func TestAuditSnapshot_DrainOnCorruptSubmission(t *testing.T) {
 	require.Error(t, err, "an undecodable retained record must not authorize SHORT")
 	require.Contains(t, buf.String(), "verdict=FULL_DRAIN_REQUIRED")
 	require.Contains(t, buf.String(), "family=submission keys=1 ok=0 vanished=0 fail=1")
+}
+
+// TestAuditSnapshot_DrainOnOrphanRebroadcast is the teeth test for the
+// index-driven failover path: a group hash with no index member holds
+// payloads NEW would never reconcile, so it must flip the verdict to
+// FULL_DRAIN_REQUIRED instead of passing silently.
+func TestAuditSnapshot_DrainOnOrphanRebroadcast(t *testing.T) {
+	ctx := context.Background()
+	client, _ := newNamespacedDebugClient(t)
+	defer func() { _ = client.Close() }()
+
+	const supplier = "pokt1audit_supplier"
+	const session = "sess-audit-1"
+
+	// Raw HSet bypasses RebroadcastStore.Put, so no index member exists:
+	// exactly the orphan shape a torn write would leave behind.
+	require.NoError(t, client.HSet(ctx,
+		client.KB().RebroadcastKey("claim", supplier, 100),
+		session, `{"m":"c2lnbmVk","h":95}`).Err())
+
+	var buf bytes.Buffer
+	err := runSnapshotAudit(ctx, client, "pg", &buf)
+	require.Error(t, err, "an orphan group hash must not authorize SHORT")
+	require.Contains(t, buf.String(), "verdict=FULL_DRAIN_REQUIRED")
+	require.Contains(t, buf.String(), "family=rebroadcast keys=1 ok=0 vanished=0 fail=1")
 }
 
 // TestAuditSnapshot_PreservesSnapshotEvidence is the read-only regression

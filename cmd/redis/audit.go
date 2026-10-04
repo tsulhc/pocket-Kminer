@@ -24,8 +24,9 @@ import (
 // It walks EVERY key under the configured base prefix on an ISOLATED Redis
 // holding a restored production copy/snapshot and decodes each known family
 // through the exact production read paths the NEW binary uses after a
-// restart. It is strictly read-only: SCAN, TYPE, GET, HGETALL, SMEMBERS,
-// SCARD, XINFO, XPENDING. It never writes, never expires, never deletes.
+// restart. It is strictly read-only: SCAN, TYPE, GET, HLEN, HGETALL,
+// HExists-via-fetch, STRLEN, SMEMBERS, XINFO, XPENDING. It never writes,
+// never expires, never deletes.
 //
 // Output is sanitized by construction: per-family key/ok/fail counts plus
 // bounded supplier/session counts. No key names, values, or identities are
@@ -237,7 +238,11 @@ func scanAllKeys(ctx context.Context, client *DebugRedisClient, kb *transportred
 // and session segments when the shape carries them. Shapes are validated
 // segment by segment: anything that does not match a known production
 // layout is unclassified (counted, never a finding — block cache, params,
-// leader and cache keys legitimately live beside the audited families).
+// leader, chain cache, the supplier registry and supplier cache, the
+// service-factor manifest and miner liveness keys legitimately live beside
+// the audited families: the registry is republished from config at manager
+// start and the caches/manifests rebuild from chain, so no retained state
+// the NEW binary needs hides there).
 // stripAuditBase removes the namespace base prefix so shape checks below
 // work under any base: production uses a single segment ("ha"), but test and
 // isolated-restore namespaces carry several, and fixed whole-key positions
@@ -323,10 +328,9 @@ func auditStreamFamily(ctx context.Context, client *DebugRedisClient, rep *audit
 		c.keys++
 		groups, err := client.XInfoGroups(ctx, s).Result()
 		if err != nil {
-			if err == redis.Nil {
-				c.vanished++
-				continue
-			}
+			// No vanished branch: XINFO GROUPS on a missing key answers
+			// NOGROUP, not Nil, and streams carry no TTL — a stream seen
+			// by SCAN that cannot be described fails the gate.
 			c.fail++
 			continue
 		}
@@ -431,18 +435,71 @@ func auditSubmissionFamily(ctx context.Context, client *DebugRedisClient, rep *a
 
 // auditRebroadcastFamily recovers every group through the failover path
 // (ActiveGroups index scan + List) and requires each entry to be
-// JSON-valid production codec output.
-func auditRebroadcastFamily(ctx context.Context, client *DebugRedisClient, rep *auditReport, _ []string) {
+// JSON-valid production codec output. Every scanned group hash must also
+// resolve through the same index: a hash orphaned from its index member
+// holds payloads NEW would never reconcile (the failover path is
+// index-driven), so orphans fail the gate instead of passing silently.
+func auditRebroadcastFamily(ctx context.Context, client *DebugRedisClient, rep *auditReport, keys []string) {
 	c := rep.families[auditRebroadcast]
 	rb := miner.NewRebroadcastStore(client.Client, time.Hour)
-	for _, phase := range []miner.RebroadcastPhase{miner.RebroadcastPhaseClaim, miner.RebroadcastPhaseProof} {
-		groups, err := rb.ActiveGroups(ctx, phase)
+
+	type groupID struct {
+		phase    string
+		supplier string
+		end      int64
+	}
+	var scanned []groupID
+	for _, k := range keys {
+		rest, ok := stripAuditBase(client.KB(), k)
+		if !ok {
+			c.fail++
+			continue
+		}
+		segs := strings.Split(rest, ":")
+		// Group hash miner:rebroadcast:{phase}:{supplier}:{end}; the
+		// phase carries Redis Cluster hash-tag braces, stripped here.
+		// Index keys miner:rebroadcast:{phase}:index are enumerated via
+		// ActiveGroups below, so only their shape is checked here.
+		switch {
+		case len(segs) == 5 && segs[0] == "miner" && segs[1] == "rebroadcast":
+			end, err := strconv.ParseInt(segs[4], 10, 64)
+			phase := strings.Trim(segs[2], "{}")
+			if err != nil || phase == "" || segs[3] == "" {
+				c.fail++
+				continue
+			}
+			scanned = append(scanned, groupID{phase, segs[3], end})
+		case len(segs) == 4 && segs[0] == "miner" && segs[1] == "rebroadcast" && segs[3] == "index":
+			if strings.Trim(segs[2], "{}") == "" {
+				c.fail++
+				continue
+			}
+			c.keys++
+			c.ok++
+		default:
+			c.fail++
+		}
+	}
+
+	// Phases to recover: both known phases plus anything the scan found,
+	// so a phase production no longer knows still gets its entries read.
+	phases := map[string]bool{
+		string(miner.RebroadcastPhaseClaim): true,
+		string(miner.RebroadcastPhaseProof): true,
+	}
+	for _, g := range scanned {
+		phases[g.phase] = true
+	}
+	active := map[groupID]bool{}
+	for phase := range phases {
+		groups, err := rb.ActiveGroups(ctx, miner.RebroadcastPhase(phase))
 		if err != nil {
 			c.fail++
 			continue
 		}
 		for _, g := range groups {
-			pending, err := rb.List(ctx, phase, g.Supplier, g.SessionEnd)
+			active[groupID{phase, g.Supplier, g.SessionEnd}] = true
+			pending, err := rb.List(ctx, miner.RebroadcastPhase(phase), g.Supplier, g.SessionEnd)
 			if err != nil {
 				c.fail++
 				continue
@@ -457,6 +514,14 @@ func auditRebroadcastFamily(ctx context.Context, client *DebugRedisClient, rep *
 				c.ok++
 			}
 		}
+	}
+	for _, g := range scanned {
+		c.keys++
+		if !active[g] {
+			c.fail++
+			continue
+		}
+		c.ok++
 	}
 }
 
@@ -473,8 +538,9 @@ func auditRebroadcastFamily(ctx context.Context, client *DebugRedisClient, rep *
 //   - every stored node must decode with DecodeStoredNode, the same codec
 //     the map store uses on read;
 //   - the root must link to a stored node: the root node's digest field
-//     is hex(root[:32]), so HExists proves the root references retained
-//     state rather than a foreign blob;
+//     is the digest hex with the count/sum suffix appended, so a prefix
+//     match of hex(root[:32]) over the fetched node fields proves the
+//     root references retained state rather than a foreign blob;
 //   - when the nodes hash is gone the cold leaves blob must be present
 //     and non-empty (the compacted failover path); full cold-prove from
 //     the blob is covered by the W5 rehearsal tests on this revision.
@@ -578,7 +644,8 @@ func auditSMSTFamily(ctx context.Context, client *DebugRedisClient, rep *auditRe
 
 // auditDedupFamily requires every dedup set to be a set. Members are
 // opaque relay hashes with no schema to decode; presence plus type is
-// the honest gate.
+// the honest gate. A key that vanished between SCAN and TYPE answers
+// "none" with no error and counts as vanished, like the other families.
 func auditDedupFamily(ctx context.Context, client *DebugRedisClient, rep *auditReport, keys []string) {
 	c := rep.families[auditDedup]
 	for _, k := range keys {
@@ -586,6 +653,10 @@ func auditDedupFamily(ctx context.Context, client *DebugRedisClient, rep *auditR
 		t, err := client.Type(ctx, k).Result()
 		if err != nil {
 			c.fail++
+			continue
+		}
+		if t == "none" {
+			c.vanished++
 			continue
 		}
 		if t != "set" {
@@ -625,9 +696,13 @@ func auditLeaseFamily(ctx context.Context, client *DebugRedisClient, rep *auditR
 // production read path: the active-session set via SMembers (the O(1)
 // counter source), the per-(session, supplier) metadata blob via GET plus
 // JSON validity with the required fields production unmarshals, and the
-// consumed counter via GET plus integer parse. A set-typed read against a
-// string key (or vice versa) is WRONGTYPE and fails the gate: that is
-// retained state the NEW binary cannot use.
+// consumed counter via GET plus integer parse. The required-fields check
+// is deliberately stricter than production getSessionMeta (which
+// unmarshals into a struct and never checks presence): a blob missing the
+// allowance fields prices nothing, so failing closed here is the safe
+// direction. A set-typed read against a string key (or vice versa) is
+// WRONGTYPE and fails the gate: that is retained state the NEW binary
+// cannot use.
 func auditMeterFamily(ctx context.Context, client *DebugRedisClient, rep *auditReport, keys []string) {
 	c := rep.families[auditMetering]
 	for _, k := range keys {
