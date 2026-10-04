@@ -131,14 +131,14 @@ func runSnapshotAudit(ctx context.Context, client *DebugRedisClient, domain stri
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(w, "snapshot_audit domain=%s suppliers=%d sessions=%d\n", rep.domain, rep.suppliers, rep.sessions)
+	fmt.Fprintf(w, "snapshot_audit domain=%s suppliers=%d sessions=%d\n", rep.domain, rep.suppliers, rep.sessions) //nolint:errcheck // matches the _, _ = Fprintf report idiom used across cmd/redis; a short write here cannot change the returned verdict, which travels via err
 	for _, f := range []auditFamily{auditStreams, auditSessions, auditSubmission, auditRebroadcast, auditSMST, auditDedup, auditLeases, auditMetering} {
 		c := rep.families[f]
-		fmt.Fprintf(w, "family=%s keys=%d ok=%d vanished=%d fail=%d\n", f, c.keys, c.ok, c.vanished, c.fail)
+		fmt.Fprintf(w, "family=%s keys=%d ok=%d vanished=%d fail=%d\n", f, c.keys, c.ok, c.vanished, c.fail) //nolint:errcheck // report line; verdict travels via err below
 	}
-	fmt.Fprintf(w, "listed_submissions=%d stream_pending=%d rebroadcast_entries=%d meter_members=%d unclassified_keys=%d\n",
+	fmt.Fprintf(w, "listed_submissions=%d stream_pending=%d rebroadcast_entries=%d meter_members=%d unclassified_keys=%d\n", //nolint:errcheck // report line; verdict travels via err below
 		rep.listed, rep.pending, rep.entries, rep.members, rep.unclassed)
-	fmt.Fprintf(w, "verdict=%s\n", rep.verdict)
+	fmt.Fprintf(w, "verdict=%s\n", rep.verdict) //nolint:errcheck // report line; verdict travels via err below
 	if rep.verdict != auditVerdictShort {
 		return fmt.Errorf("snapshot audit verdict: %s (see family fail counts above)", rep.verdict)
 	}
@@ -234,39 +234,52 @@ func scanAllKeys(ctx context.Context, client *DebugRedisClient, kb *transportred
 // segment by segment: anything that does not match a known production
 // layout is unclassified (counted, never a finding — block cache, params,
 // leader and cache keys legitimately live beside the audited families).
+// stripAuditBase removes the namespace base prefix so shape checks below
+// work under any base: production uses a single segment ("ha"), but test and
+// isolated-restore namespaces carry several, and fixed whole-key positions
+// would silently unclassify everything there.
+func stripAuditBase(kb *transportredis.KeyBuilder, key string) (string, bool) {
+	rest, ok := strings.CutPrefix(key, strings.TrimSuffix(kb.AllKeysPattern(), "*"))
+	if !ok || rest == "" {
+		return "", false
+	}
+	return rest, true
+}
+
 func classifySnapshotKey(kb *transportredis.KeyBuilder, key string) (auditFamily, string, string) {
 	if supplier, ok := kb.StreamAddress(key); ok {
 		return auditStreams, supplier, ""
 	}
-	segs := strings.Split(key, ":")
-	if len(segs) < 3 {
+	rest, ok := stripAuditBase(kb, key)
+	if !ok {
 		return "", "", ""
 	}
-	// All audited miner/tx families share {base}:miner:... or {base}:tx:...;
-	// smst lives at {base}:smst:....
+	segs := strings.Split(rest, ":")
+	// All audited miner/tx families share miner:... or tx:... once the
+	// base is stripped; smst lives at smst:....
 	switch {
-	case len(segs) == 5 && segs[1] == "miner" && segs[2] == "sessions":
-		// {base}:miner:sessions:{supplier}:{session}; index/state-index
+	case len(segs) == 4 && segs[0] == "miner" && segs[1] == "sessions":
+		// miner:sessions:{supplier}:{session}; index/state-index
 		// keys have more segments and are counted via the session reads.
-		return auditSessions, segs[3], segs[4]
-	case len(segs) == 6 && segs[1] == "tx" && segs[2] == "track":
-		if _, err := strconv.ParseInt(segs[4], 10, 64); err != nil {
+		return auditSessions, segs[2], segs[3]
+	case len(segs) == 5 && segs[0] == "tx" && segs[1] == "track":
+		if _, err := strconv.ParseInt(segs[3], 10, 64); err != nil {
 			return "", "", ""
 		}
-		return auditSubmission, segs[3], segs[5]
-	case len(segs) == 6 && segs[1] == "miner" && segs[2] == "rebroadcast":
+		return auditSubmission, segs[2], segs[4]
+	case len(segs) == 5 && segs[0] == "miner" && segs[1] == "rebroadcast":
 		return auditRebroadcast, "", ""
-	case len(segs) == 5 && segs[1] == "smst":
-		switch segs[4] {
+	case len(segs) == 4 && segs[0] == "smst":
+		switch segs[3] {
 		case "nodes", "root", "stats", "live_root", "leaves":
-			return auditSMST, segs[2], segs[3]
+			return auditSMST, segs[1], segs[2]
 		}
 		return "", "", ""
-	case len(segs) == 5 && segs[1] == "miner" && segs[2] == "dedup" && segs[3] == "session":
-		return auditDedup, "", segs[4]
-	case len(segs) == 4 && segs[1] == "miner" && segs[2] == "claim":
-		return auditLeases, segs[3], ""
-	case segs[1] == "meter":
+	case len(segs) == 4 && segs[0] == "miner" && segs[1] == "dedup" && segs[2] == "session":
+		return auditDedup, "", segs[3]
+	case len(segs) == 3 && segs[0] == "miner" && segs[1] == "claim":
+		return auditLeases, segs[2], ""
+	case segs[0] == "meter":
 		return auditMetering, "", ""
 	}
 	return "", "", ""
@@ -337,8 +350,12 @@ func auditSubmissionFamily(ctx context.Context, client *DebugRedisClient, rep *a
 	for _, k := range keys {
 		c.keys++
 		_, supplier, session := classifySnapshotKey(client.KB(), k)
-		segs := strings.Split(k, ":")
-		end, err := strconv.ParseInt(segs[4], 10, 64)
+		rest, ok := stripAuditBase(client.KB(), k)
+		if !ok {
+			c.fail++
+			continue
+		}
+		end, err := strconv.ParseInt(strings.Split(rest, ":")[3], 10, 64)
 		if err != nil {
 			c.fail++
 			continue
