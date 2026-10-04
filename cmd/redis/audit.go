@@ -169,7 +169,9 @@ func auditSnapshotState(ctx context.Context, client *DebugRedisClient, domain st
 		case auditSessions:
 			sessions = append(sessions, k)
 			suppliers[supplier] = struct{}{}
-			sessionsSet[session] = struct{}{}
+			if session != "" {
+				sessionsSet[session] = struct{}{}
+			}
 		case auditSubmission:
 			submissions = append(submissions, k)
 			suppliers[supplier] = struct{}{}
@@ -259,15 +261,27 @@ func classifySnapshotKey(kb *transportredis.KeyBuilder, key string) (auditFamily
 	// base is stripped; smst lives at smst:....
 	switch {
 	case len(segs) == 4 && segs[0] == "miner" && segs[1] == "sessions":
-		// miner:sessions:{supplier}:{session}; index/state-index
-		// keys have more segments and are counted via the session reads.
+		// miner:sessions:{supplier}:{session} hash; miner:sessions:{supplier}:index
+		// is the supplier's session list (audited via SMembers, marked by an
+		// empty session below).
+		if segs[3] == "index" {
+			return auditSessions, segs[2], ""
+		}
 		return auditSessions, segs[2], segs[3]
+	case len(segs) == 5 && segs[0] == "miner" && segs[1] == "sessions" && segs[3] == "state":
+		// miner:sessions:{supplier}:state:{state} per-state list, same
+		// SMembers readability gate as the supplier index.
+		return auditSessions, segs[2], ""
 	case len(segs) == 5 && segs[0] == "tx" && segs[1] == "track":
 		if _, err := strconv.ParseInt(segs[3], 10, 64); err != nil {
 			return "", "", ""
 		}
 		return auditSubmission, segs[2], segs[4]
 	case len(segs) == 5 && segs[0] == "miner" && segs[1] == "rebroadcast":
+		return auditRebroadcast, "", ""
+	case len(segs) == 4 && segs[0] == "miner" && segs[1] == "rebroadcast" && segs[3] == "index":
+		// miner:rebroadcast:{phase}:index group list; recovery reads it via
+		// ActiveGroups, so the gate below needs no per-key work.
 		return auditRebroadcast, "", ""
 	case len(segs) == 4 && segs[0] == "smst":
 		switch segs[3] {
@@ -313,14 +327,24 @@ func auditStreamFamily(ctx context.Context, client *DebugRedisClient, rep *audit
 }
 
 // auditSessionFamily decodes every session metadata key through the
-// production session store. A key that reads absent raced expiry and is
-// not a finding; any other error is.
+// production session store. Session-list index keys carry no session id
+// (empty marker from the classifier); the restart path enumerates them,
+// so the honest gate is readability via SMembers. A hash key that reads
+// absent raced expiry and is not a finding; any other error is.
 func auditSessionFamily(ctx context.Context, client *DebugRedisClient, rep *auditReport, keys []string) {
 	c := rep.families[auditSessions]
 	stores := map[string]*miner.RedisSessionStore{}
 	for _, k := range keys {
 		c.keys++
 		_, supplier, session := classifySnapshotKey(client.KB(), k)
+		if session == "" {
+			if _, err := client.SMembers(ctx, k).Result(); err != nil {
+				c.fail++
+				continue
+			}
+			c.ok++
+			continue
+		}
 		st, ok := stores[supplier]
 		if !ok {
 			st = miner.NewRedisSessionStore(client.Logger, client.Client,

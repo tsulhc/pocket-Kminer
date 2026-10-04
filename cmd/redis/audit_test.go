@@ -81,7 +81,7 @@ func TestAuditSnapshot_ShortOnHealthyState(t *testing.T) {
 	require.NoError(t, runSnapshotAudit(ctx, client, "pg", &buf))
 	out := buf.String()
 	require.Contains(t, out, "verdict=SHORT_CUTOVER_COMPATIBLE")
-	require.Contains(t, out, "family=sessions keys=1 ok=1 vanished=0 fail=0")
+	require.Contains(t, out, "family=sessions keys=3 ok=3 vanished=0 fail=0")
 	require.Contains(t, out, "family=submission keys=1 ok=1 vanished=0 fail=0")
 	require.Contains(t, out, "family=smst ")
 	require.NotContains(t, out, "fail=1")
