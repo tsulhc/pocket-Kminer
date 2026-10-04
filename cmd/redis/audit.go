@@ -304,9 +304,9 @@ func classifySnapshotKey(kb *transportredis.KeyBuilder, key string) (auditFamily
 		switch {
 		case len(segs) == 2 && segs[1] == "active_sessions":
 			return auditMetering, "", ""
-		case len(segs) == 5 && segs[4] == "meta":
+		case len(segs) == 4 && segs[3] == "meta":
 			return auditMetering, "", ""
-		case len(segs) == 5 && segs[4] == "consumed":
+		case len(segs) == 4 && segs[3] == "consumed":
 			return auditMetering, "", ""
 		}
 		return "", "", ""
@@ -631,7 +631,7 @@ func auditMeterFamily(ctx context.Context, client *DebugRedisClient, rep *auditR
 			}
 			rep.members += int64(len(members))
 			c.ok++
-		case len(segs) == 5 && segs[4] == "meta":
+		case len(segs) == 4 && segs[3] == "meta":
 			data, err := client.Get(ctx, k).Bytes()
 			if err != nil {
 				if err == redis.Nil {
@@ -657,7 +657,7 @@ func auditMeterFamily(ctx context.Context, client *DebugRedisClient, rep *auditR
 				continue
 			}
 			c.ok++
-		case len(segs) == 5 && segs[4] == "consumed":
+		case len(segs) == 4 && segs[3] == "consumed":
 			raw, err := client.Get(ctx, k).Result()
 			if err != nil {
 				if err == redis.Nil {
