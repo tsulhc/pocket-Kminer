@@ -133,13 +133,9 @@ func rehearseDomain(t *testing.T, domain string, withLeases bool) {
 	}
 }
 
-// ClassifySupplierOverlap gates cutover authorization on public supplier
-// identities (no secrets involved): disjoint identity sets permit independent
-// PG/FG domains; any overlap requires proven routing/ownership exclusivity
-// before active-active on separate Redis domains may be assumed safe.
-//
-// The real PG/FG public address lists are operator inputs (chain queries);
-// this pure function is the decision rule, pinned below on synthetic sets.
+// ClassifySupplierOverlap describes the operator-confirmed identity relation
+// for the regression below. PG and FG are independent Redis/state domains, so
+// overlap is informational and is not a cutover authorization gate.
 func ClassifySupplierOverlap(pg, fg []string) string {
 	inPG := make(map[string]struct{}, len(pg))
 	for _, s := range pg {
@@ -158,41 +154,44 @@ func TestClassifySupplierOverlap(t *testing.T) {
 		ClassifySupplierOverlap([]string{"pokt1aaa", "pokt1bbb"}, []string{"pokt1ccc"}))
 	require.Equal(t, "overlap",
 		ClassifySupplierOverlap([]string{"pokt1aaa", "pokt1bbb"}, []string{"pokt1bbb", "pokt1ccc"}),
-		"one shared supplier must force the exclusivity proof")
+		"the two independent Redis domains intentionally share supplier identities")
 	require.Equal(t, "disjoint",
 		ClassifySupplierOverlap(nil, nil), "two empty domains share nothing")
 	require.Equal(t, "disjoint",
 		ClassifySupplierOverlap([]string{"pokt1aaa"}, nil))
 }
 
-// AuthorizeCutover is the cutover gate: both domain state verdicts must be
-// SHORT_CUTOVER_COMPATIBLE, and an overlapping identity set without proven
-// routing/ownership exclusivity authorizes nothing — even with two SHORT
-// verdicts. The per-domain rehearsals above are inputs to this decision, not
-// the decision itself.
-func AuthorizeCutover(pgVerdict, fgVerdict, overlap string, exclusivityProven bool) string {
+// AuthorizeCutover is the per-domain boundary gate. Each domain must have a
+// SHORT-compatible state verdict, and OLD/NEW may not coexist against the same
+// Redis domain. PG and FG may temporarily run different generations because
+// their Redis/state domains are independent, even though suppliers overlap.
+func AuthorizeCutover(pgVerdict, fgVerdict string, pgOldNewCoexist, fgOldNewCoexist bool) string {
 	if pgVerdict != VerdictShortCutover || fgVerdict != VerdictShortCutover {
 		return "NOT_AUTHORIZED"
 	}
-	if overlap != "disjoint" && !exclusivityProven {
+	if pgOldNewCoexist || fgOldNewCoexist {
 		return "NOT_AUTHORIZED"
 	}
 	return "AUTHORIZED"
 }
 
 func TestAuthorizeCutover(t *testing.T) {
+	// The shared supplier identities are accepted across independent PG/FG
+	// Redis domains: PG NEW + FG OLD is an allowed intermediate state.
+	require.Equal(t, "overlap",
+		ClassifySupplierOverlap([]string{"pokt1shared"}, []string{"pokt1shared"}))
 	require.Equal(t, "AUTHORIZED",
-		AuthorizeCutover(VerdictShortCutover, VerdictShortCutover, "disjoint", false),
-		"disjoint sets with two SHORT verdicts authorize")
+		AuthorizeCutover(VerdictShortCutover, VerdictShortCutover, false, false),
+		"supplier overlap does not block migration across independent Redis domains")
 	require.Equal(t, "NOT_AUTHORIZED",
-		AuthorizeCutover(VerdictShortCutover, VerdictShortCutover, "overlap", false),
-		"overlap without an exclusivity proof authorizes nothing, even with two SHORT verdicts")
-	require.Equal(t, "AUTHORIZED",
-		AuthorizeCutover(VerdictShortCutover, VerdictShortCutover, "overlap", true),
-		"overlap with a proven exclusivity authorizes")
+		AuthorizeCutover(VerdictShortCutover, VerdictShortCutover, true, false),
+		"PG OLD and PG NEW may not coexist against PG Redis")
 	require.Equal(t, "NOT_AUTHORIZED",
-		AuthorizeCutover(VerdictFullDrain, VerdictShortCutover, "disjoint", false),
+		AuthorizeCutover(VerdictShortCutover, VerdictShortCutover, false, true),
+		"FG OLD and FG NEW may not coexist against FG Redis")
+	require.Equal(t, "NOT_AUTHORIZED",
+		AuthorizeCutover(VerdictFullDrain, VerdictShortCutover, false, false),
 		"a FULL_DRAIN domain verdict never authorizes")
 	require.Equal(t, "NOT_AUTHORIZED",
-		AuthorizeCutover(VerdictShortCutover, VerdictFullDrain, "disjoint", false))
+		AuthorizeCutover(VerdictShortCutover, VerdictFullDrain, false, false))
 }
