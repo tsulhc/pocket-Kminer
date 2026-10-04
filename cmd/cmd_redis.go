@@ -59,6 +59,7 @@ Examples:
 	cmd.AddCommand(redis.KeysCmd())
 	cmd.AddCommand(redis.FlushCmd())
 	cmd.AddCommand(redis.SubmissionsCmd())
+	cmd.AddCommand(redis.AuditCmd())
 
 	return cmd
 }
