@@ -2,6 +2,7 @@ package redis
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -294,7 +295,21 @@ func classifySnapshotKey(kb *transportredis.KeyBuilder, key string) (auditFamily
 	case len(segs) == 3 && segs[0] == "miner" && segs[1] == "claim":
 		return auditLeases, segs[2], ""
 	case segs[0] == "meter":
-		return auditMetering, "", ""
+		// Production metering keys come in three shapes with three types:
+		//   meter:active_sessions            SET read by SMembers;
+		//   meter:{session}:{supplier}:meta     STRING JSON blob read by GET;
+		//   meter:{session}:{supplier}:consumed STRING integer read by GET.
+		// Anything else under meter: is not a state the restart path
+		// reads and stays unclassified (counted, never a finding).
+		switch {
+		case len(segs) == 2 && segs[1] == "active_sessions":
+			return auditMetering, "", ""
+		case len(segs) == 5 && segs[4] == "meta":
+			return auditMetering, "", ""
+		case len(segs) == 5 && segs[4] == "consumed":
+			return auditMetering, "", ""
+		}
+		return "", "", ""
 	}
 	return "", "", ""
 }
@@ -441,11 +456,29 @@ func auditRebroadcastFamily(ctx context.Context, client *DebugRedisClient, rep *
 	}
 }
 
-// auditSMSTFamily proves each retained tree is resumable through a fresh
-// manager: a claimed root must reimport to identical bytes, a live-only
-// tree must resume and keep accumulating. ProveClosest needs a known leaf
-// path, which a snapshot walk cannot supply; the proof path itself is
-// covered by the W5 rehearsal tests on this revision.
+// auditSMSTFamily proves each retained tree is resumable WITHOUT touching
+// it. The production resume path (GetOrCreateTree) is deliberately NOT
+// used here: it sets TTLs on creation and DELETES corrupt roots, so
+// running it would mutate the snapshot under audit and destroy the very
+// evidence a drain verdict must preserve. Instead every check below is a
+// read (GET/HLEN/HGETALL/HEXISTS/STRLEN) decoded with the production
+// codec and layout constants:
+//
+//   - a present root must be exactly SMSTRootLen bytes, else nothing can
+//     import it;
+//   - every stored node must decode with DecodeStoredNode, the same codec
+//     the map store uses on read;
+//   - the root must link to a stored node: the root node's digest field
+//     is hex(root[:32]), so HExists proves the root references retained
+//     state rather than a foreign blob;
+//   - when the nodes hash is gone the cold leaves blob must be present
+//     and non-empty (the compacted failover path); full cold-prove from
+//     the blob is covered by the W5 rehearsal tests on this revision.
+//
+// Nodes without any root are what a fresh start sees (production ignores
+// them and starts empty with identical behavior), so they are not a
+// finding; a root with neither nodes nor blob is retained state the NEW
+// binary cannot use and fails the gate.
 func auditSMSTFamily(ctx context.Context, client *DebugRedisClient, rep *auditReport, keys []string) {
 	c := rep.families[auditSMST]
 	byPair := map[string][]string{}
@@ -453,39 +486,74 @@ func auditSMSTFamily(ctx context.Context, client *DebugRedisClient, rep *auditRe
 		_, supplier, session := classifySnapshotKey(client.KB(), k)
 		byPair[supplier+"\x00"+session] = append(byPair[supplier+"\x00"+session], k)
 	}
-	mgrs := map[string]*miner.RedisSMSTManager{}
 	for pair, pairKeys := range byPair {
 		parts := strings.SplitN(pair, "\x00", 2)
 		supplier, session := parts[0], parts[1]
-		mgr, ok := mgrs[supplier]
-		if !ok {
-			mgr = miner.NewRedisSMSTManager(client.Logger, client.Client,
-				miner.RedisSMSTManagerConfig{SupplierAddress: supplier, CacheTTL: time.Hour})
-			mgrs[supplier] = mgr
-		}
-		hasClaimed, hasLive := false, false
-		for _, k := range pairKeys {
-			if strings.HasSuffix(k, ":root") {
-				hasClaimed = true
-			}
-			if strings.HasSuffix(k, ":live_root") {
-				hasLive = true
-			}
-		}
-		if _, err := mgr.GetOrCreateTree(ctx, session); err != nil {
-			c.fail++
+		kb := client.KB()
+		nodesKey := kb.SMSTNodesKey(supplier, session)
+		claimed, claimedErr := client.Get(ctx, kb.SMSTRootKey(supplier, session)).Bytes()
+		live, liveErr := client.Get(ctx, kb.SMSTLiveRootKey(supplier, session)).Bytes()
+		if claimedErr != nil && claimedErr != redis.Nil {
+			c.fail += int64(len(pairKeys))
 			continue
 		}
-		root, err := mgr.GetTreeRoot(ctx, session)
+		if liveErr != nil && liveErr != redis.Nil {
+			c.fail += int64(len(pairKeys))
+			continue
+		}
+		hasClaimed := claimedErr == nil && len(claimed) > 0
+		hasLive := liveErr == nil && len(live) > 0
+		anchor := claimed
+		if !hasClaimed {
+			anchor = live
+		}
+		if (hasClaimed || hasLive) && len(anchor) != miner.SMSTRootLen {
+			// Malformed root: production would delete this key and start
+			// fresh. The audit preserves it as drain evidence instead.
+			c.fail += int64(len(pairKeys))
+			continue
+		}
+		nodeCount, err := client.HLen(ctx, nodesKey).Result()
 		if err != nil {
-			c.fail++
+			c.fail += int64(len(pairKeys))
 			continue
 		}
-		if (hasClaimed || hasLive) && len(root) == 0 {
-			// Roots on disk but nothing resumable: retained state the
-			// NEW binary cannot use.
-			c.fail++
+		if nodeCount > 0 {
+			nodes, err := client.HGetAll(ctx, nodesKey).Result()
+			if err != nil {
+				c.fail += int64(len(pairKeys))
+				continue
+			}
+			bad := false
+			for _, v := range nodes {
+				if _, err := miner.DecodeStoredNode([]byte(v)); err != nil {
+					bad = true
+					break
+				}
+			}
+			if bad {
+				c.fail += int64(len(pairKeys))
+				continue
+			}
+			if hasClaimed || hasLive {
+				ok, err := client.HExists(ctx, nodesKey, hex.EncodeToString(anchor[:32])).Result()
+				if err != nil || !ok {
+					c.fail += int64(len(pairKeys))
+					continue
+				}
+			}
+			c.keys += int64(len(pairKeys))
+			c.ok += int64(len(pairKeys))
 			continue
+		}
+		if hasClaimed || hasLive {
+			// Compacted shape: nodes gone, the leaves blob must carry
+			// the tree. STRLEN proves presence without pulling the blob.
+			n, err := client.StrLen(ctx, kb.SMSTLeavesKey(supplier, session)).Result()
+			if err != nil || n == 0 {
+				c.fail += int64(len(pairKeys))
+				continue
+			}
 		}
 		c.keys += int64(len(pairKeys))
 		c.ok += int64(len(pairKeys))
@@ -537,18 +605,75 @@ func auditLeaseFamily(ctx context.Context, client *DebugRedisClient, rep *auditR
 	}
 }
 
-// auditMeterFamily requires the metering active-session set to read.
-// Members are opaque session references; the count is the signal.
+// auditMeterFamily requires every metering key to decode through its
+// production read path: the active-session set via SMembers (the O(1)
+// counter source), the per-(session, supplier) metadata blob via GET plus
+// JSON validity with the required fields production unmarshals, and the
+// consumed counter via GET plus integer parse. A set-typed read against a
+// string key (or vice versa) is WRONGTYPE and fails the gate: that is
+// retained state the NEW binary cannot use.
 func auditMeterFamily(ctx context.Context, client *DebugRedisClient, rep *auditReport, keys []string) {
 	c := rep.families[auditMetering]
 	for _, k := range keys {
 		c.keys++
-		members, err := client.SMembers(ctx, k).Result()
-		if err != nil {
+		rest, ok := stripAuditBase(client.KB(), k)
+		if !ok {
 			c.fail++
 			continue
 		}
-		rep.members += int64(len(members))
-		c.ok++
+		segs := strings.Split(rest, ":")
+		switch {
+		case len(segs) == 2 && segs[1] == "active_sessions":
+			members, err := client.SMembers(ctx, k).Result()
+			if err != nil {
+				c.fail++
+				continue
+			}
+			rep.members += int64(len(members))
+			c.ok++
+		case len(segs) == 5 && segs[4] == "meta":
+			data, err := client.Get(ctx, k).Bytes()
+			if err != nil {
+				if err == redis.Nil {
+					c.vanished++
+					continue
+				}
+				c.fail++
+				continue
+			}
+			var meta map[string]json.RawMessage
+			if err := json.Unmarshal(data, &meta); err != nil {
+				c.fail++
+				continue
+			}
+			// The fields production requires to price a session: without
+			// them the allowance is unknown and the meter refuses.
+			if _, ok := meta["session_id"]; !ok {
+				c.fail++
+				continue
+			}
+			if _, ok := meta["max_stake_upokt"]; !ok {
+				c.fail++
+				continue
+			}
+			c.ok++
+		case len(segs) == 5 && segs[4] == "consumed":
+			raw, err := client.Get(ctx, k).Result()
+			if err != nil {
+				if err == redis.Nil {
+					c.vanished++
+					continue
+				}
+				c.fail++
+				continue
+			}
+			if _, err := strconv.ParseInt(raw, 10, 64); err != nil {
+				c.fail++
+				continue
+			}
+			c.ok++
+		default:
+			c.fail++
+		}
 	}
 }
