@@ -536,8 +536,20 @@ func auditSMSTFamily(ctx context.Context, client *DebugRedisClient, rep *auditRe
 				continue
 			}
 			if hasClaimed || hasLive {
-				ok, err := client.HExists(ctx, nodesKey, hex.EncodeToString(anchor[:32])).Result()
-				if err != nil || !ok {
+				// The map-store keys nodes by digest with the node's
+				// count/sum suffix appended, so the root digest is a
+				// PREFIX of its field, never the whole field: match on
+				// the prefix over the nodes already fetched above (no
+				// extra round trip, still strictly read-only).
+				wantPrefix := hex.EncodeToString(anchor[:32])
+				linked := false
+				for f := range nodes {
+					if strings.HasPrefix(f, wantPrefix) {
+						linked = true
+						break
+					}
+				}
+				if !linked {
 					c.fail += int64(len(pairKeys))
 					continue
 				}
