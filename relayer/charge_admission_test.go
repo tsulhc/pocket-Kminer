@@ -16,8 +16,10 @@ import (
 	sharedtypes "github.com/pokt-network/poktroll/x/shared/types"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	goredis "github.com/redis/go-redis/v9"
+	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/require"
 
+	"github.com/pokt-network/pocket-relay-miner/storage/kv"
 	redisutil "github.com/pokt-network/pocket-relay-miner/transport/redis"
 
 	"github.com/pokt-network/pocket-relay-miner/internal/testredis"
@@ -53,7 +55,7 @@ func newChargeMeterOn(t *testing.T, redisClient *redisutil.Client, start bool) *
 	app := &fakeAppClient{addr: chargeTestApp}
 	app.stakeUpokt.Store(1000)
 	meter := NewRelayMeter(
-		testLogger(), redisClient, app, nil,
+		testLogger(), kv.NewRedis(zerolog.Nop(), redisClient), app, nil,
 		&fakeSessionClient{numSuppliers: 2}, nil,
 		&fakeSharedParamCache{params: &sharedtypes.Params{
 			NumBlocksPerSession:            10,
@@ -151,7 +153,7 @@ func newEagerChargeFixture(t *testing.T, backendURL string, validator RelayValid
 	app := &fakeAppClient{addr: f.appAddr}
 	app.stakeUpokt.Store(1_000_000)
 	meter := NewRelayMeter(
-		testLogger(), meterRedis, app, nil,
+		testLogger(), kv.NewRedis(zerolog.Nop(), meterRedis), app, nil,
 		&fakeSessionClient{numSuppliers: 1}, nil,
 		&fakeSharedParamCache{params: &sharedtypes.Params{
 			NumBlocksPerSession:            10,
@@ -243,9 +245,9 @@ func TestEveryServedRelayIsChargedWhetherOrNotItWasMined(t *testing.T) {
 	processor := NewRelayProcessor(testLogger(), nil, nil, nil)
 	processor.SetDifficultyProvider(zeroTargetDifficulty{})
 	f.proxy.relayProcessor = processor
-	workers := pond.NewPool(2)
-	t.Cleanup(workers.StopAndWait)
-	f.proxy.publishSubpool = workers.NewSubpool(1)
+	queue := &servicePublishQueue{pool: pond.NewPool(1), maxBytes: 1 << 30}
+	t.Cleanup(queue.pool.StopAndWait)
+	f.proxy.publishQueues = map[string]*servicePublishQueue{simTestService: queue}
 
 	const sessionID = "sess-unmined"
 	key := meter.consumedKey(sessionID, f.supplierAddr)
@@ -258,7 +260,7 @@ func TestEveryServedRelayIsChargedWhetherOrNotItWasMined(t *testing.T) {
 		require.Equal(t, http.StatusOK, w.Code, "body=%s", w.Body.String())
 	}
 	// Every publish task has run once the subpool drains: the count below is final.
-	f.proxy.publishSubpool.StopAndWait()
+	queue.pool.StopAndWait()
 
 	require.Equal(t, skippedBefore+served, testutil.ToFloat64(skipped), "premise: no served relay met the difficulty")
 	require.Equal(t, int32(0), f.pub.calls.Load(), "premise: nothing was mined, so nothing was published")

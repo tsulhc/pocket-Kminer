@@ -22,7 +22,7 @@ import (
 // the node smt gave it instead of a copy. A 1 MiB pulse OOM-killed the miner
 // with the leaf and a copy of its node both resident until the HSET returned.
 
-func bufferedNode(t *testing.T, store *RedisMapStore, key []byte) ([]byte, bool) {
+func bufferedNode(t *testing.T, store *nodeStore, key []byte) ([]byte, bool) {
 	t.Helper()
 	store.pipelineMu.Lock()
 	defer store.pipelineMu.Unlock()
@@ -32,7 +32,7 @@ func bufferedNode(t *testing.T, store *RedisMapStore, key []byte) ([]byte, bool)
 
 func TestRedisMapStore_SetKeepsTheSliceItIsGiven(t *testing.T) {
 	h := newFlushFailureHarness(t, true)
-	store := h.tree.store.(*RedisMapStore)
+	store := h.tree.store.(*nodeStore)
 	key, value := []byte("node-digest"), transport.ChainedHashBytes("set-owns", 1<<20)
 
 	store.BeginPipeline()
@@ -46,7 +46,7 @@ func TestRedisMapStore_SetKeepsTheSliceItIsGiven(t *testing.T) {
 
 func TestRedisMapStore_GetServesABufferedNodeWithoutRedis(t *testing.T) {
 	h := newFlushFailureHarness(t, true)
-	store := h.tree.store.(*RedisMapStore)
+	store := h.tree.store.(*nodeStore)
 	key, value := []byte("pending-digest"), transport.ChainedHashBytes("pending", 4096)
 	want := bytes.Clone(value)
 
@@ -145,7 +145,7 @@ func TestCommit_CompactsBigLeavesBeforeTheFlushAndLosesNothingWhenItFails(t *tes
 // root the tree holds, and the proof is built later from leaves already
 // compacted. Until a flush succeeds, those nodes exist only in the store's
 // buffer, and the proof has to be served from there.
-func TestProveClosest_ServesACompactedLeafFromTheBufferAfterAFailedFlush(t *testing.T) {
+func TestProveWeighted_ServesACompactedLeafFromTheBufferAfterAFailedFlush(t *testing.T) {
 	h := newFlushFailureHarness(t, true)
 	h.seed(4)
 	key := sha256.Sum256([]byte("proof-from-buffer"))

@@ -8,12 +8,6 @@ allow_k8s_contexts('kind-kind')
 
 # Load Tilt extensions
 load("ext://restart_process", "docker_build_with_restart")
-k8s_yaml(blob("""
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: redis-operator
-"""))
 
 load("ext://secret", "secret_create_generic")
 
@@ -25,10 +19,10 @@ load("./tilt/k8s/validator.Tiltfile", "deploy_validator")
 load("./tilt/k8s/account-init.Tiltfile", "deploy_account_init")
 load("./tilt/k8s/miner.Tiltfile", "deploy_miners", "generate_miner_config")
 load("./tilt/k8s/relayer.Tiltfile", "deploy_relayers", "generate_relayer_config")
+load("./tilt/k8s/standalone.Tiltfile", "deploy_standalone")
 load("./tilt/k8s/backend.Tiltfile", "deploy_backend")
 load("./tilt/k8s/nginx-backend.Tiltfile", "provision_nginx_backend")
 load("./tilt/k8s/observability.Tiltfile", "deploy_observability")
-load("./tilt/k8s/path.Tiltfile", "deploy_path")
 
 print("=" * 60)
 print("Pocket RelayMiner - Local Development Environment")
@@ -39,9 +33,11 @@ config = load_config()
 
 print("\nConfiguration:")
 print("  Chain ID: {}".format(config["validator"]["chain_id"]))
-print("  Relayers: {}".format(config["relayer"]["count"]))
-print("  Miners: {}".format(config["miner"]["count"]))
-print("  Redis mode: {}".format(config["redis"]["mode"]))
+print("  Relay miner mode: {}".format(config["relay_miner_mode"]))
+if config["relay_miner_mode"] == "ha":
+    print("  Relayers: {}".format(config["relayer"]["count"]))
+    print("  Miners: {}".format(config["miner"]["count"]))
+    print("  Redis mode: {}".format(config["redis"]["mode"]))
 print("  Observability: {}".format(config["observability"]["enabled"]))
 print()
 
@@ -230,25 +226,25 @@ stringData:
 
 # Deploy infrastructure (order matters: Redis → Validator → Account Init → Miners → Relayers)
 print("Deploying infrastructure...")
-deploy_redis(config)
+standalone_mode = config["relay_miner_mode"] == "standalone"
+# Standalone mode uses no Redis; high-availability mode deploys one.
+if not standalone_mode:
+    deploy_redis(config)
 deploy_validator(config)
 deploy_account_init(config, all_keys_path, genesis_path)
 
-# Deploy relay-miner components
-# IMPORTANT: Miners MUST start before Relayers (cache population dependency)
 print("Deploying relay-miner components...")
-deploy_miners(config)
-deploy_relayers(config)
+if standalone_mode:
+    deploy_standalone(config)
+else:
+    # IMPORTANT: Miners MUST start before Relayers (cache population dependency)
+    deploy_miners(config)
+    deploy_relayers(config)
 
 # Deploy backends
 print("Deploying backend services...")
 deploy_backend(config)
 provision_nginx_backend()
-
-# Deploy PATH gateway (optional - routes relays to relayers)
-if config.get("path", {}).get("enabled", False):
-    print("Deploying PATH gateway...")
-    deploy_path(config)
 
 # Deploy observability (optional)
 if config["observability"]["enabled"]:
@@ -266,8 +262,6 @@ print("  - Grafana: http://localhost:{}".format(config["observability"]["grafana
 print("  - Validator Rest: http://localhost:{}".format(config["validator"]["ports"]["rest"]))
 print("  - Validator RPC: http://localhost:{}".format(config["validator"]["ports"]["rpc"]))
 print("  - Validator gRpc: http://localhost:{}".format(config["validator"]["ports"]["grpc"]))
-if config.get("path", {}).get("enabled", False):
-    print("  - PATH Gateway: http://localhost:{}".format(config["path"]["port"]))
 print()
 print("Commands:")
 print("  tilt up       - Start all services")

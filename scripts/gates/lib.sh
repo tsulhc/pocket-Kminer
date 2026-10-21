@@ -294,6 +294,48 @@ gate_settlement_breakdown() {
     ' "$events_file" || { printf '0\t0\t0\t0\t0\t0\t0\t0\t0\t0'; return 1; }
 }
 
+# gate_relay_miner_mode -- which mode the cluster runs, from its Deployments.
+#
+# Reads Deployment names on stdin, one per line, bare or as kubectl's
+# `deployment.apps/<name>`. Prints `ha` (relayer and miner, no standalone) or
+# `standalone` (standalone, no relayer and no miner) and returns 0. Anything
+# else prints the reason and returns 1: both sets at once is a high-availability
+# miner left beside a standalone process, and both would claim the same
+# suppliers. The cluster is the only source of the mode, so a flag cannot
+# disagree with what is running.
+gate_relay_miner_mode() {
+    local names has_relayer=0 has_miner=0 has_standalone=0
+    names="$(sed 's#^deployment[^/]*/##')"
+    printf '%s\n' "$names" | grep -qx relayer && has_relayer=1
+    printf '%s\n' "$names" | grep -qx miner && has_miner=1
+    printf '%s\n' "$names" | grep -qx standalone && has_standalone=1
+    if [ "$has_standalone" -eq 1 ] && [ "$has_relayer" -eq 0 ] && [ "$has_miner" -eq 0 ]; then
+        printf 'standalone\n'
+        return 0
+    fi
+    if [ "$has_standalone" -eq 0 ] && [ "$has_relayer" -eq 1 ] && [ "$has_miner" -eq 1 ]; then
+        printf 'ha\n'
+        return 0
+    fi
+    if [ "$has_standalone" -eq 1 ]; then
+        printf 'a standalone Deployment AND a relayer or miner Deployment: both would serve and claim the same suppliers\n'
+    else
+        printf 'neither a standalone Deployment nor both relayer and miner Deployments\n'
+    fi
+    return 1
+}
+
+# gate_side_configmap <mode> <relayer|miner> -- the ConfigMap holding that
+# side's rendered config: its own in high-availability mode, the one standalone
+# config (where the side is the section of its name) in standalone mode.
+gate_side_configmap() {
+    case "$1" in
+    ha) printf '%s-config\n' "$2" ;;
+    standalone) printf 'standalone-config\n' ;;
+    *) return 1 ;;
+    esac
+}
+
 # gate_repo_root -- cd to the repository root so a gate behaves the same
 # wherever it is invoked from.
 gate_repo_root() {
@@ -579,6 +621,8 @@ gate_settle_timeout_min() {
 # calls gate_fail; the caller does, on the status.
 gate_spanish_hits() {
     local dir="$1" words_file="$2" mode="${3:-}" words accents out rc hits=''
+    # Expanded as ${src[@]+"${src[@]}"}: bash before 4.4 (3.2 is stock macOS)
+    # treats an empty array as unbound under set -u.
     local -a src=()
     local exclude=':(exclude)scripts/gates/spanish-words.txt'
     [ "$mode" = --cached ] && src=(--cached)
@@ -594,11 +638,11 @@ gate_spanish_hits() {
 
     [ "$(gate_spanish_scanned "$dir")" -gt 0 ] || return 2
 
-    out="$(git -C "$dir" grep --no-color -I -n "${src[@]}" -E "$accents" -- . "$exclude" 2>&1)"
+    out="$(git -C "$dir" grep --no-color -I -n ${src[@]+"${src[@]}"} -E "$accents" -- . "$exclude" 2>&1)"
     rc=$?
     case "$rc" in 0) hits="$out" ;; 1) ;; *) return 2 ;; esac
 
-    out="$(git -C "$dir" grep --no-color -I -n "${src[@]}" -w -i -E "$words" -- . "$exclude" 2>&1)"
+    out="$(git -C "$dir" grep --no-color -I -n ${src[@]+"${src[@]}"} -w -i -E "$words" -- . "$exclude" 2>&1)"
     rc=$?
     case "$rc" in 0) hits="${hits:+$hits$'\n'}$out" ;; 1) ;; *) return 2 ;; esac
 
