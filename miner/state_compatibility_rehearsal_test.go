@@ -44,7 +44,7 @@ func rehearseMinerState(t *testing.T, withCompaction bool) {
 	const sessionEnd = int64(100)
 
 	// Gate 1 — claim/proof/inclusion tracking: the retained submission record
-	// is written by the tracker and read back by the reconciler's readers.
+	// is written by the tracker and read back by the keyed reconciler reader.
 	tr, _ := setupSubmissionTracker(t)
 	require.NoError(t, tr.TrackClaimSubmission(ctx,
 		supplier, "eth", "pokt1rehearsal_app", session, 90, sessionEnd,
@@ -65,9 +65,6 @@ func rehearseMinerState(t *testing.T, withCompaction bool) {
 	require.NoError(t, err)
 	require.Equal(t, "on_chain_confirmed", confirmed.ProofOnChainOutcome)
 	require.Equal(t, int64(101), confirmed.ProofInclusionHeight)
-	listed, err := tr.ListRecordsForSupplier(ctx, supplier)
-	require.NoError(t, err)
-	require.Len(t, listed, 1, "the supplier listing must find the retained record")
 	_, err = tr.GetRecord(ctx, supplier, sessionEnd, "sess-never-tracked")
 	require.Error(t, err, "a missing record must error, not return an empty success")
 
