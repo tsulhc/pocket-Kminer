@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/pokt-network/pocket-relay-miner/logging"
-	"github.com/redis/go-redis/v9"
+	"github.com/pokt-network/pocket-relay-miner/storage/kv"
 
 	redistransport "github.com/pokt-network/pocket-relay-miner/transport/redis"
 )
@@ -127,9 +127,9 @@ func claimBroadcastOutcome(success bool) string {
 
 // SubmissionTracker tracks claim/proof submissions to Redis for debugging.
 type SubmissionTracker struct {
-	logger      logging.Logger
-	redisClient *redistransport.Client
-	ttl         time.Duration
+	logger logging.Logger
+	store  kv.Store
+	ttl    time.Duration
 }
 
 // countWriteFailure counts a tracking write Redis refused, telling an
@@ -150,14 +150,14 @@ func countWriteFailure(kind string, err error) {
 
 // NewSubmissionTracker creates a new submission tracker.
 // ttl specifies how long submission records are kept in Redis for debugging.
-func NewSubmissionTracker(logger logging.Logger, redisClient *redistransport.Client, ttl time.Duration) *SubmissionTracker {
+func NewSubmissionTracker(logger logging.Logger, store kv.Store, ttl time.Duration) *SubmissionTracker {
 	if ttl <= 0 {
 		ttl = 24 * time.Hour // Default: 24 hours
 	}
 	return &SubmissionTracker{
-		logger:      logging.ForComponent(logger, "submission_tracker"),
-		redisClient: redisClient,
-		ttl:         ttl,
+		logger: logging.ForComponent(logger, "submission_tracker"),
+		store:  store,
+		ttl:    ttl,
 	}
 }
 
@@ -211,7 +211,7 @@ func (t *SubmissionTracker) TrackClaimSubmission(
 		return fmt.Errorf("failed to marshal tracking record: %w", err)
 	}
 
-	if err := t.redisClient.Set(ctx, key, data, t.ttl).Err(); err != nil {
+	if err := t.store.Set(ctx, key, data, t.ttl); err != nil {
 		countWriteFailure("claim", err)
 		return fmt.Errorf("failed to store tracking record: %w", err)
 	}
@@ -246,7 +246,7 @@ func (t *SubmissionTracker) TrackProofSubmission(
 	proofSize := int64(len(proof))
 
 	// Get existing record
-	data, err := t.redisClient.Get(ctx, key).Bytes()
+	data, err := t.store.Get(ctx, key)
 	if err != nil {
 		// If record doesn't exist, create minimal one (shouldn't happen normally)
 		t.logger.Warn().
@@ -275,7 +275,7 @@ func (t *SubmissionTracker) TrackProofSubmission(
 			return fmt.Errorf("failed to marshal new tracking record: %w", marshalErr)
 		}
 
-		if setErr := t.redisClient.Set(ctx, key, newData, t.ttl).Err(); setErr != nil {
+		if setErr := t.store.Set(ctx, key, newData, t.ttl); setErr != nil {
 			countWriteFailure("proof", setErr)
 			return fmt.Errorf("failed to store new tracking record: %w", setErr)
 		}
@@ -307,7 +307,7 @@ func (t *SubmissionTracker) TrackProofSubmission(
 		return fmt.Errorf("failed to marshal updated tracking record: %w", err)
 	}
 
-	if err := t.redisClient.Set(ctx, key, updatedData, t.ttl).Err(); err != nil {
+	if err := t.store.Set(ctx, key, updatedData, t.ttl); err != nil {
 		return fmt.Errorf("failed to update tracking record: %w", err)
 	}
 
@@ -324,7 +324,7 @@ func (t *SubmissionTracker) TrackProofSubmission(
 func (t *SubmissionTracker) GetRecord(ctx context.Context, supplier string, sessionEnd int64, sessionID string) (*SubmissionTrackingRecord, error) {
 	key := t.makeKey(supplier, sessionEnd, sessionID)
 
-	data, err := t.redisClient.Get(ctx, key).Bytes()
+	data, err := t.store.Get(ctx, key)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get tracking record: %w", err)
 	}
@@ -337,50 +337,10 @@ func (t *SubmissionTracker) GetRecord(ctx context.Context, supplier string, sess
 	return &record, nil
 }
 
-// ListRecordsForSupplier returns all tracking records for a supplier.
-func (t *SubmissionTracker) ListRecordsForSupplier(ctx context.Context, supplier string) ([]*SubmissionTrackingRecord, error) {
-	pattern := t.redisClient.KB().TxTrackPattern(supplier)
-
-	// SCAN, not KEYS: KEYS blocks Redis for its full duration and on a
-	// cluster client is routed to a single node.
-	var keys []string
-	var cursor uint64
-	for {
-		batch, next, scanErr := t.redisClient.Scan(ctx, cursor, pattern, 500).Result()
-		if scanErr != nil {
-			return nil, fmt.Errorf("failed to list keys: %w", scanErr)
-		}
-		keys = append(keys, batch...)
-		cursor = next
-		if cursor == 0 {
-			break
-		}
-	}
-
-	var records []*SubmissionTrackingRecord
-	for _, key := range keys {
-		data, getErr := t.redisClient.Get(ctx, key).Bytes()
-		if getErr != nil {
-			t.logger.Warn().Err(getErr).Str("key", key).Msg("failed to get record")
-			continue
-		}
-
-		var record SubmissionTrackingRecord
-		if unmarshalErr := json.Unmarshal(data, &record); unmarshalErr != nil {
-			t.logger.Warn().Err(unmarshalErr).Str("key", key).Msg("failed to unmarshal record")
-			continue
-		}
-
-		records = append(records, &record)
-	}
-
-	return records, nil
-}
-
 // makeKey generates the Redis key for a tracking record.
 // Format: ha:tx:track:{supplier}:{sessionEndHeight}:{sessionID}
 func (t *SubmissionTracker) makeKey(supplier string, sessionEnd int64, sessionID string) string {
-	return t.redisClient.KB().TxTrackKey(supplier, sessionEnd, sessionID)
+	return t.store.KB().TxTrackKey(supplier, sessionEnd, sessionID)
 }
 
 // ClaimOnChainUpdate is the payload passed to
@@ -388,76 +348,71 @@ func (t *SubmissionTracker) makeKey(supplier string, sessionEnd int64, sessionID
 // the inclusion reconciler after polling AllClaims.
 type ClaimOnChainUpdate struct {
 	Supplier        string
+	SessionEnd      int64
+	SessionID       string
 	TxHash          string
 	Outcome         string
 	InclusionHeight int64
 	Rebroadcasts    int
 }
 
-// UpdateClaimOnChainOutcome finds every submission record for the given
-// supplier whose ClaimTxHash matches TxHash and overwrites its claim-
-// on-chain fields with the provided outcome. The TTL is preserved at
-// t.ttl.
+// UpdateClaimOnChainOutcome overwrites the claim-on-chain fields of the record
+// identified by (Supplier, SessionEnd, SessionID) when that record holds the
+// claim TxHash names. The TTL is preserved at t.ttl.
 //
-// The scan is intentionally simple (SCAN over the supplier's prefix): a
-// single miner's in-flight-session set is bounded and the update runs on
-// a background worker pool, so the O(N) cost is acceptable.
+// One key, read directly, as the proof side does. A claim batched with others
+// is reported once per session by the inclusion reconciler, so each session's
+// record is updated by its own call. A scan of the supplier's prefix read every
+// record of the TTL window per outcome, and raced the expiry of other sessions'
+// keys between the scan and the read.
 func (t *SubmissionTracker) UpdateClaimOnChainOutcome(ctx context.Context, u ClaimOnChainUpdate) error {
 	if u.TxHash == "" {
 		return nil
 	}
-	records, err := t.ListRecordsForSupplier(ctx, u.Supplier)
-	if err != nil {
+	record, err := t.GetRecord(ctx, u.Supplier, u.SessionEnd, u.SessionID)
+	if err != nil && !errors.Is(err, kv.ErrNotFound) {
+		// A read that failed is not a missing record: it reaches the caller,
+		// which logs it, and is not counted as an outcome without a record.
 		return err
 	}
 
-	updated := 0
-	for _, record := range records {
-		if record.ClaimTxHash != u.TxHash {
-			continue
-		}
-		record.ClaimOnChainOutcome = u.Outcome
-		record.ClaimInclusionHeight = u.InclusionHeight
-		if u.Rebroadcasts > 0 {
-			record.ClaimRebroadcasts = u.Rebroadcasts
-		}
-
-		key := t.makeKey(record.Supplier, record.SessionEnd, record.SessionID)
-		data, marshalErr := json.Marshal(record)
-		if marshalErr != nil {
-			t.logger.Warn().Err(marshalErr).Str("session_id", record.SessionID).
-				Msg("failed to marshal updated claim on-chain outcome record")
-			continue
-		}
-		if setErr := t.redisClient.Set(ctx, key, data, t.ttl).Err(); setErr != nil {
-			countWriteFailure("claim_outcome", setErr)
-			t.logger.Warn().Err(setErr).Str("session_id", record.SessionID).
-				Msg("failed to persist updated claim on-chain outcome record")
-			continue
-		}
-		updated++
-	}
-
-	if updated == 0 {
+	if err != nil || record.ClaimTxHash != u.TxHash {
 		// The reconciler polls a tx until it resolves and then stops, so an
 		// outcome with no record to annotate is lost for good. Warn, not Debug:
 		// this is once per session, not per relay, and after the tracker stopped
 		// skipping writes it should not happen at all -- when it does, the
-		// record it wanted is missing and only these two fields say which.
+		// record it wanted is missing and only these fields say which.
 		trackingOutcomesWithoutRecord.WithLabelValues("claim").Inc()
 		t.logger.Warn().
 			Str("supplier", u.Supplier).
+			Str("session_id", u.SessionID).
 			Str("tx_hash", u.TxHash).
 			Str("outcome", u.Outcome).
 			Msg("claim on-chain outcome found no submission record to annotate; the outcome is lost")
 		return nil
 	}
 
+	record.ClaimOnChainOutcome = u.Outcome
+	record.ClaimInclusionHeight = u.InclusionHeight
+	if u.Rebroadcasts > 0 {
+		record.ClaimRebroadcasts = u.Rebroadcasts
+	}
+
+	key := t.makeKey(u.Supplier, u.SessionEnd, u.SessionID)
+	data, marshalErr := json.Marshal(record)
+	if marshalErr != nil {
+		return fmt.Errorf("failed to marshal claim on-chain outcome record: %w", marshalErr)
+	}
+	if setErr := t.store.Set(ctx, key, data, t.ttl); setErr != nil {
+		countWriteFailure("claim_outcome", setErr)
+		return fmt.Errorf("failed to persist claim on-chain outcome record: %w", setErr)
+	}
+
 	t.logger.Debug().
 		Str("supplier", u.Supplier).
+		Str("session_id", u.SessionID).
 		Str("tx_hash", u.TxHash).
 		Str("outcome", u.Outcome).
-		Int("records_updated", updated).
 		Msg("applied claim on-chain outcome")
 
 	return nil
@@ -496,11 +451,11 @@ func (t *SubmissionTracker) UpdateProofOnChainOutcome(ctx context.Context, u Pro
 		// failure, and swallowing it made a Redis outage indistinguishable from
 		// a session that was never tracked.
 		//
-		// redis.Nil is what tells them apart, and it is the ONLY case that keeps
-		// the old behaviour. Everything else now reaches the caller, which logs
+		// kv.ErrNotFound is what tells them apart, and it is the ONLY case that
+		// keeps the old behaviour. Everything else now reaches the caller, which logs
 		// it -- without this, that log was unreachable for the failure that
 		// actually happens.
-		if errors.Is(err, redis.Nil) {
+		if errors.Is(err, kv.ErrNotFound) {
 			return nil
 		}
 		return err
@@ -523,7 +478,7 @@ func (t *SubmissionTracker) UpdateProofOnChainOutcome(ctx context.Context, u Pro
 	if marshalErr != nil {
 		return fmt.Errorf("failed to marshal proof on-chain outcome record: %w", marshalErr)
 	}
-	if setErr := t.redisClient.Set(ctx, key, data, t.ttl).Err(); setErr != nil {
+	if setErr := t.store.Set(ctx, key, data, t.ttl); setErr != nil {
 		return fmt.Errorf("failed to persist proof on-chain outcome record: %w", setErr)
 	}
 

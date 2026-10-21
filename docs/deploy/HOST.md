@@ -1,4 +1,9 @@
-# Deploy on a host (binary + systemd)
+# Deploy on a host (binary + systemd): high-availability mode
+
+This runbook runs the **high-availability mode**. For the **standalone mode**
+(1 service, an embedded store, no Redis), follow
+[HOST_STANDALONE.md](HOST_STANDALONE.md) instead;
+[README.md, "Choose a mode"](README.md#choose-a-mode) compares the two.
 
 This runbook installs the relayer and the miner as 2 systemd services on 1
 Linux host (or VM), next to Redis 8.10 or newer. Example files are in
@@ -20,15 +25,15 @@ in [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
 - A Linux host with systemd and cgroup v2, root access, and the
   [prerequisites](README.md#prerequisites): a reachable node, a staked
   supplier key, a backend per service, a funded supplier account.
-- A copy of this repository at tag `v0.1.2`, for `examples/host/` and
+- A copy of this repository at tag `v0.1.5`, for `examples/host/` and
   `config.redis.example.conf`:
 
 ```bash
-git clone --branch v0.1.2 https://github.com/pokt-network/pocket-relay-miner.git && cd pocket-relay-miner
+git clone --branch v0.1.5 https://github.com/pokt-network/pocket-relay-miner.git && cd pocket-relay-miner
 ```
 
-**If not**: `Remote branch v0.1.2 not found in upstream origin` → check the
-tag is typed exactly `v0.1.2`; the list of tags is at
+**If not**: `Remote branch v0.1.5 not found in upstream origin` → check the
+tag is typed exactly `v0.1.5`; the list of tags is at
 <https://github.com/pokt-network/pocket-relay-miner/tags>.
 
 **Stop if**: you do not have the supplier key or the node endpoints. A human
@@ -42,15 +47,15 @@ same one.
 **Run** (download it from the release; `arm64` instead of `amd64` on ARM)
 
 ```bash
-curl -sLO https://github.com/pokt-network/pocket-relay-miner/releases/download/v0.1.2/pocket-relay-miner_v0.1.2_linux_amd64.tar.gz
-curl -sLO https://github.com/pokt-network/pocket-relay-miner/releases/download/v0.1.2/checksums.txt
+curl -sLO https://github.com/pokt-network/pocket-relay-miner/releases/download/v0.1.5/pocket-relay-miner_v0.1.5_linux_amd64.tar.gz
+curl -sLO https://github.com/pokt-network/pocket-relay-miner/releases/download/v0.1.5/checksums.txt
 sha256sum --ignore-missing -c checksums.txt
-mkdir -p bin && tar -xzf pocket-relay-miner_v0.1.2_linux_amd64.tar.gz -C bin
+mkdir -p bin && tar -xzf pocket-relay-miner_v0.1.5_linux_amd64.tar.gz -C bin
 ```
 
-**Expect**: `pocket-relay-miner_v0.1.2_linux_amd64.tar.gz: OK`
+**Expect**: `pocket-relay-miner_v0.1.5_linux_amd64.tar.gz: OK`
 
-Or **Run** (build from source; needs Go 1.26.5 and make)
+Or **Run** (build from source; needs Go 1.27.2 and make)
 
 ```bash
 make build-release
@@ -62,7 +67,7 @@ Or **Run** (copy it out of the release image; needs Docker, and the binary is
 statically linked)
 
 ```bash
-mkdir -p bin && id=$(docker create ghcr.io/pokt-network/pocket-relay-miner:v0.1.2) && docker cp "$id:/usr/local/bin/pocket-relay-miner" bin/pocket-relay-miner && docker rm "$id"
+mkdir -p bin && id=$(docker create ghcr.io/pokt-network/pocket-relay-miner:v0.1.5) && docker cp "$id:/usr/local/bin/pocket-relay-miner" bin/pocket-relay-miner && docker rm "$id"
 ```
 
 Then install it and create the service user:
@@ -326,7 +331,7 @@ at `✓ SUCCESS` once the proof window has passed.
 
 ## Dashboards (optional)
 
-Prometheus and Grafana with the 7 dashboards of the compose example work on a
+Prometheus and Grafana with the 8 dashboards of the compose example work on a
 host too: scrape `127.0.0.1:9090` (relayer) and `127.0.0.1:9092` (miner) and
 provision the dashboard files, as
 [examples/observability/README.md, "With a host deployment"](../../examples/observability/README.md#with-a-host-deployment)

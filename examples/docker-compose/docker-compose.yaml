@@ -54,7 +54,7 @@ services:
   # Builds the claim and proof for every served relay and submits them.
   # Exits if it cannot read the chain at startup, hence restart: on-failure.
   miner:
-    image: ghcr.io/pokt-network/pocket-relay-miner:v0.1.2
+    image: ghcr.io/pokt-network/pocket-relay-miner:v0.1.5
     command: ["miner", "--config", "/config/miner.yaml"]
     volumes:
       - ./config/miner.yaml:/config/miner.yaml:ro
@@ -85,7 +85,7 @@ services:
   # Serves relays: verifies each request, forwards it to your backend, signs
   # the response and hands the relay to the miner through Redis.
   relayer:
-    image: ghcr.io/pokt-network/pocket-relay-miner:v0.1.2
+    image: ghcr.io/pokt-network/pocket-relay-miner:v0.1.5
     command: ["relayer", "--config", "/config/relayer.yaml"]
     volumes:
       - ./config/relayer.yaml:/config/relayer.yaml:ro
@@ -121,7 +121,7 @@ services:
     restart: unless-stopped
 
   # --- Observability (optional) ------------------------------------------------
-  # Prometheus, Grafana with the 7 dashboards in examples/observability/, and a
+  # Prometheus, Grafana with the 8 dashboards in examples/observability/, and a
   # Redis exporter. They belong to the "observability" profile, so a plain `up`
   # does not start them; add `--profile observability` to start them too (see
   # examples/observability/README.md). Both ports are bound to loopback: use an

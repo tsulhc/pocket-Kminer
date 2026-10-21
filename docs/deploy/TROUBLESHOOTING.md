@@ -1,11 +1,23 @@
 # Troubleshooting a deployment
 
 Find the message you see, then apply the action. Every message below is copied
-from the v0.1.0 binary: from a real run, or from the source where noted.
+from the v0.1.0 binary: from a real run, or from the source where noted. The
+[Standalone mode](#standalone-mode) section, and the store messages marked
+"since standalone mode", are from the build that added standalone mode.
+
+Most messages apply to both modes; [Redis](#redis) is high-availability mode
+only, and [Standalone mode](#standalone-mode) is standalone mode only. In
+standalone mode the relayer and the miner are 1 process, so their messages are
+in the same log.
 
 Compose users: read logs with
-`docker compose -p prm-example -f examples/docker-compose/docker-compose.yaml logs <service>`.
-Host users: `journalctl -u pocket-relay-miner-<relayer|miner> -n 100 --no-pager`.
+`docker compose -p prm-example -f examples/docker-compose/docker-compose.yaml logs <service>`
+(high availability) or
+`docker compose -p prm-standalone -f examples/docker-compose/docker-compose.standalone.yaml logs standalone`
+(standalone).
+Host users: `journalctl -u pocket-relay-miner-<relayer|miner> -n 100 --no-pager`
+(high availability) or `journalctl -u pocket-relay-miner-standalone -n 100 --no-pager`
+(standalone).
 Logs are JSON by default; search for `"level":"error"`, `"level":"warn"` and `Error:`.
 
 ## Quick table
@@ -77,7 +89,8 @@ EXIT=1
 ```
 
 Before exiting, the relayer also logs
-`Redis not operable: no new work admitted until it has room` with
+`store not operable: no new work admitted until it has room` (since standalone
+mode; `Redis not operable: ...` in v0.1.x) with
 `"reason":"misconfigured"`.
 
 **Action**: load [config.redis.example.conf](../../config.redis.example.conf)
@@ -215,11 +228,27 @@ config; [config.relayer.example.yaml](../../config.relayer.example.yaml)).
 | 503 `relayer is not admitting relays right now` | `pricing_unavailable` | no service factor manifest yet | [Relayer up but not ready](#relayer-up-but-not-ready) |
 | 503 `relayer is not admitting relays right now` | `publish_queue_full` | the queue of relays waiting to be written to Redis is full | check Redis latency and health; the queue drains by itself |
 | 429 `relayer is not admitting relays right now` | `validation_queue_full` | an optimistic service's validation queue is full | wait for `Retry-After`; if persistent, raise the service's capacity |
+| 429 `relayer is not admitting relays right now` | `service_publish_queue_full` | one service's served relays waiting to be mined hold its bound (`ha_relayer_publish_queue_bytes` reached `ha_relayer_publish_queue_max_bytes`, its validation queue capacity), usually because the full node does not answer that service's mining difficulty | check the full node the relayer queries; only that service is refused, the others keep serving |
 | 429 `relayer is not admitting relays: storage saturated` | `storage_saturated` | Redis has less than 1 GiB free, or 1/8 of `maxmemory` when that is smaller | raise `maxmemory`, or let the miner drain; admission reopens at twice that line (2 GiB free with a `maxmemory` of 8 GiB or more; 768 MiB free with the compose example's `3gb`) |
 | relay refused before any backend call | `no_local_signer` | the relay names a supplier whose key this relayer does not hold | add the key to `keys.keys_file`, or check the gateway targets the right supplier |
 
 Per-relay rejections log at debug level only; count them with the metric,
 on the relayer's metrics port (`metrics.addr`, 9090 by default).
+
+## Standalone mode
+
+| Message | Cause | Action |
+|---|---|---|
+| `a standalone config has no redis section` | the standalone config has a top-level `redis:` | remove it: standalone mode uses no Redis. To run on Redis, use the high-availability mode |
+| `<side>.redis.url: standalone connects to no Redis` | `url` or `namespace` under `relayer.redis` or `miner.redis` | remove it |
+| `storage.path is required: the directory the embedded store lives in` | no `storage.path` | set it to a directory on local disk |
+| `pebblestore: open <path>: resource temporarily unavailable` | another process has the store open: a second standalone process on the same `storage.path` | stop the other process; run 1 standalone process per store and per set of supplier keys |
+| `pebblestore: open <path>: ... permission denied` (not reproduced: the wording is the OS error's) | the process's user cannot write `storage.path` | give that directory to the service user (the host unit's `StateDirectory=` does; the compose example mounts its volume on a directory the image's user owns) |
+| `store not operable: no new work admitted until it has room` with `"reason":"memory_reserve"` | the disk of `storage.path` has less than 1 GiB free (an eighth, on a disk under 8 GiB) | free space on that disk; the relayer side takes relays again with 2 GiB free, the miner side with 1.5 GiB. `ha_transport_store_free_bytes` shows the free bytes |
+| `store not operable: ...` with `"reason":"sample_stale"` | the free space of the disk could not be read | check that `storage.path` exists and its filesystem is mounted |
+
+The `pocket-relay-miner redis ...` inspection commands read Redis; in
+standalone mode, read the metrics on port 9092 and the logs instead.
 
 ## Still stuck
 

@@ -7,6 +7,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pokt-network/pocket-relay-miner/storage/kv"
+	"github.com/rs/zerolog"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -20,7 +23,7 @@ func setupSubmissionTracker(t *testing.T) (*SubmissionTracker, *redisutil.Client
 
 	return NewSubmissionTracker(
 		logging.NewLoggerFromConfig(logging.DefaultConfig()),
-		client,
+		kv.NewRedis(zerolog.Nop(), client),
 		1*time.Hour,
 	), client
 }
@@ -59,6 +62,8 @@ func TestUpdateClaimOnChainOutcome_OnChainFound(t *testing.T) {
 	ctx := context.Background()
 	require.NoError(t, tr.UpdateClaimOnChainOutcome(ctx, ClaimOnChainUpdate{
 		Supplier:        "pokt1test",
+		SessionEnd:      110,
+		SessionID:       "sess-1",
 		TxHash:          "txhash-abc",
 		Outcome:         "on_chain_found",
 		InclusionHeight: 127,
@@ -81,9 +86,11 @@ func TestUpdateClaimOnChainOutcome_OnChainMissing(t *testing.T) {
 
 	ctx := context.Background()
 	require.NoError(t, tr.UpdateClaimOnChainOutcome(ctx, ClaimOnChainUpdate{
-		Supplier: "pokt1test",
-		TxHash:   "txhash-missing",
-		Outcome:  "on_chain_missing",
+		Supplier:   "pokt1test",
+		SessionEnd: 110,
+		SessionID:  "sess-3",
+		TxHash:     "txhash-missing",
+		Outcome:    "on_chain_missing",
 	}))
 
 	got, err := tr.GetRecord(ctx, "pokt1test", 110, "sess-3")
@@ -92,29 +99,35 @@ func TestUpdateClaimOnChainOutcome_OnChainMissing(t *testing.T) {
 	assert.Equal(t, int64(0), got.ClaimInclusionHeight)
 }
 
-func TestUpdateClaimOnChainOutcome_MultipleSessionsSameTxHash(t *testing.T) {
-	// Claims are batched: a single tx can cover multiple sessions. All their
-	// records must be updated together.
+func TestUpdateClaimOnChainOutcome_BatchedTxIsAppliedPerSession(t *testing.T) {
+	// Claims are batched: a single tx can cover multiple sessions. The inclusion
+	// reconciler reports the outcome once per session, and each call updates
+	// only the record it names, and only when that record holds the tx.
 	tr, _ := setupSubmissionTracker(t)
 	seedClaim(t, tr, "pokt1test", "sess-a", "txhash-batch")
 	seedClaim(t, tr, "pokt1test", "sess-b", "txhash-batch")
 	seedClaim(t, tr, "pokt1test", "sess-c", "txhash-other") // must NOT be updated
 
 	ctx := context.Background()
-	require.NoError(t, tr.UpdateClaimOnChainOutcome(ctx, ClaimOnChainUpdate{
-		Supplier:        "pokt1test",
-		TxHash:          "txhash-batch",
-		Outcome:         "on_chain_found",
-		InclusionHeight: 200,
-	}))
+	for _, id := range []string{"sess-a", "sess-b", "sess-c"} {
+		require.NoError(t, tr.UpdateClaimOnChainOutcome(ctx, ClaimOnChainUpdate{
+			Supplier:        "pokt1test",
+			SessionEnd:      110,
+			SessionID:       id,
+			TxHash:          "txhash-batch",
+			Outcome:         "on_chain_found",
+			InclusionHeight: 200,
+		}))
+	}
 
 	for _, id := range []string{"sess-a", "sess-b"} {
 		got, err := tr.GetRecord(ctx, "pokt1test", 110, id)
 		require.NoError(t, err)
 		assert.Equal(t, "on_chain_found", got.ClaimOnChainOutcome, id)
+		assert.Equal(t, int64(200), got.ClaimInclusionHeight, id)
 	}
 
-	// Unrelated session untouched.
+	// A record holding another tx is untouched.
 	got, err := tr.GetRecord(ctx, "pokt1test", 110, "sess-c")
 	require.NoError(t, err)
 	assert.Empty(t, got.ClaimOnChainOutcome,

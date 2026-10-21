@@ -101,7 +101,10 @@ func TestReactivateClaimed_AcceptsOnlyStatesBehindClaimed(t *testing.T) {
 
 			flipped, err := store.ReactivateClaimed(ctx, sessionID, reactivationTestRoot("guard"), "TXHASH")
 			require.NoError(t, err)
-			require.Equal(t, tt.wantFlip, flipped, "flip decision")
+			require.Equal(t, tt.wantFlip, flipped.From != "", "flip decision")
+			if tt.wantFlip {
+				require.Equal(t, tt.state, flipped.From, "the flip reports the state it came from")
+			}
 
 			got, err := store.Get(ctx, sessionID)
 			require.NoError(t, err)
@@ -135,7 +138,7 @@ func TestReactivateClaimed_WritesClaimFieldsWithTheState(t *testing.T) {
 
 	flipped, err := store.ReactivateClaimed(ctx, sessionID, root, "TX-REBROADCAST")
 	require.NoError(t, err)
-	require.True(t, flipped)
+	require.Equal(t, SessionStateClaimTxError, flipped.From, "the flip reports the state it came from")
 
 	got, err := store.Get(ctx, sessionID)
 	require.NoError(t, err)
@@ -321,7 +324,7 @@ func TestReactivateClaimed_ConcurrentObserversProduceExactlyOneFlip(t *testing.T
 			defer wg.Done()
 			<-start
 			flipped, err := store.ReactivateClaimed(ctx, sessionID, root, "TX-RACE")
-			if err == nil && flipped {
+			if err == nil && flipped.From != "" {
 				flips.Add(1)
 			}
 		}()
@@ -345,7 +348,7 @@ func TestReactivateClaimed_ConcurrentObserversProduceExactlyOneFlip(t *testing.T
 // with a proof submitted — and the half that was untested is exactly the half
 // that depends on the SMST still being in Redis. The claimed root now comes
 // from the persisted MsgCreateClaim, so it survives the tree; the PROOF does
-// not, because ProveClosest lazy-loads the node hash.
+// not, because ProveWeighted lazy-loads the node hash.
 //
 // So this drives the real edge end to end: a real tree, the real
 // MsgCreateClaim the reconciler stored, reactivateClaimedSession unmarshalling
@@ -427,7 +430,7 @@ func TestReactivation_EndsWithAProvableSession(t *testing.T) {
 	//    against the root the reactivation wrote. Without this the fix is
 	//    proven only up to the state change.
 	path := protocol.GetPathForProof([]byte("relay-1"), sessionID)
-	proofBytes, err := smstManager.ProveClosest(ctx, sessionID, path)
+	proofBytes, err := smstManager.ProveWeighted(ctx, sessionID, path)
 	require.NoError(t, err, "a reactivated session must still be provable")
 	require.NotEmpty(t, proofBytes)
 
@@ -508,7 +511,7 @@ func TestReactivation_RootSurvivesTheTree(t *testing.T) {
 		"the root comes from the persisted claim message, so a missing tree must not lose it")
 
 	// And the honest half: the proof does still need the tree.
-	_, proveErr := smstManager.ProveClosest(ctx, sessionID, protocol.GetPathForProof([]byte("relay-1"), sessionID))
+	_, proveErr := smstManager.ProveWeighted(ctx, sessionID, protocol.GetPathForProof([]byte("relay-1"), sessionID))
 	require.Error(t, proveErr,
 		"documented limitation: the root survives the tree, the proof does not")
 }

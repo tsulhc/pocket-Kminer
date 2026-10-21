@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pokt-network/pocket-relay-miner/storage/kv"
+
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/require"
@@ -80,7 +82,7 @@ func TestSubmissionTracker_WritesEveryKindWhileTheStoreIsClosed(t *testing.T) {
 	client, prefix := newExclusiveTestRedis(t)
 	closeStoreByReserve(t, client, prefix)
 
-	tr := NewSubmissionTracker(zerolog.Nop(), client, time.Hour)
+	tr := NewSubmissionTracker(zerolog.Nop(), kv.NewRedis(zerolog.Nop(), client), time.Hour)
 	const supplier = "pokt1track"
 	const sessionID = "sess-closed"
 	const txHash = "0xtx"
@@ -96,7 +98,7 @@ func TestSubmissionTracker_WritesEveryKindWhileTheStoreIsClosed(t *testing.T) {
 	require.NoError(t, tr.TrackProofSubmission(ctx, supplier, 110, sessionID,
 		[]byte("proof"), "0xprooftx", true, "", 105, 110, true, ""))
 	require.NoError(t, tr.UpdateClaimOnChainOutcome(ctx, ClaimOnChainUpdate{
-		Supplier: supplier, TxHash: txHash, Outcome: "on_chain_found", InclusionHeight: 111,
+		Supplier: supplier, SessionEnd: 110, SessionID: sessionID, TxHash: txHash, Outcome: "on_chain_found", InclusionHeight: 111,
 	}))
 	require.NoError(t, tr.UpdateProofOnChainOutcome(ctx, ProofOnChainUpdate{
 		Supplier: supplier, SessionEnd: 110, SessionID: sessionID,
@@ -119,7 +121,7 @@ func TestSubmissionTracker_WritesEveryKindWhileTheStoreIsClosed(t *testing.T) {
 func TestSubmissionTracker_AWriteRefusedByRedisReachesTheCallerAndIsCounted(t *testing.T) {
 	ctx := context.Background()
 	client, _ := newExclusiveTestRedis(t)
-	tr := NewSubmissionTracker(zerolog.Nop(), client, time.Hour)
+	tr := NewSubmissionTracker(zerolog.Nop(), kv.NewRedis(zerolog.Nop(), client), time.Hour)
 	const supplier = "pokt1refused"
 
 	require.NoError(t, client.ConfigSet(ctx, "maxmemory-policy", "noeviction").Err())
@@ -148,7 +150,7 @@ func TestSubmissionTracker_AWriteRefusedByRedisReachesTheCallerAndIsCounted(t *t
 func TestSubmissionTracker_AProofWithNoClaimSaysItDoesNotKnow(t *testing.T) {
 	ctx := context.Background()
 	client, _ := newTestRedis(t)
-	tr := NewSubmissionTracker(zerolog.Nop(), client, time.Hour)
+	tr := NewSubmissionTracker(zerolog.Nop(), kv.NewRedis(zerolog.Nop(), client), time.Hour)
 	const supplier = "pokt1unknown"
 
 	require.NoError(t, tr.TrackProofSubmission(ctx, supplier, 110, "sess-proof-first",
@@ -181,21 +183,21 @@ func TestSubmissionTracker_AProofWithNoClaimSaysItDoesNotKnow(t *testing.T) {
 func TestSubmissionTracker_AnOutcomeWithNoRecordIsCounted(t *testing.T) {
 	ctx := context.Background()
 	client, _ := newTestRedis(t)
-	tr := NewSubmissionTracker(zerolog.Nop(), client, time.Hour)
+	tr := NewSubmissionTracker(zerolog.Nop(), kv.NewRedis(zerolog.Nop(), client), time.Hour)
 	const supplier = "pokt1orphan"
 
 	seedClaim(t, tr, supplier, "sess-a", "0xtx-a")
 	missed := testutil.ToFloat64(trackingOutcomesWithoutRecord.WithLabelValues("claim"))
 
 	require.NoError(t, tr.UpdateClaimOnChainOutcome(ctx, ClaimOnChainUpdate{
-		Supplier: supplier, TxHash: "0xtx-nobody", Outcome: "on_chain_found", InclusionHeight: 111,
+		Supplier: supplier, SessionEnd: 110, SessionID: "sess-a", TxHash: "0xtx-nobody", Outcome: "on_chain_found", InclusionHeight: 111,
 	}))
 	require.Equal(t, missed+1, testutil.ToFloat64(trackingOutcomesWithoutRecord.WithLabelValues("claim")),
 		"LINK outcome-without-record: an outcome that annotated nothing is counted")
 
 	// Control: the outcome that does find its record is not counted as missing.
 	require.NoError(t, tr.UpdateClaimOnChainOutcome(ctx, ClaimOnChainUpdate{
-		Supplier: supplier, TxHash: "0xtx-a", Outcome: "on_chain_found", InclusionHeight: 111,
+		Supplier: supplier, SessionEnd: 110, SessionID: "sess-a", TxHash: "0xtx-a", Outcome: "on_chain_found", InclusionHeight: 111,
 	}))
 	require.Equal(t, missed+1, testutil.ToFloat64(trackingOutcomesWithoutRecord.WithLabelValues("claim")))
 }
