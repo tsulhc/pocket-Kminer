@@ -130,9 +130,20 @@ func TestTrustedRequestIDSurvivesInnerOuterAndConfigSpoof(t *testing.T) {
 // TestGRPCRequestIDPropagatesTrustedID proves the gRPC path derives the ID
 // from the typed RelayRequest and overwrites a spoofed inner header.
 func TestGRPCRequestIDPropagatesTrustedID(t *testing.T) {
-	var gotID atomic.Value
+	type backendHeaders struct {
+		requestID   string
+		application string
+		supplier    string
+		service     string
+	}
+	observed := make(chan backendHeaders, 1)
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotID.Store(r.Header.Get("Pocket-Request-ID"))
+		observed <- backendHeaders{
+			requestID:   r.Header.Get(HeaderPocketRequestID),
+			application: r.Header.Get(HeaderPocketApplication),
+			supplier:    r.Header.Get(HeaderPocketSupplier),
+			service:     r.Header.Get(HeaderPocketService),
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","result":"0x10","id":1}`))
@@ -140,13 +151,25 @@ func TestGRPCRequestIDPropagatesTrustedID(t *testing.T) {
 	defer backend.Close()
 
 	fx := newGRPCPublishFixture(t, backend.URL)
+	svcConfig := fx.svc.serviceConfigs[fx.serviceID]
+	svcConfig.Backends = map[string]BackendConfig{
+		BackendTypeJSONRPC: {Headers: map[string]string{
+			HeaderPocketApplication: "CONFIG-APP",
+			HeaderPocketSupplier:    "CONFIG-SUPPLIER",
+			HeaderPocketService:     "CONFIG-SERVICE",
+		}},
+	}
+	fx.svc.serviceConfigs[fx.serviceID] = svcConfig
 
 	var inner sdktypes.POKTHTTPRequest
 	require.NoError(t, proto.Unmarshal(fx.stream.req.Payload, &inner))
 	if inner.Header == nil {
 		inner.Header = map[string]*sdktypes.Header{}
 	}
-	inner.Header["Pocket-Request-ID"] = &sdktypes.Header{Key: "Pocket-Request-ID", Values: []string{"GRPC-INNER-SPOOF"}}
+	inner.Header[HeaderPocketRequestID] = &sdktypes.Header{Key: HeaderPocketRequestID, Values: []string{"GRPC-INNER-SPOOF"}}
+	inner.Header[HeaderPocketApplication] = &sdktypes.Header{Key: HeaderPocketApplication, Values: []string{"INNER-APP"}}
+	inner.Header[HeaderPocketSupplier] = &sdktypes.Header{Key: HeaderPocketSupplier, Values: []string{"INNER-SUPPLIER"}}
+	inner.Header[HeaderPocketService] = &sdktypes.Header{Key: HeaderPocketService, Values: []string{"INNER-SERVICE"}}
 	mutated, err := proto.Marshal(&inner)
 	require.NoError(t, err)
 	fx.stream.req.Payload = mutated
@@ -155,10 +178,13 @@ func TestGRPCRequestIDPropagatesTrustedID(t *testing.T) {
 
 	require.NoError(t, fx.svc.handleSendRelay(fx.stream))
 	require.Equal(t, int32(1), fx.proc.calls.Load(), "premise: the relay was served, so the backend was hit")
-	got, ok := gotID.Load().(string)
-	require.True(t, ok && got != "", "premise: backend observed the request header")
-	require.Equal(t, expected, got,
+	got := <-observed
+	require.NotEmpty(t, got.requestID, "premise: backend observed the request header")
+	require.Equal(t, expected, got.requestID,
 		"gRPC backend must receive the derived ID, not the spoofed inner header")
+	require.Equal(t, fx.stream.req.Meta.SessionHeader.ApplicationAddress, got.application)
+	require.Equal(t, fx.stream.req.Meta.SupplierOperatorAddress, got.supplier)
+	require.Equal(t, fx.serviceID, got.service)
 }
 
 // TestForwardToBackend_RequestIDOverridesConfigSpoof is the Redis-free unit
@@ -186,11 +212,11 @@ func TestForwardToBackend_RequestIDOverridesConfigSpoof(t *testing.T) {
 		},
 	}
 
-	_, _, _, err := svc.forwardToBackend(t.Context(), "svc", svcConfig, poktReq, nil, BackendTypeREST, "trusted-derived-id")
+	_, _, _, err := svc.forwardToBackend(t.Context(), "svc", svcConfig, poktReq, nil, BackendTypeREST, "trusted-derived-id", trustedBackendIdentity{})
 	require.NoError(t, err)
 	require.Equal(t, "trusted-derived-id", gotID.Load().(string))
 
-	_, _, _, err = svc.forwardToBackend(t.Context(), "svc", svcConfig, poktReq, nil, BackendTypeREST, "")
+	_, _, _, err = svc.forwardToBackend(t.Context(), "svc", svcConfig, poktReq, nil, BackendTypeREST, "", trustedBackendIdentity{})
 	require.NoError(t, err)
 	require.Equal(t, "", gotID.Load().(string), "empty derivation must delete the header, not leave a spoof")
 }
@@ -356,4 +382,64 @@ func decodeObservations(t *testing.T, raw string) []observationRecord {
 		}
 	}
 	return out
+}
+
+func observationEvent(t *testing.T, sink *telemetrySyncBuffer) map[string]any {
+	t.Helper()
+	for _, line := range strings.Split(sink.String(), "\n") {
+		var event map[string]any
+		if json.Unmarshal([]byte(line), &event) == nil && event["event"] == relayObservationEvent {
+			return event
+		}
+	}
+	t.Fatal("missing relay observation event")
+	return nil
+}
+
+func TestServicePublishQueueFullObservation(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Error("backend must not be reached while the service publish queue is full")
+	}))
+	defer backend.Close()
+	f, _, _, _ := newEagerChargeFixture(t, backend.URL, acceptAnyValidator{})
+	sink := &telemetrySyncBuffer{}
+	f.proxy.logger = logging.Logger(zerolog.New(sink))
+	queue := f.proxy.publishQueues[simTestService]
+	queue.queued.Store(queue.maxBytes)
+	defer queue.queued.Store(0)
+
+	w := f.post(t, f.buildSignedSimBody(t, f.appAddr, simTestService, "service-queue-full"), false)
+	require.Equal(t, http.StatusTooManyRequests, w.Code)
+	event := observationEvent(t, sink)
+	require.Equal(t, rejectReasonServicePublishQueueFull, event["reject_reason"])
+	require.Equal(t, float64(http.StatusTooManyRequests), event["status_code"])
+}
+
+func TestFailedBackendObservationsIncludeTotalLatency(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer backend.Close()
+
+	t.Run("http", func(t *testing.T) {
+		f, _, _, _ := newEagerChargeFixture(t, backend.URL, acceptAnyValidator{})
+		sink := &telemetrySyncBuffer{}
+		f.proxy.logger = logging.Logger(zerolog.New(sink))
+		w := f.post(t, f.buildSignedSimBody(t, f.appAddr, simTestService, "http-backend-error"), false)
+		require.Equal(t, http.StatusServiceUnavailable, w.Code)
+		event := observationEvent(t, sink)
+		require.Equal(t, relayOutcomeBackend5xx, event["outcome"])
+		require.Contains(t, event, "total_latency_ms")
+	})
+
+	t.Run("grpc", func(t *testing.T) {
+		fx := newGRPCPublishFixture(t, backend.URL)
+		sink := &telemetrySyncBuffer{}
+		fx.svc.logger = logging.Logger(zerolog.New(sink))
+		err := fx.svc.handleSendRelay(fx.stream)
+		require.Error(t, err)
+		event := observationEvent(t, sink)
+		require.Equal(t, relayOutcomeBackend5xx, event["outcome"])
+		require.Contains(t, event, "total_latency_ms")
+	})
 }

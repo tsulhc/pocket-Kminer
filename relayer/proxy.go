@@ -1093,6 +1093,9 @@ func (p *ProxyServer) handleRelay(w http.ResponseWriter, r *http.Request) {
 	// overwrite it below. Telemetry only, no admission/accounting change.
 	observation := newRelayObservation(relayRequest, body, poktHTTPRequest, serviceID, rpcType)
 	defer func() {
+		if observation.TotalLatency <= 0 {
+			observation.TotalLatency = time.Since(startTime)
+		}
 		logRelayObservation(p.logger, relayRequest, observation)
 	}()
 
@@ -1255,6 +1258,8 @@ func (p *ProxyServer) handleRelay(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Retry-After", "1")
 		p.sendError(w, http.StatusTooManyRequests, "relayer is not admitting relays right now")
 		relaysRejected.WithLabelValues(serviceID, rpcType, rejectReasonServicePublishQueueFull).Inc()
+		observation.RejectReason = rejectReasonServicePublishQueueFull
+		observation.StatusCode = http.StatusTooManyRequests
 		return
 	}
 

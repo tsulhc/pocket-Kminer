@@ -176,6 +176,26 @@ func setPocketRequestIDValue(header http.Header, requestID string) {
 	header.Set(HeaderPocketRequestID, requestID)
 }
 
+type trustedBackendIdentity struct {
+	Application string
+	Supplier    string
+	Service     string
+}
+
+func (identity trustedBackendIdentity) apply(header http.Header) {
+	setOrDeleteHeader(header, HeaderPocketApplication, identity.Application)
+	setOrDeleteHeader(header, HeaderPocketSupplier, identity.Supplier)
+	setOrDeleteHeader(header, HeaderPocketService, identity.Service)
+}
+
+func setOrDeleteHeader(header http.Header, key, value string) {
+	if value == "" {
+		header.Del(key)
+		return
+	}
+	header.Set(key, value)
+}
+
 type relayObservation struct {
 	RequestID            string
 	ServiceID            string
@@ -284,7 +304,8 @@ func boundedRejectReason(value string) string {
 		rejectReasonValidationQueueFull,
 		rejectReasonStorageSaturated,
 		rejectReasonRecvError,
-		rejectReasonSendError:
+		rejectReasonSendError,
+		rejectReasonServicePublishQueueFull:
 		return value
 	default:
 		return ""
