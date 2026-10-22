@@ -374,6 +374,9 @@ func (s *RelayGRPCService) serveSendRelay(stream grpc.ServerStream, ctx context.
 	// refined after DeserializeHTTPRequest below. Telemetry only.
 	observation := newRelayObservation(relayRequest, nil, nil, serviceID, BackendTypeGRPC)
 	defer func() {
+		if observation.TotalLatency <= 0 {
+			observation.TotalLatency = time.Since(arrivalTime)
+		}
 		logRelayObservation(s.logger, relayRequest, observation)
 	}()
 
@@ -539,9 +542,14 @@ func (s *RelayGRPCService) serveSendRelay(stream grpc.ServerStream, ctx context.
 	grpcEndpoint = grpcPool.Next()
 	requestID := pocketRequestIDFromRelayRequest(relayRequest)
 	backendStart := time.Now()
+	trustedIdentity := trustedBackendIdentity{
+		Application: applicationAddr,
+		Supplier:    supplierOperatorAddr,
+		Service:     serviceID,
+	}
 
 	// Forward request to backend and get response
-	respBody, respHeaders, respStatus, err := s.forwardToBackend(ctx, serviceID, &svcConfig, poktHTTPRequest, grpcEndpoint, grpcRPCType, requestID)
+	respBody, respHeaders, respStatus, err := s.forwardToBackend(ctx, serviceID, &svcConfig, poktHTTPRequest, grpcEndpoint, grpcRPCType, requestID, trustedIdentity)
 	observation.BackendLatency = time.Since(backendStart)
 	if grpcEndpoint != nil {
 		observation.BackendEndpoint = grpcEndpoint.Name
@@ -818,7 +826,13 @@ func (s *RelayGRPCService) serveSimulatedGRPC(
 		grpcEndpoint = grpcPool.Next()
 	}
 	simRequestID := pocketRequestIDFromRelayRequest(relayRequest)
-	respBody, respHeaders, respStatus, err := s.forwardToBackend(ctx, serviceID, &svcConfig, poktHTTPRequest, grpcEndpoint, grpcRPCType, simRequestID)
+	meta := relayRequest.GetMeta()
+	trustedIdentity := trustedBackendIdentity{
+		Application: meta.GetSessionHeader().GetApplicationAddress(),
+		Supplier:    meta.GetSupplierOperatorAddress(),
+		Service:     serviceID,
+	}
+	respBody, respHeaders, respStatus, err := s.forwardToBackend(ctx, serviceID, &svcConfig, poktHTTPRequest, grpcEndpoint, grpcRPCType, simRequestID, trustedIdentity)
 	if err != nil {
 		record(SimResultBackendError)
 		return status.Errorf(codes.Unavailable, "backend error: %v", err)
@@ -865,6 +879,7 @@ func (s *RelayGRPCService) forwardToBackend(
 	endpoint *pool.BackendEndpoint,
 	rpcType string,
 	requestID string,
+	trustedIdentity trustedBackendIdentity,
 ) ([]byte, http.Header, int, error) {
 	// Find the backend configuration
 	var backendURL string
@@ -963,6 +978,9 @@ func (s *RelayGRPCService) forwardToBackend(
 
 	// Apply backend config headers + authentication (shared with HTTP path).
 	applyBackendAuthAndHeaders(req, configHeaders, auth)
+	// Inner request headers and backend configuration are caller-controlled.
+	// Overwrite/remove identity from the validated RelayRequest only after both.
+	trustedIdentity.apply(req.Header)
 	// W2 trusted correlation: overwrite any inner or configured
 	// Pocket-Request-ID with the ID derived from the signed envelope.
 	setPocketRequestIDValue(req.Header, requestID)
